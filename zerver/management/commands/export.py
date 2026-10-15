@@ -9,7 +9,7 @@ from django.utils.timezone import now as timezone_now
 from typing_extensions import override
 
 from zerver.actions.realm_settings import do_deactivate_realm
-from zerver.lib.export import export_realm_wrapper
+from zerver.lib.export import export_realm_wrapper, export_tarball_prefix
 from zerver.lib.management import ZulipBaseCommand
 from zerver.models import RealmExport
 
@@ -107,6 +107,15 @@ class Command(ZulipBaseCommand):
             action="store_true",
             help="Whether to upload resulting tarball to s3 or LOCAL_UPLOADS_DIR",
         )
+        parser.add_argument(
+            "--remove-files-while-archiving",
+            action="store_true",
+            help=(
+                "Delete exported files as they are added to the tarball, rather than "
+                "afterwards, to avoid needing disk space for two copies of the export. "
+                "If archiving fails, the exported files are lost"
+            ),
+        )
         self.add_realm_args(parser, required=True)
 
     @override
@@ -132,7 +141,7 @@ class Command(ZulipBaseCommand):
             raise CommandError(f"The realm {realm.string_id} is already deactivated.  Aborting...")
 
         if output_dir is None:
-            output_dir = tempfile.mkdtemp(prefix="zulip-export-")
+            output_dir = tempfile.mkdtemp(prefix=export_tarball_prefix(realm))
         else:
             output_dir = os.path.realpath(os.path.expanduser(output_dir))
             if os.path.exists(output_dir):
@@ -187,4 +196,5 @@ class Command(ZulipBaseCommand):
             upload=options["upload"],
             percent_callback=percent_callback,
             export_as_active=True if options["deactivate_realm"] else None,
+            remove_files_while_archiving=options["remove_files_while_archiving"],
         )

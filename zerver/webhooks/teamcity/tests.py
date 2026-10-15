@@ -32,6 +32,17 @@ class TeamCityHookTests(WebhookTestCase):
         expected_message = "Project :: Compile build 5535 - CL 123456 has been fixed! :thumbs_up: See [changes](http://teamcity/viewLog.html?buildTypeId=Project_Compile&buildId=19952&tab=buildChangesDiv) and [build log](http://teamcity/viewLog.html?buildTypeId=Project_Compile&buildId=19952)."
         self.check_webhook("fixed", self.TOPIC_NAME, expected_message)
 
+    def test_teamcity_unsupported_build_result(self) -> None:
+        payload = self.get_body("success").replace(
+            '"buildResult": "success"', '"buildResult": "unsupported"'
+        )
+        result = self.client_post(self.url, payload, content_type="application/json")
+        self.assert_json_success(result)
+        self.assert_in_response(
+            "The 'unsupported' event isn't currently supported by the TeamCity webhook; ignoring",
+            result,
+        )
+
     def test_teamcity_personal(self) -> None:
         expected_message = "Your personal build for Project :: Compile build 5535 - CL 123456 is broken with status Exit code 1 (new)! :thumbs_down: See [changes](http://teamcity/viewLog.html?buildTypeId=Project_Compile&buildId=19952&tab=buildChangesDiv) and [build log](http://teamcity/viewLog.html?buildTypeId=Project_Compile&buildId=19952)."
         payload = orjson.dumps(
@@ -41,7 +52,7 @@ class TeamCityHookTests(WebhookTestCase):
         msg = self.get_last_message()
 
         self.assertEqual(msg.content, expected_message)
-        self.assertEqual(msg.recipient.type, Recipient.PERSONAL)
+        self.assertEqual(msg.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
 
     def test_non_generic_payload_ignore_pm_notification(self) -> None:
         expected_message = MISCONFIGURED_PAYLOAD_TYPE_ERROR_MESSAGE.format(
@@ -55,4 +66,4 @@ class TeamCityHookTests(WebhookTestCase):
         msg = self.get_last_message()
 
         self.assertEqual(msg.content, expected_message)
-        self.assertEqual(msg.recipient.type, Recipient.PERSONAL)
+        self.assertEqual(msg.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)

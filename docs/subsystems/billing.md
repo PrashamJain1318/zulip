@@ -52,7 +52,7 @@ development environment to receive webhook events from Stripe.
   Stripe.
 - With `tools/run-dev` stopped, you can run `./manage.py
 populate_billing_realms` to populate different billing states, both
-  Cloud and Self-hosted, with various initial plans and billing schedules.
+  Cloud and self-hosted, with various initial plans and billing schedules.
 - Feel free to modify `populate_billing_realms` to add more states if they
   seem useful in your testing. After running the command, you will see a list of
   populated organizations.
@@ -62,11 +62,11 @@ populate_billing_realms` to populate different billing states, both
   - Login as the only available user.
   - Go to `/billing`.
 - Populated `RemoteZulipServer` customers can be accessed by going to
-  `http://selfhosting.localhost:9991/serverlogin/` and providing the
+  `http://selfhosting.zulipdev.com:9991/serverlogin/` and providing the
   credentials in the login form for the server state you wish to
   test. The credentials are printed in the terminal by `./manage.py
 populate_billing_realms`.
-- Populated `RemoteRealm` customers can be accessed simply by follow
+- Populated `RemoteRealm` customers can be accessed simply by following
   their links printed in the terminal in the `./manage.py
 populate_billing_realms` output.
 
@@ -183,8 +183,12 @@ has some additional information.
 
 ## Writing tests
 
-Writing new tests is fairly easy. Most of the tests are placed in
-`test_stripe`. If you need do API calls to stripe, wrap the test
+Writing new tests is fairly easy. Billing tests live in
+`corporate/tests/`: `test_stripe` covers the Zulip Cloud billing
+flows, `test_stripe_remote_realm` and `test_stripe_remote_server`
+cover self-hosted realms and servers, `test_billing_lib` covers the
+helpers in `corporate/lib/stripe.py`, and `test_sponsorship` covers
+sponsorship requests. If you need to do API calls to stripe, wrap the test
 function in `@mock_stripe` and run `tools/test-backend TEST_NAME
 --generate-stripe-fixtures`. It will run all your calls and generate
 fixtures for any API calls to stripe, so that they can be used to

@@ -2,13 +2,14 @@ import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import * as blueslip from "./blueslip.ts";
+import {INCOMING_WEBHOOK_BOT_TYPE_INT} from "./bot_type_values.ts";
 import * as channel from "./channel.ts";
 import {LazySet} from "./lazy_set.ts";
 import {page_params} from "./page_params.ts";
 import type {User} from "./people.ts";
 import * as people from "./people.ts";
+import {get_retry_backoff_seconds} from "./retry_backoff.ts";
 import * as sub_store from "./sub_store.ts";
-import * as util from "./util.ts";
 
 // Maps stream_id to the number of subscribers in that stream.
 // Note: These counts can sometimes be wrong due to races on the backend,
@@ -38,7 +39,7 @@ export function has_complete_subscriber_data(): boolean {
     const all_stream_ids = new Set(sub_store.stream_ids());
     return (
         all_stream_ids.size === fetched_stream_ids.size &&
-        all_stream_ids.difference(fetched_stream_ids).size === 0
+        all_stream_ids.isSubsetOf(fetched_stream_ids)
     );
 }
 
@@ -55,7 +56,18 @@ const pending_subscriber_requests = new Map<
     }
 >();
 // Requests for subscriptions for a user
-const pending_subscription_requests = new Map<number, Promise<void>>();
+const pending_subscription_requests = new Map<
+    number,
+    {
+        subscriptions_promise: Promise<void>;
+        // Channels the user was removed from while the request was in
+        // flight. The server may have built its response before those
+        // removals, so we skip these channels instead of re-adding the
+        // user from stale data. We don't need to track additions: the
+        // event already added the user, and re-adding them is harmless.
+        stream_ids_removed_during_fetch: Set<number>;
+    }
+>();
 
 export function clear_for_testing(): void {
     stream_subscribers.clear();
@@ -77,21 +89,23 @@ const fetch_user_subscriptions_response_schema = z.object({
 // delay each time) if the server keeps returning non-400 errors.
 export async function fetch_stream_subscribers_with_retry(
     stream_id: number,
-    num_attempts = 1,
 ): Promise<LazySet | null> {
-    const subscribers = await fetch_stream_subscribers(stream_id);
-    // Bad request, so just give up here.
-    if (subscribers === false) {
-        return null;
+    let num_attempts = 1;
+    while (true) {
+        const subscribers = await fetch_stream_subscribers(stream_id);
+        // Bad request, so just give up here.
+        if (subscribers === false) {
+            return null;
+        }
+        // Failed request, retry.
+        if (subscribers === null) {
+            num_attempts += 1;
+            const retry_delay_secs = get_retry_backoff_seconds(undefined, num_attempts);
+            await new Promise((resolve) => setTimeout(resolve, retry_delay_secs * 1000));
+            continue;
+        }
+        return subscribers;
     }
-    // Failed request, retry.
-    if (subscribers === null) {
-        num_attempts += 1;
-        const retry_delay_secs = util.get_retry_backoff_seconds(undefined, num_attempts);
-        await new Promise((resolve) => setTimeout(resolve, retry_delay_secs * 1000));
-        return fetch_stream_subscribers_with_retry(stream_id, num_attempts);
-    }
-    return subscribers;
 }
 
 // This function either waits for an existing pending request or kicks off
@@ -145,6 +159,11 @@ async function fetch_stream_subscribers_from_server(
                         error_json: xhr.responseJSON,
                     });
                     resolve(false);
+                } else if (xhr.readyState === 0) {
+                    // This means that something in client-side code cancelled the request.
+                    // We've seen this happen, only occasionally, and decided to ignore and
+                    // potentially retry.
+                    resolve(null);
                 } else {
                     blueslip.error("Failure fetching channel subscribers", {
                         stream_id,
@@ -176,11 +195,6 @@ function get_loaded_subscriber_subset(stream_id: number): LazySet {
     return subscribers;
 }
 
-async function get_full_subscriber_set(stream_id: number, retry_on_failure: true): Promise<LazySet>;
-async function get_full_subscriber_set(
-    stream_id: number,
-    retry_on_failure: boolean,
-): Promise<LazySet | null>;
 async function get_full_subscriber_set(
     stream_id: number,
     retry_on_failure: boolean,
@@ -199,7 +213,7 @@ async function get_full_subscriber_set(
         if (fetched_subscribers === null || fetched_subscribers === false) {
             return null;
         }
-        set_subscribers(stream_id, [...fetched_subscribers.keys()]);
+        set_subscribers(stream_id, fetched_subscribers.keys().toArray());
     }
     return get_loaded_subscriber_subset(stream_id);
 }
@@ -212,12 +226,31 @@ export async function is_subscriber_subset(
     const sub2_promise = get_full_subscriber_set(stream_id2, false);
     const sub1_set = await sub1_promise;
     const sub2_set = await sub2_promise;
-    // This happens if we encountered an error feteching subscribers.
+    // This happens if we encountered an error fetching subscribers.
     if (sub1_set === null || sub2_set === null) {
         return null;
     }
 
-    return [...sub1_set.keys()].every((key) => sub2_set.has(key));
+    return sub1_set.keys().every((key) => {
+        // If the user is in the linked stream, the check passes.
+        if (sub2_set.has(key)) {
+            return true;
+        }
+
+        // Use ignore_missing=true because subscribers may include users
+        // inaccessible to the current viewer (e.g., guest-visibility limits);
+        // those will return undefined and fall through to the non-subset case.
+        const user = people.maybe_get_user_by_id(key, true);
+
+        // Incoming webhook bots are write-only and can't read messages, so a
+        // private channel containing them as the only "extra" subscriber
+        // doesn't expose anything.
+        if (user?.bot_type === INCOMING_WEBHOOK_BOT_TYPE_INT) {
+            return true;
+        }
+
+        return false;
+    });
 }
 
 export function potential_subscribers(stream_id: number): User[] {
@@ -299,7 +332,7 @@ function decrement_subscriber_count(
 // Note: `subscriber_count` can sometimes be wrong due to races on the backend,
 // so we should fetch full subscriber data if we care about this number being
 // accurate.
-export let get_subscriber_count = (stream_id: number, include_bots = true): number => {
+export function get_subscriber_count(stream_id: number, include_bots = true): number {
     const count = subscriber_counts.get(stream_id);
     if (count === undefined) {
         blueslip.warn(`We called get_subscriber_count for an untracked stream: ${stream_id}`);
@@ -317,17 +350,13 @@ export let get_subscriber_count = (stream_id: number, include_bots = true): numb
         }
     }
     return count - bot_count;
-};
-
-export function rewire_get_subscriber_count(value: typeof get_subscriber_count): void {
-    get_subscriber_count = value;
 }
 
 export function set_subscriber_count(stream_id: number, count: number): void {
     subscriber_counts.set(stream_id, count);
 }
 
-export function clear_subscriber_counts_for_tests(): void {
+export function clear_subscriber_counts(): void {
     subscriber_counts.clear();
 }
 
@@ -344,7 +373,7 @@ export function get_subscriber_ids_assert_loaded(stream_id: number): number[] {
     // want an array of user_ids who are subscribed to a stream.
     const subscribers = get_loaded_subscriber_subset(stream_id);
 
-    return [...subscribers.keys()];
+    return subscribers.keys().toArray();
 }
 
 export async function get_subscribers_with_possible_fetch(
@@ -354,12 +383,13 @@ export async function get_subscribers_with_possible_fetch(
     // This function parallels `get_subscribers` but ensures we include all
     // subscribers, possibly fetching that data from the server.
     const subscribers = await get_full_subscriber_set(stream_id, retry_on_failure);
-    // This means the request failed, which can only happen if `retry_on_failure`
-    // is false.
+    // This means the request failed. Even with `retry_on_failure`, a
+    // bad request is not retried, since the channel was deleted or we
+    // lost access to it.
     if (subscribers === null) {
         return null;
     }
-    return [...subscribers.keys()];
+    return subscribers.keys().toArray();
 }
 
 export function set_subscribers(stream_id: number, user_ids: number[], full_data = true): void {
@@ -392,6 +422,7 @@ export function remove_subscriber(stream_id: number, user_id: number): void {
     const subscribers = get_loaded_subscriber_subset(stream_id);
     decrement_subscriber_count(subscribers, stream_id, user_id);
     subscribers.delete(user_id);
+    pending_subscription_requests.get(user_id)?.stream_ids_removed_during_fetch.add(stream_id);
 }
 
 export function bulk_add_subscribers({
@@ -441,6 +472,9 @@ export function bulk_remove_subscribers({
                 decrement_subscriber_count(subscribers, sub.stream_id, user_id);
             }
             subscribers.delete(user_id);
+            pending_subscription_requests
+                .get(user_id)
+                ?.stream_ids_removed_during_fetch.add(stream_id);
         }
 
         if (pending_subscriber_requests.has(stream_id)) {
@@ -485,7 +519,7 @@ export async function get_unique_subscriber_count_for_streams(
     stream_ids: number[],
 ): Promise<number> {
     const valid_subscribers = new LazySet([]);
-    const promises: Record<number, Promise<LazySet>> = {};
+    const promises: Record<number, Promise<LazySet | null>> = {};
     for (const stream_id of stream_ids) {
         promises[stream_id] = get_full_subscriber_set(stream_id, true);
     }
@@ -493,7 +527,7 @@ export async function get_unique_subscriber_count_for_streams(
     for (const stream_id of stream_ids) {
         // If it's `null`, that means a request failed and we don't know the
         // full subscribers set, so just use whatever we have already.
-        const subscribers = await promises[stream_id]!;
+        const subscribers = (await promises[stream_id]!) ?? get_loaded_subscriber_subset(stream_id);
 
         for (const user_id of subscribers.keys()) {
             if (!people.is_valid_bot_user(user_id)) {
@@ -514,7 +548,16 @@ async function fetch_subscriptions_for_user_from_server(user_id: number): Promis
             success(raw_data) {
                 const subscriptions =
                     fetch_user_subscriptions_response_schema.parse(raw_data).subscribed_channel_ids;
+                const pending_request = pending_subscription_requests.get(user_id)!;
                 for (const stream_id of subscriptions) {
+                    if (pending_request.stream_ids_removed_during_fetch.has(stream_id)) {
+                        continue;
+                    }
+                    // We already have the exact subscriber set for this
+                    // stream, so a stale response must not re-add the user.
+                    if (fetched_stream_ids.has(stream_id)) {
+                        continue;
+                    }
                     add_subscriber(stream_id, user_id);
                 }
                 fetched_user_subscriptions.add(user_id);
@@ -544,7 +587,7 @@ export async function fetch_subscriptions_for_user(user_id: number): Promise<voi
     }
 
     if (pending_subscription_requests.has(user_id)) {
-        return pending_subscription_requests.get(user_id)!;
+        return pending_subscription_requests.get(user_id)!.subscriptions_promise;
     }
 
     const subscriptions_promise = (async () => {
@@ -554,6 +597,8 @@ export async function fetch_subscriptions_for_user(user_id: number): Promise<voi
                 blueslip.warn("Failure fetching user's subscribed channels. Retrying.", {
                     user_id,
                 });
+                // The retry's response will already reflect these removals.
+                pending_subscription_requests.get(user_id)!.stream_ids_removed_during_fetch.clear();
             }
             const result = await fetch_subscriptions_for_user_from_server(user_id);
             // Bad request, so just give up here.
@@ -562,11 +607,10 @@ export async function fetch_subscriptions_for_user(user_id: number): Promise<voi
                 break;
             }
             // Failed request, so try again (unless we've reached the retry limit)
-            else if (result === null) {
+            if (result === null) {
                 num_attempts += 1;
-                const retry_delay_secs = util.get_retry_backoff_seconds(undefined, num_attempts);
+                const retry_delay_secs = get_retry_backoff_seconds(undefined, num_attempts);
                 await new Promise((resolve) => setTimeout(resolve, retry_delay_secs * 1000));
-                continue;
             }
             // Success
             else {
@@ -575,13 +619,17 @@ export async function fetch_subscriptions_for_user(user_id: number): Promise<voi
             }
         }
         if (num_attempts === 5) {
+            pending_subscription_requests.delete(user_id);
             blueslip.error("Failure fetching user's subscribed channels. Giving up.", {
                 user_id,
             });
         }
     })();
 
-    pending_subscription_requests.set(user_id, subscriptions_promise);
+    pending_subscription_requests.set(user_id, {
+        subscriptions_promise,
+        stream_ids_removed_during_fetch: new Set(),
+    });
     return subscriptions_promise;
 }
 

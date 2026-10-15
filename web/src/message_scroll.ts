@@ -1,7 +1,5 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
-import assert from "minimalistic-assert";
-import type * as tippy from "tippy.js";
 
 import * as compose_banner from "./compose_banner.ts";
 import * as message_fetch from "./message_fetch.ts";
@@ -9,67 +7,14 @@ import * as message_lists from "./message_lists.ts";
 import * as message_scroll_state from "./message_scroll_state.ts";
 import * as message_viewport from "./message_viewport.ts";
 import * as narrow_state from "./narrow_state.ts";
+import * as scroll_to_bottom_button from "./scroll_to_bottom_button.ts";
 import * as unread from "./unread.ts";
 import * as unread_ops from "./unread_ops.ts";
 import * as unread_ui from "./unread_ui.ts";
-import {the} from "./util.ts";
-
-let hide_scroll_to_bottom_timer: ReturnType<typeof setTimeout> | undefined;
-export function hide_scroll_to_bottom(): void {
-    const $show_scroll_to_bottom_button = $("#scroll-to-bottom-button-container");
-    if (message_lists.current === undefined) {
-        // Scroll to bottom button is not for non-message views.
-        $show_scroll_to_bottom_button.removeClass("show");
-        return;
-    }
-
-    if (
-        message_viewport.bottom_rendered_message_visible() ||
-        message_lists.current.visibly_empty()
-    ) {
-        // If last message is visible, just hide the
-        // scroll to bottom button.
-        $show_scroll_to_bottom_button.removeClass("show");
-        return;
-    }
-
-    // Wait before hiding to allow user time to click on the button.
-    hide_scroll_to_bottom_timer = setTimeout(() => {
-        // Don't hide if user is hovered on it.
-        if (
-            !narrow_state.narrowed_by_topic_reply() &&
-            !the($show_scroll_to_bottom_button).matches(":hover")
-        ) {
-            $show_scroll_to_bottom_button.removeClass("show");
-        }
-    }, 3000);
-}
-
-export function show_scroll_to_bottom_button(): void {
-    if (message_viewport.bottom_rendered_message_visible()) {
-        // Only show scroll to bottom button when
-        // last message is not visible in the
-        // current scroll position.
-        return;
-    }
-
-    clearTimeout(hide_scroll_to_bottom_timer);
-    $("#scroll-to-bottom-button-container").addClass("show");
-}
-
-$(document).on("keydown", (e) => {
-    if (e.shiftKey || e.ctrlKey || e.metaKey) {
-        return;
-    }
-
-    // Hide scroll to bottom button on any keypress.
-    // Keyboard users are very less likely to use this button.
-    $("#scroll-to-bottom-button-container").removeClass("show");
-});
 
 export function scroll_finished(): void {
     message_scroll_state.set_actively_scrolling(false);
-    hide_scroll_to_bottom();
+    scroll_to_bottom_button.update();
 
     if (message_lists.current === undefined) {
         return;
@@ -95,6 +40,9 @@ export function scroll_finished(): void {
         // are waiting on user input to do so. So, we only mark messages
         // as read if we are updating selection on this scroll.
         //
+        // For /near/ views, check whether we should resume marking
+        // messages as read before processing visibility.
+        message_lists.current.maybe_resume_reading_for_near_view();
         // When the window scrolls, it may cause some messages to
         // enter the screen and become read.  Calling
         // unread_ops.process_visible will update necessary
@@ -131,7 +79,7 @@ function scroll_finish(): void {
     // Don't present the "scroll to bottom" widget if the current
     // scroll was triggered by the keyboard.
     if (!message_scroll_state.keyboard_triggered_current_scroll) {
-        show_scroll_to_bottom_button();
+        scroll_to_bottom_button.handle_non_keyboard_scroll();
     }
     message_scroll_state.set_keyboard_triggered_current_scroll(false);
 
@@ -144,6 +92,8 @@ export function initialize(): void {
         "scroll",
         _.throttle(() => {
             if (message_lists.current === undefined) {
+                // When in a non-message view, we don't need to process
+                // message scroll events.
                 return;
             }
 
@@ -193,23 +143,6 @@ export function initialize(): void {
                 message_lists.current === event.msg_list
             ) {
                 unread_ui.notify_messages_remain_unread();
-            }
-        }
-    });
-
-    const $show_scroll_to_bottom_button = $("#scroll-to-bottom-button-container").expectOne();
-    // Delete the tippy tooltip whenever the fadeout animation for
-    // this button is finished. This is necessary because the fading animation
-    // confuses Tippy's built-in `data-reference-hidden` feature.
-    $show_scroll_to_bottom_button.on("transitionend", (e) => {
-        assert(e.originalEvent instanceof TransitionEvent);
-        if (e.originalEvent.propertyName === "visibility") {
-            const tooltip = the(
-                $<tippy.ReferenceElement>("#scroll-to-bottom-button-clickable-area"),
-            )._tippy;
-            // make sure the tooltip exists and the class is not currently showing
-            if (tooltip && !$show_scroll_to_bottom_button.hasClass("show")) {
-                tooltip.destroy();
             }
         }
     });

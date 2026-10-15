@@ -57,7 +57,7 @@ write, including tests and documentation, if you use the right process.
 
 ## Hello world walkthrough
 
-Check out [this detailed guide](incoming-webhooks-walkthrough) for
+Check out [this detailed guide](incoming-webhooks-walkthrough.md) for
 step-by-step instructions on developing an incoming webhook integration.
 
 ## Checklist
@@ -74,7 +74,8 @@ examples below are for an incoming webhook named `MyWebHook`.
   necessary helper functions.
 - `zerver/webhooks/mywebhook/fixtures/message_type.json`: A sample
   of payload data, from the third-party service, used by tests. Add
-  one fixture file per event type supported by your integration.
+  fixtures covering the event types and conditions your integration
+  supports.
 - `zerver/webhooks/mywebhook/tests.py`: Tests for your webhook.
 - `zerver/webhooks/mywebhook/doc.md`: End-user documentation explaining
   how to set up the integration.
@@ -117,6 +118,12 @@ configured! 🎉"
   together; this makes for much better consumption by Zulip users. E.g.,
   for a bug tracker integration, put the bug number in the topic for all
   messages; for an integration like Nagios, put the service in the topic.
+- If your integration references usernames from external accounts (such as
+  GitHub usernames), consider using the `guess_zulip_user_from_external_account`
+  helper function from `zerver/lib/webhooks/common.py`. This function automatically
+  matches external accounts to Zulip users who have linked those accounts in their
+  profile's custom fields. This enables converting external usernames to silent mentions,
+  notifying the relevant Zulip users.
 - Integrations that don't match a team's workflow can often be uselessly
   spammy. Give careful thought to providing options for triggering Zulip
   messages only for certain event types, certain projects, or sending
@@ -128,12 +135,6 @@ configured! 🎉"
 - Sometimes it can be helpful to contact the third-party service if it
   appears they don't have an API or outgoing webhook you can use.
   Sometimes the API you're looking for is just not properly documented.
-- A helpful tool for testing your integration is [UltraHook](http://www.ultrahook.com/),
-  which allows you to receive webhook calls via your local Zulip
-  development environment. This enables you to do end-to-end testing with
-  live data from the third-party service you're integrating, and can help
-  you spot why something isn't working or if the service is using [custom
-  HTTP headers](incoming-webhooks-walkthrough.md#custom-http-event-type-headers).
 
 ## URL specification
 

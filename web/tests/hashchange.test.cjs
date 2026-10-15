@@ -2,10 +2,11 @@
 
 const assert = require("node:assert/strict");
 
+const {make_stream} = require("./lib/example_stream.cjs");
 const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
 let $window_stub;
@@ -16,6 +17,7 @@ const history = set_global("history", {state: null});
 
 const admin = mock_esm("../src/admin");
 const drafts_overlay_ui = mock_esm("../src/drafts_overlay_ui");
+const inbox_ui = mock_esm("../src/inbox_ui");
 const info_overlay = mock_esm("../src/info_overlay");
 const message_viewport = mock_esm("../src/message_viewport");
 const overlays = mock_esm("../src/overlays");
@@ -25,6 +27,7 @@ const settings = mock_esm("../src/settings");
 mock_esm("../src/settings_data", {
     user_can_create_public_streams: () => true,
 });
+const sidebar_ui = mock_esm("../src/sidebar_ui");
 const spectators = mock_esm("../src/spectators", {
     login_to_access() {},
 });
@@ -34,6 +37,7 @@ const ui_report = mock_esm("../src/ui_report");
 set_global("favicon", {});
 
 const browser_history = zrequire("browser_history");
+const {UNKNOWN_USER_ID} = zrequire("filter_util");
 const people = zrequire("people");
 const hash_util = zrequire("hash_util");
 const hashchange = zrequire("hashchange");
@@ -46,12 +50,12 @@ const user_settings = {};
 initialize_user_settings({user_settings});
 
 const devel_id = 100;
-const devel = {
+const devel = make_stream({
     name: "devel",
     stream_id: devel_id,
     color: "blue",
     subscribed: true,
-};
+});
 stream_data.add_sub_for_tests(devel);
 
 run_test("terms_round_trip", () => {
@@ -60,7 +64,7 @@ run_test("terms_round_trip", () => {
     let narrow;
 
     terms = [
-        {operator: "stream", operand: devel_id.toString()},
+        {operator: "channel", operand: devel_id.toString()},
         {operator: "topic", operand: "algol"},
     ];
     hash = hash_util.search_terms_to_hash(terms);
@@ -73,7 +77,7 @@ run_test("terms_round_trip", () => {
     ]);
 
     terms = [
-        {operator: "stream", operand: devel_id.toString()},
+        {operator: "channel", operand: devel_id.toString()},
         {operator: "topic", operand: "visual c++", negated: true},
     ];
     hash = hash_util.search_terms_to_hash(terms);
@@ -87,62 +91,17 @@ run_test("terms_round_trip", () => {
 
     // test new encodings, where we have a stream id
     const florida_id = 987;
-    const florida_stream = {
+    const florida_stream = make_stream({
         name: "Florida, USA",
         stream_id: florida_id,
-    };
+    });
     stream_data.add_sub_for_tests(florida_stream);
-    terms = [{operator: "stream", operand: florida_id.toString()}];
+    terms = [{operator: "channel", operand: florida_id.toString()}];
     hash = hash_util.search_terms_to_hash(terms);
     assert.equal(hash, "#narrow/channel/987-Florida.2C-USA");
     narrow = hash_util.parse_narrow(hash.split("/"));
     assert.deepEqual(narrow, [
         {operator: "channel", operand: florida_id.toString(), negated: false},
-    ]);
-});
-
-run_test("stream_to_channel_rename", () => {
-    let terms;
-    let hash;
-    let narrow;
-    let filter;
-
-    // Confirm searches with "stream" and "streams" return URLs and
-    // Filter objects with the new "channel" and "channels" operators.
-    terms = [{operator: "stream", operand: devel_id.toString()}];
-    hash = hash_util.search_terms_to_hash(terms);
-    assert.equal(hash, "#narrow/channel/100-devel");
-    narrow = hash_util.parse_narrow(hash.split("/"));
-    assert.deepEqual(narrow, [{operator: "channel", operand: devel_id.toString(), negated: false}]);
-    filter = new Filter(narrow);
-    assert.deepEqual(filter.terms(), [
-        {operator: "channel", operand: devel_id.toString(), negated: false},
-    ]);
-
-    terms = [{operator: "streams", operand: "public"}];
-    hash = hash_util.search_terms_to_hash(terms);
-    assert.equal(hash, "#narrow/channels/public");
-    narrow = hash_util.parse_narrow(hash.split("/"));
-    assert.deepEqual(narrow, [{operator: "channels", operand: "public", negated: false}]);
-    filter = new Filter(narrow);
-    assert.deepEqual(filter.terms(), [{operator: "channels", operand: "public", negated: false}]);
-
-    // Confirm that a narrow URL with "channel" and an enocoded stream/channel ID,
-    // will be decoded correctly.
-    const test_stream_id = 34;
-    const test_channel = {
-        name: "decode",
-        stream_id: test_stream_id,
-    };
-    stream_data.add_sub_for_tests(test_channel);
-    hash = "#narrow/channel/34-decode";
-    narrow = hash_util.parse_narrow(hash.split("/"));
-    assert.deepEqual(narrow, [
-        {operator: "channel", operand: test_stream_id.toString(), negated: false},
-    ]);
-    filter = new Filter(narrow);
-    assert.deepEqual(filter.terms(), [
-        {operator: "channel", operand: test_stream_id.toString(), negated: false},
     ]);
 });
 
@@ -166,26 +125,18 @@ run_test("people_slugs", () => {
         full_name: "Alice Smith",
     };
 
-    people.add_active_user(alice);
-    terms = [{operator: "sender", operand: "alice@example.com"}];
+    people.add_active_user(alice, "server_events");
+    terms = [{operator: "sender", operand: alice.user_id}];
     hash = hash_util.search_terms_to_hash(terms);
     assert.equal(hash, "#narrow/sender/42-Alice-Smith");
     narrow = hash_util.parse_narrow(hash.split("/"));
-    assert.deepEqual(narrow, [{operator: "sender", operand: "alice@example.com", negated: false}]);
+    assert.deepEqual(narrow, [{operator: "sender", operand: alice.user_id, negated: false}]);
 
-    terms = [{operator: "dm", operand: "alice@example.com"}];
+    terms = [{operator: "dm", operand: [alice.user_id]}];
     hash = hash_util.search_terms_to_hash(terms);
     assert.equal(hash, "#narrow/dm/42-Alice-Smith");
     narrow = hash_util.parse_narrow(hash.split("/"));
-    assert.deepEqual(narrow, [{operator: "dm", operand: "alice@example.com", negated: false}]);
-
-    // Even though we renamed "pm-with" to "dm", preexisting
-    // links/URLs with "pm-with" operator are handled correctly.
-    terms = [{operator: "pm-with", operand: "alice@example.com"}];
-    hash = hash_util.search_terms_to_hash(terms);
-    assert.equal(hash, "#narrow/pm-with/42-Alice-Smith");
-    narrow = hash_util.parse_narrow(hash.split("/"));
-    assert.deepEqual(narrow, [{operator: "dm", operand: "alice@example.com", negated: false}]);
+    assert.deepEqual(narrow, [{operator: "dm", operand: [alice.user_id], negated: false}]);
 });
 
 function test_helper({override, override_rewire, change_tab}) {
@@ -252,6 +203,10 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     override(popovers, "hide_all", () => {
         hide_all_called = true;
     });
+    let sidebar_hide_all_called = false;
+    override(sidebar_ui, "hide_all", () => {
+        sidebar_hide_all_called = true;
+    });
     window.location.hash = "#unknown_hash";
 
     browser_history.clear_for_testing();
@@ -259,6 +214,7 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     // If it's an unknown hash it should show the home view.
     assert.equal(recent_view_ui_shown, true);
     assert.equal(hide_all_called, true);
+    assert.equal(sidebar_hide_all_called, true);
     helper.assert_events([
         [overlays, "close_for_hash_change"],
         [message_viewport, "stop_auto_scrolling"],
@@ -266,10 +222,12 @@ run_test("hash_interactions", ({override, override_rewire}) => {
 
     window.location.hash = "#feed";
     hide_all_called = false;
+    sidebar_hide_all_called = false;
 
     helper.clear_events();
     $window_stub.trigger("hashchange");
     assert.equal(hide_all_called, true);
+    assert.equal(sidebar_hide_all_called, true);
     helper.assert_events([
         [overlays, "close_for_hash_change"],
         [message_viewport, "stop_auto_scrolling"],
@@ -298,11 +256,13 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     assert.equal(window.location.hash, "#recent");
 
     const denmark_id = 1;
-    stream_data.add_sub_for_tests({
-        subscribed: true,
-        name: "Denmark",
-        stream_id: denmark_id,
-    });
+    stream_data.add_sub_for_tests(
+        make_stream({
+            subscribed: true,
+            name: "Denmark",
+            stream_id: denmark_id,
+        }),
+    );
     window.location.hash = "#narrow/channel/Denmark";
 
     helper.clear_events();
@@ -314,6 +274,43 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     ]);
     let terms = helper.get_narrow_terms();
     assert.equal(terms[0].operand, denmark_id.toString());
+
+    let inbox_filter;
+    override(inbox_ui, "show", (filter) => {
+        inbox_filter = filter;
+    });
+    window.location.hash = "#topics/channel/Denmark";
+
+    helper.clear_events();
+    $window_stub.trigger("hashchange");
+    helper.assert_events([
+        [overlays, "close_for_hash_change"],
+        [message_viewport, "stop_auto_scrolling"],
+    ]);
+    assert.equal(inbox_filter.terms()[0].operand, denmark_id.toString());
+
+    // Only a channel has a topics list.
+    for (const hash of [
+        "#topics",
+        "#topics/is/starred",
+        "#topics/channel/Denmark/topic/lunch",
+        "#topics/dm/undefined",
+    ]) {
+        window.location.hash = hash;
+        recent_view_ui_shown = false;
+        inbox_filter = undefined;
+
+        helper.clear_events();
+        $window_stub.trigger("hashchange");
+        helper.assert_events([
+            [overlays, "close_for_hash_change"],
+            [message_viewport, "stop_auto_scrolling"],
+            [ui_report, "error"],
+        ]);
+        // The home view is shown, and not a topics list.
+        assert.equal(recent_view_ui_shown, true);
+        assert.equal(inbox_filter, undefined);
+    }
 
     window.location.hash = "#narrow";
 
@@ -359,6 +356,19 @@ run_test("hash_interactions", ({override, override_rewire}) => {
         [message_viewport, "stop_auto_scrolling"],
         [ui_report, "error"],
     ]);
+
+    // A DM link with an invalid user slug is not an invalid narrow hash.
+    window.location.hash = "#narrow/dm/undefined";
+
+    helper.clear_events();
+    $window_stub.trigger("hashchange");
+    helper.assert_events([
+        [overlays, "close_for_hash_change"],
+        [message_viewport, "stop_auto_scrolling"],
+        "message_view.show",
+    ]);
+    terms = helper.get_narrow_terms();
+    assert.deepEqual(terms[0].operand, [UNKNOWN_USER_ID]);
 
     window.location.hash = "#channels/subscribed";
 
@@ -427,6 +437,12 @@ run_test("hash_interactions", ({override, override_rewire}) => {
         [admin, "launch", ["users", "active"]],
     ]);
 
+    let fixed_url;
+    override(history, "replaceState", (_state, _title, url) => {
+        fixed_url = url;
+        window.location.hash = new URL(url).hash;
+    });
+
     window.location.hash = "#organization/user-list-admin";
 
     // Check whether `user-list-admin` is redirect to `users`, we
@@ -435,6 +451,7 @@ run_test("hash_interactions", ({override, override_rewire}) => {
     // the arguments passed to `admin.launch`.
     helper.clear_events();
     $window_stub.trigger("hashchange");
+    assert.equal(fixed_url, "http://zulip.zulipdev.com/#organization/users/active");
     helper.assert_events([
         [overlays, "close_for_hash_change"],
         [settings, "build_page"],
@@ -482,6 +499,7 @@ run_test("update_hash_to_match_filter", ({override, override_rewire}) => {
 run_test("fail_incorrectly_cased_URL", ({override, override_rewire}) => {
     browser_history.clear_for_testing();
     override(popovers, "hide_all", noop);
+    override(sidebar_ui, "hide_all", noop);
     const helper = test_helper({override, override_rewire, change_tab: false});
 
     // We can receive URLs which contain operators that

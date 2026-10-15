@@ -339,6 +339,8 @@ ERROR_TEMPLATES = {
     "unexpected_keyword_argument": _('Argument "{argument}" at {var_name} is unexpected'),
     "string_pattern_mismatch": _("{var_name} has invalid format"),
     "string_fixed_length": _("{var_name} is not length {length}"),
+    "too_long": _("{var_name} is too long (limit: {max_length} items)"),
+    "too_short": _("{var_name} is too short (minimum {min_length} items)"),
 }
 
 
@@ -353,7 +355,7 @@ def parse_value_for_parameter(parameter: FuncParam[T], value: object) -> T:
         error = exc.errors()[0]
         # We require all Pydantic raised error types that we expect to be
         # explicitly handled here. The end result should either be a 400
-        # error with an translated message or an internal server error.
+        # error with a translated message or an internal server error.
         error_template = ERROR_TEMPLATES.get(error["type"])
         var_name = parameter.request_var_name + "".join(
             f"[{json.dumps(loc)}]" for loc in error["loc"]

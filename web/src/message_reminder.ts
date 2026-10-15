@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import type * as z from "zod/mini";
 
 import render_message_reminders from "../templates/message_reminders.hbs";
@@ -20,7 +20,11 @@ export type TimeFormattedReminder = {
     scheduled_delivery_timestamp: number;
 };
 
-export const reminders_by_id = new Map<number, Reminder>();
+export let reminders_by_id = new Map<number, Reminder>();
+
+export function set_reminders_by_id_for_testing(reminders: Map<number, Reminder>): void {
+    reminders_by_id = reminders;
+}
 
 export const reminders_by_message_id = new Map<number, TimeFormattedReminder[]>();
 

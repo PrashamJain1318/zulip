@@ -11,6 +11,7 @@ const buddy_list_presence = mock_esm("../src/buddy_list_presence");
 const scroll_util = mock_esm("../src/scroll_util");
 const pm_list = mock_esm("../src/pm_list");
 const util = mock_esm("../src/util");
+mock_esm("../src/sidebar_header_sticky_shadow", {initialize() {}});
 
 const state_data = zrequire("state_data");
 const activity_ui = zrequire("activity_ui");
@@ -22,6 +23,31 @@ run_test("redraw", ({override, override_rewire}) => {
     override(buddy_list_presence, "update_indicators", noop);
 
     activity_ui.redraw();
+});
+
+run_test("defer buddy list redraw while a user card is open", ({override, override_rewire}) => {
+    const realm = make_realm();
+    state_data.set_realm(realm);
+    override(realm, "realm_presence_disabled", false);
+    override(pm_list, "update_private_messages", noop);
+    override(buddy_list_presence, "update_indicators", noop);
+    activity_ui.set_cursor_and_filter();
+
+    activity_ui.set_user_card_open(true);
+    assert.equal(activity_ui.build_user_sidebar(), undefined);
+    activity_ui.redraw_user(1);
+
+    let build_count = 0;
+    override_rewire(activity_ui, "build_user_sidebar", () => {
+        build_count += 1;
+        return undefined;
+    });
+    activity_ui.set_user_card_open(false);
+    assert.equal(build_count, 1);
+
+    activity_ui.set_user_card_open(true);
+    activity_ui.set_user_card_open(false);
+    assert.equal(build_count, 1);
 });
 
 run_test("initialize", ({override, override_rewire}) => {
@@ -60,17 +86,17 @@ run_test("initialize", ({override, override_rewire}) => {
         assert.equal(delay, 42000);
     });
 
-    let my_email = "";
+    let my_user_id;
 
-    function narrow_by_email(email) {
-        my_email = email;
+    function narrow_by_user_id(user_id) {
+        my_user_id = user_id;
     }
 
-    activity_ui.initialize({narrow_by_email});
+    activity_ui.initialize({narrow_by_user_id});
 
-    assert.equal(my_email, "");
-    activity_ui.get_narrow_by_email_function_for_test_code()("alice@example.com");
-    assert.equal(my_email, "alice@example.com");
+    assert.equal(my_user_id, undefined);
+    activity_ui.get_narrow_by_user_id_function_for_test_code()(1);
+    assert.equal(my_user_id, 1);
 
     // Simulate the subsequent calls to
     // activity.send_presence_to_server.

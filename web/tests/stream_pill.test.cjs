@@ -4,9 +4,15 @@ const assert = require("node:assert/strict");
 
 const {make_user_group} = require("./lib/example_group.cjs");
 const {make_realm} = require("./lib/example_realm.cjs");
-const example_settings = require("./lib/example_settings.cjs");
-const {zrequire} = require("./lib/namespace.cjs");
+const {server_supported_permission_settings} = require("./lib/example_settings.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
+const {make_user} = require("./lib/example_user.cjs");
+const {mock_channel_get} = require("./lib/mock_channel.cjs");
+const {mock_esm, zrequire} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
+const blueslip = require("./lib/zblueslip.cjs");
+
+const channel = mock_esm("../src/channel");
 
 const peer_data = zrequire("peer_data");
 const people = zrequire("people");
@@ -20,11 +26,11 @@ const realm = make_realm();
 set_current_user(current_user);
 set_realm(realm);
 
-const me = {
+const me = make_user({
     email: "me@example.com",
     user_id: 5,
     full_name: "Me Myself",
-};
+});
 
 const me_group = make_user_group({
     name: "me_group",
@@ -41,23 +47,23 @@ const nobody_group = make_user_group({
     direct_subgroup_ids: new Set(),
 });
 
-const denmark = {
+const denmark = make_stream({
     stream_id: 101,
     name: "Denmark",
     subscribed: true,
     can_administer_channel_group: nobody_group.id,
     can_add_subscribers_group: nobody_group.id,
     can_subscribe_group: nobody_group.id,
-};
-const sweden = {
+});
+const sweden = make_stream({
     stream_id: 102,
     name: "Sweden",
     subscribed: false,
     can_administer_channel_group: nobody_group.id,
     can_add_subscribers_group: nobody_group.id,
     can_subscribe_group: nobody_group.id,
-};
-const germany = {
+});
+const germany = make_stream({
     stream_id: 103,
     name: "Germany",
     subscribed: false,
@@ -65,17 +71,19 @@ const germany = {
     can_administer_channel_group: nobody_group.id,
     can_add_subscribers_group: nobody_group.id,
     can_subscribe_group: nobody_group.id,
-};
+});
 
 const denmark_pill = {
     type: "stream",
     stream_id: denmark.stream_id,
-    show_subscriber_count: true,
 };
 const sweden_pill = {
     type: "stream",
     stream_id: sweden.stream_id,
-    show_subscriber_count: true,
+};
+const germany_pill = {
+    type: "stream",
+    stream_id: germany.stream_id,
 };
 
 const subs = [denmark, sweden, germany];
@@ -94,11 +102,7 @@ user_groups.initialize({realm_user_groups: [me_group, nobody_group]});
 run_test("create_item", ({override}) => {
     override(current_user, "user_id", me.user_id);
     override(current_user, "is_admin", true);
-    override(
-        realm,
-        "server_supported_permission_settings",
-        example_settings.server_supported_permission_settings,
-    );
+    override(realm, "server_supported_permission_settings", server_supported_permission_settings);
     override(realm, "realm_can_add_subscribers_group", me_group.id);
     function test_create_item(
         stream_name,
@@ -126,8 +130,6 @@ run_test("create_item", ({override}) => {
 run_test("display_value", () => {
     assert.deepEqual(stream_pill.get_display_value_from_item(denmark_pill), "Denmark");
     assert.deepEqual(stream_pill.get_display_value_from_item(sweden_pill), "Sweden");
-    sweden_pill.show_subscriber_count = false;
-    assert.deepEqual(stream_pill.get_display_value_from_item(sweden_pill), "Sweden");
 });
 
 run_test("get_stream_id", () => {
@@ -138,8 +140,37 @@ run_test("get_user_ids", async () => {
     const items = [denmark_pill, sweden_pill];
     const widget = {items: () => items};
 
-    const user_ids = await stream_pill.get_user_ids(widget);
-    assert.deepEqual(user_ids, [1, 2, 3, 4, 5, 77]);
+    assert.deepEqual(await stream_pill.get_user_ids(widget), {
+        status: "success",
+        user_ids: [1, 2, 3, 4, 5, 77],
+    });
+});
+
+run_test("get_user_ids_fetch_failed", async () => {
+    // Germany's subscribers have not been fetched, and the fetch
+    // fails with a bad request, so we don't know who they are.
+    const widget = {items: () => [denmark_pill, germany_pill]};
+    mock_channel_get(channel, (opts) => {
+        assert.equal(opts.url, `/json/streams/${germany.stream_id}/members`);
+        opts.error({status: 400, responseJSON: ""});
+    });
+    blueslip.expect("error", "Bad request to fetch channel subscribers.");
+    assert.deepEqual(await stream_pill.get_user_ids(widget), {
+        status: "failed",
+        failed_stream_id: germany.stream_id,
+    });
+    blueslip.reset();
+});
+
+run_test("get_subscriber_fetch_failure_message", () => {
+    assert.equal(
+        stream_pill.get_subscriber_fetch_failure_message(germany.stream_id),
+        "translated: Failed to fetch subscribers of #Germany. Remove the channel and try again.",
+    );
+    assert.equal(
+        stream_pill.get_subscriber_fetch_failure_message(999),
+        "translated: Failed to fetch subscribers of a channel. Remove the channel and try again.",
+    );
 });
 
 run_test("get_stream_ids", () => {
@@ -156,10 +187,9 @@ run_test("generate_pill_html", () => {
         "<div class='pill 'data-stream-id=\"101\" tabindex=0>\n" +
             '    <span class="pill-label">\n' +
             '        <span class="pill-value">\n' +
-            '<i class="zulip-icon zulip-icon-hashtag channel-privacy-type-icon" aria-hidden="true"></i>            Denmark\n' +
-            "        </span></span>\n" +
+            '                <span class="decorated-channel-name-wrapper"><span class="channel-privacy-type-icon"><i class="zulip-icon zulip-icon-hashtag" aria-hidden="true"></i></span><span class="decorated-channel-name">Denmark</span></span>        </span></span>\n' +
             '    <div class="exit">\n' +
-            '        <a role="button" class="zulip-icon zulip-icon-close pill-close-button"></a>\n' +
+            '        <i role="button" class="zulip-icon zulip-icon-close pill-close-button" aria-label="translated: Remove"></i>\n' +
             "    </div>\n" +
             "</div>\n",
     );

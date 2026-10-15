@@ -22,12 +22,13 @@ from django.utils.timezone import now as timezone_now
 
 from zerver.actions.realm_settings import do_deactivate_realm
 from zerver.actions.streams import do_change_stream_group_based_setting, do_deactivate_stream
-from zerver.actions.users import do_deactivate_user
+from zerver.actions.users import change_user_is_active, do_deactivate_user
 from zerver.lib.email_mirror import (
     RateLimitedRealmMirror,
     create_missed_message_address,
     filter_footer,
     generate_missed_message_token,
+    get_message_part_by_type,
     get_missed_message_token_from_address,
     is_forwarded,
     is_missed_message_address,
@@ -44,16 +45,23 @@ from zerver.lib.email_mirror_helpers import (
     get_channel_email_token,
     get_email_gateway_message_string_from_address,
 )
-from zerver.lib.email_mirror_server import ZulipMessageHandler, send_to_postmaster
-from zerver.lib.email_notifications import convert_html_to_markdown
+from zerver.lib.email_mirror_server import (
+    ZulipMessageHandler,
+    parse_listen_address,
+    send_to_postmaster,
+)
+from zerver.lib.markdown.from_html import convert_html_to_markdown
+from zerver.lib.message import truncate_topic
 from zerver.lib.send_email import FromAddress
 from zerver.lib.streams import ensure_stream
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import most_recent_message, most_recent_usermessage
 from zerver.models import Attachment, Recipient, Stream, UserProfile
+from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
 from zerver.models.groups import NamedUserGroup, SystemGroups
 from zerver.models.messages import Message
 from zerver.models.realms import get_realm
+from zerver.models.recipients import get_or_create_direct_message_group
 from zerver.models.streams import StreamTopicsPolicyEnum, get_stream
 from zerver.models.users import get_system_bot
 
@@ -306,24 +314,27 @@ class TestStreamEmailMessages(ZulipTestCase):
         email_token = get_channel_email_token(stream, creator=user_profile, sender=user_profile)
         stream_to_address = encode_email_address(stream.name, email_token)
 
-        incoming_valid_message = EmailMessage()
-        incoming_valid_message.set_content("TestStreamEmailMessages body")
+        for header_name, header_value in [
+            ("Delivered-To", stream_to_address),
+            ("Envelope-To", f"<{stream_to_address}>"),
+        ]:
+            with self.subTest(header_name):
+                incoming_valid_message = EmailMessage()
+                incoming_valid_message.set_content(f"{header_name} body")
 
-        incoming_valid_message["Subject"] = "TestStreamEmailMessages subject"
-        incoming_valid_message["From"] = self.example_email("hamlet")
-        # Simulate a mailing list
-        incoming_valid_message["To"] = "foo-mailinglist@example.com"
-        incoming_valid_message["Envelope-To"] = stream_to_address
-        incoming_valid_message["Reply-to"] = self.example_email("othello")
+                incoming_valid_message["Subject"] = f"{header_name} subject"
+                incoming_valid_message["From"] = self.example_email("hamlet")
+                incoming_valid_message["To"] = "foo-mailinglist@example.com"
+                incoming_valid_message["Reply-to"] = self.example_email("othello")
+                incoming_valid_message[header_name] = header_value
 
-        process_message(incoming_valid_message)
+                process_message(incoming_valid_message)
 
-        # Hamlet is subscribed to this stream so should see the email message from Othello.
-        message = most_recent_message(user_profile)
-
-        self.assertEqual(message.content, "TestStreamEmailMessages body")
-        self.assert_message_stream_name(message, stream.name)
-        self.assertEqual(message.topic_name(), incoming_valid_message["Subject"])
+                # Hamlet is subscribed to this stream so should see the email message from Othello.
+                message = most_recent_message(user_profile)
+                self.assertEqual(message.content, f"{header_name} body")
+                self.assert_message_stream_name(message, stream.name)
+                self.assertEqual(message.topic_name(), incoming_valid_message["Subject"])
 
     def test_receive_stream_email_messages_blank_subject_success(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -490,8 +501,10 @@ class TestStreamEmailMessages(ZulipTestCase):
         self.assertEqual(
             m.output,
             [
-                f"INFO:{logger_name}:Failed to process email to {stream.name} ({stream.realm.string_id}): "
-                f"Not authorized to send to channel '{stream.name}'",
+                (
+                    f"INFO:{logger_name}:Failed to process email to {stream.name} ({stream.realm.string_id}): "
+                    f"Not authorized to send to channel '{stream.name}'"
+                )
             ],
         )
         self.assertEqual(Message.objects.latest("id").id, last_message_id)
@@ -836,6 +849,38 @@ class TestChannelEmailMessagesPermissions(ZulipTestCase):
                 f"INFO:{logger_name}:Successfully processed email to {channel.name} ({realm.string_id})"
             ],
         )
+
+    def test_deactivated_sender_or_creator(self) -> None:
+        hamlet = self.example_user("hamlet")
+        realm = get_realm("zulip")
+        channel = get_stream("Denmark", realm)
+        email_gateway_bot = get_system_bot(settings.EMAIL_GATEWAY_BOT, realm.id)
+        bot = self.create_test_bot("test2", hamlet, full_name="Test bot")
+
+        channel_email_addresses = [
+            encode_email_address(
+                channel.name, get_channel_email_token(channel, creator=hamlet, sender=sender)
+            )
+            for sender in (hamlet, email_gateway_bot, bot)
+        ]
+
+        # Deactivating a user also deactivates their bots.
+        do_deactivate_user(hamlet, acting_user=None)
+        bot.refresh_from_db()
+        self.assertFalse(bot.is_active)
+
+        initial_last_message = self.get_last_message()
+        for channel_email_address in channel_email_addresses:
+            incoming_valid_message = self.create_incoming_valid_message(channel_email_address)
+            with self.assertLogs(logger_name, level="INFO") as m:
+                process_message(incoming_valid_message)
+            self.assertEqual(
+                m.output,
+                [
+                    f"INFO:{logger_name}:Failed to process email to {channel.name} ({realm.string_id}): Sending user is not active. Ignoring this channel message email."
+                ],
+            )
+        self.assertEqual(initial_last_message, self.get_last_message())
 
 
 class TestEmailMirrorMessagesWithAttachments(ZulipTestCase):
@@ -1273,100 +1318,186 @@ class TestStreamEmailMessagesEmptyBody(ZulipTestCase):
 
 
 class TestMissedMessageEmailMessages(ZulipTestCase):
-    def test_receive_missed_personal_message_email_messages(self) -> None:
-        # Build dummy messages for message notification email reply.
-        # Have Hamlet send Othello a direct message. Othello will
-        # reply via email Hamlet will receive the message.
-        self.login("hamlet")
-        othello = self.example_user("othello")
+    def send_dm_and_get_reply_address(
+        self,
+        sender: UserProfile,
+        recipients: list[UserProfile],
+        *,
+        reply_sender: UserProfile,
+        content: str = "original direct message",
+    ) -> str:
+        # Send a direct message from `sender` to `recipients` (a group
+        # DM, or a 1:1 when there is a single recipient), and return a
+        # missed-message reply address for `reply_sender`.
+        self.login_user(sender)
         result = self.client_post(
             "/json/messages",
             {
                 "type": "private",
-                "content": "test_receive_missed_message_email_messages",
-                "to": orjson.dumps([othello.id]).decode(),
+                "content": content,
+                "to": orjson.dumps([user.id for user in recipients]).decode(),
             },
         )
         self.assert_json_success(result)
 
-        user_profile = self.example_user("othello")
-        usermessage = most_recent_usermessage(user_profile)
+        usermessage = most_recent_usermessage(reply_sender)
+        # We don't want to send actual emails, but we do need to
+        # create and store the token for looking up who did reply.
+        return create_missed_message_address(reply_sender, usermessage.message)
 
-        # we don't want to send actual emails but we do need to create and store the
-        # token for looking up who did reply.
-        mm_address = create_missed_message_address(user_profile, usermessage.message)
-
+    def build_missed_message_reply_email(
+        self, sender: UserProfile, mm_address: str, body: str
+    ) -> EmailMessage:
         incoming_valid_message = EmailMessage()
-        incoming_valid_message.set_content("TestMissedMessageEmailMessages body")
-
-        incoming_valid_message["Subject"] = "TestMissedMessageEmailMessages subject"
-        incoming_valid_message["From"] = self.example_email("othello")
+        incoming_valid_message.set_content(body)
+        incoming_valid_message["Subject"] = "reply subject"
+        incoming_valid_message["From"] = sender.delivery_email
         incoming_valid_message["To"] = mm_address
-        incoming_valid_message["Reply-to"] = self.example_email("othello")
+        incoming_valid_message["Reply-to"] = sender.delivery_email
+        return incoming_valid_message
 
-        with self.assert_database_query_count(17):
+    def test_receive_missed_personal_message_email_messages(self) -> None:
+        # Build dummy messages for message notification email reply.
+        # Have Hamlet send Othello a direct message. Othello will
+        # reply via email Hamlet will receive the message.
+        othello = self.example_user("othello")
+        hamlet = self.example_user("hamlet")
+        mm_address = self.send_dm_and_get_reply_address(hamlet, [othello], reply_sender=othello)
+
+        incoming_valid_message = self.build_missed_message_reply_email(
+            othello, mm_address, "TestMissedMessageEmailMessages body"
+        )
+
+        with self.assert_database_query_count(21):
             process_message(incoming_valid_message)
 
         # confirm that Hamlet got the message
-        user_profile = self.example_user("hamlet")
-        message = most_recent_message(user_profile)
+        message = most_recent_message(hamlet)
 
+        direct_group_message = get_or_create_direct_message_group(id_list=[hamlet.id, othello.id])
         self.assertEqual(message.content, "TestMissedMessageEmailMessages body")
-        self.assertEqual(message.sender, self.example_user("othello"))
-        self.assertEqual(message.recipient.type_id, user_profile.id)
-        self.assertEqual(message.recipient.type, Recipient.PERSONAL)
+        self.assertEqual(message.sender, othello)
+        self.assertEqual(message.recipient.type_id, direct_group_message.id)
+        self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
 
     def test_receive_missed_group_direct_message_email_messages(self) -> None:
         # Build dummy messages for message notification email reply.
         # Have Othello send Iago and Cordelia a group direct message.
         # Cordelia will reply via email Iago and Othello will receive
         # the message.
-        self.login("othello")
+        othello = self.example_user("othello")
         cordelia = self.example_user("cordelia")
         iago = self.example_user("iago")
-        result = self.client_post(
-            "/json/messages",
-            {
-                "type": "private",
-                "content": "test_receive_missed_message_email_messages",
-                "to": orjson.dumps([cordelia.id, iago.id]).decode(),
-            },
+        mm_address = self.send_dm_and_get_reply_address(
+            othello, [cordelia, iago], reply_sender=cordelia
         )
-        self.assert_json_success(result)
 
-        user_profile = self.example_user("cordelia")
-        usermessage = most_recent_usermessage(user_profile)
+        incoming_valid_message = self.build_missed_message_reply_email(
+            cordelia, mm_address, "TestMissedGroupDirectMessageEmailMessages body"
+        )
 
-        # we don't want to send actual emails but we do need to create and store the
-        # token for looking up who did reply.
-        mm_address = create_missed_message_address(user_profile, usermessage.message)
-
-        incoming_valid_message = EmailMessage()
-        incoming_valid_message.set_content("TestMissedGroupDirectMessageEmailMessages body")
-
-        incoming_valid_message["Subject"] = "TestMissedGroupDirectMessageEmailMessages subject"
-        incoming_valid_message["From"] = self.example_email("cordelia")
-        incoming_valid_message["To"] = mm_address
-        incoming_valid_message["Reply-to"] = self.example_email("cordelia")
-
-        with self.assert_database_query_count(22):
+        with self.assert_database_query_count(21):
             process_message(incoming_valid_message)
 
-        # Confirm Iago received the message.
-        user_profile = self.example_user("iago")
-        message = most_recent_message(user_profile)
+        # Confirm Iago and Othello received the message.
+        for user_profile in [iago, othello]:
+            message = most_recent_message(user_profile)
+            self.assertEqual(message.content, "TestMissedGroupDirectMessageEmailMessages body")
+            self.assertEqual(message.sender, cordelia)
+            self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
 
-        self.assertEqual(message.content, "TestMissedGroupDirectMessageEmailMessages body")
-        self.assertEqual(message.sender, self.example_user("cordelia"))
+    def test_receive_missed_group_direct_message_email_with_deactivated_user(self) -> None:
+        # A reply to a message notification email for a group direct
+        # message is delivered to the remaining active members when a
+        # member of the group has since been deactivated, and the
+        # conversation remains a group direct message.
+        othello = self.example_user("othello")
+        cordelia = self.example_user("cordelia")
+        iago = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
+        mm_address = self.send_dm_and_get_reply_address(
+            othello, [cordelia, iago, hamlet], reply_sender=cordelia
+        )
+
+        iago_message_before = most_recent_message(iago)
+        do_deactivate_user(iago, acting_user=None)
+
+        incoming_valid_message = self.build_missed_message_reply_email(
+            cordelia, mm_address, "Reply with deactivated group member body"
+        )
+        process_message(incoming_valid_message)
+
+        # The remaining active members received the message, in the
+        # direct message group of just the active members.
+        direct_message_group = get_or_create_direct_message_group(
+            id_list=[othello.id, cordelia.id, hamlet.id]
+        )
+        for user_profile in [othello, hamlet]:
+            message = most_recent_message(user_profile)
+            self.assertEqual(message.content, "Reply with deactivated group member body")
+            self.assertEqual(message.sender, cordelia)
+            self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+            self.assertEqual(message.recipient.type_id, direct_message_group.id)
+
+        # The deactivated user did not receive the message.
+        self.assertEqual(most_recent_message(iago).id, iago_message_before.id)
+
+    def test_receive_missed_group_direct_message_email_keeps_mirror_dummy_user(self) -> None:
+        # A mirror-dummy user is inactive but a valid recipient; unlike a
+        # deactivated user, it must be kept in the group when delivering
+        # the reply.
+        othello = self.example_user("othello")
+        cordelia = self.example_user("cordelia")
+        iago = self.example_user("iago")
+        mm_address = self.send_dm_and_get_reply_address(
+            othello, [cordelia, iago], reply_sender=cordelia
+        )
+
+        iago.is_mirror_dummy = True
+        iago.save(update_fields=["is_mirror_dummy"])
+        change_user_is_active(iago, False)
+
+        incoming_valid_message = self.build_missed_message_reply_email(
+            cordelia, mm_address, "Reply with mirror-dummy group member body"
+        )
+        process_message(incoming_valid_message)
+
+        # The reply reaches the full three-person group (the mirror-dummy
+        # user was kept), not a reduced group.
+        direct_message_group = get_or_create_direct_message_group(
+            id_list=[othello.id, cordelia.id, iago.id]
+        )
+        message = most_recent_message(othello)
+        self.assertEqual(message.content, "Reply with mirror-dummy group member body")
+        self.assertEqual(message.sender, cordelia)
         self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+        self.assertEqual(message.recipient.type_id, direct_message_group.id)
 
-        # Confirm Othello received the message.
-        user_profile = self.example_user("othello")
-        message = most_recent_message(user_profile)
+    def test_receive_missed_group_direct_message_email_all_recipients_deactivated(self) -> None:
+        # If every member other than the sender has been deactivated,
+        # the reply is dropped with a log message rather than an
+        # exception.
+        othello = self.example_user("othello")
+        cordelia = self.example_user("cordelia")
+        iago = self.example_user("iago")
+        mm_address = self.send_dm_and_get_reply_address(
+            othello, [cordelia, iago], reply_sender=cordelia
+        )
 
-        self.assertEqual(message.content, "TestMissedGroupDirectMessageEmailMessages body")
-        self.assertEqual(message.sender, self.example_user("cordelia"))
-        self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+        do_deactivate_user(othello, acting_user=None)
+        do_deactivate_user(iago, acting_user=None)
+
+        incoming_valid_message = self.build_missed_message_reply_email(
+            cordelia, mm_address, "Reply with no active recipients body"
+        )
+        initial_last_message = self.get_last_message()
+        with self.assertLogs("zerver.lib.email_mirror", level="INFO") as info_logs:
+            process_message(incoming_valid_message)
+        self.assertIn(
+            f"INFO:zerver.lib.email_mirror:Dropping message notification email reply from user {cordelia.id} to a group direct message with no active recipients",
+            info_logs.output,
+        )
+        self.assertEqual(initial_last_message, self.get_last_message())
 
     def test_receive_missed_stream_message_email_messages(self) -> None:
         # build dummy messages for message notification email reply
@@ -1401,7 +1532,7 @@ class TestMissedMessageEmailMessages(ZulipTestCase):
         incoming_valid_message["To"] = mm_address
         incoming_valid_message["Reply-to"] = user_profile.delivery_email
 
-        with self.assert_database_query_count(18):
+        with self.assert_database_query_count(19):
             process_message(incoming_valid_message)
 
         # confirm that Hamlet got the message
@@ -1820,6 +1951,59 @@ class TestStreamEmailMessagesSubjectStripping(ZulipTestCase):
             stripped = strip_from_subject(subject["original_subject"])
             self.assertEqual(stripped, subject["stripped_subject"])
 
+    def test_subject_added_for_every_message(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login_user(hamlet)
+        stream = self.subscribe(hamlet, "Denmark")
+
+        long_subject = "S" * (MAX_TOPIC_NAME_LENGTH + 10)
+        email_body = "TestStreamEmailMessages body"
+        email_token = get_channel_email_token(stream, creator=hamlet, sender=hamlet)
+        stream_to_address = encode_email_address(stream.name, email_token)
+        stream_to_address_with_sender = encode_email_address(
+            stream.name, email_token, show_sender=True
+        )
+
+        def get_incoming_valid_message(to: str, subject: str = long_subject) -> EmailMessage:
+            message = EmailMessage()
+            message.set_content(email_body)
+            message["Subject"] = subject
+            message["From"] = self.example_email("hamlet")
+            message["To"] = to
+            message["Reply-to"] = self.example_email("othello")
+            return message
+
+        process_message(get_incoming_valid_message(stream_to_address))
+        message = most_recent_message(hamlet)
+        self.assertEqual(truncate_topic(long_subject), message.topic_name())
+        self.assertEqual(
+            f"**Subject:** {long_subject}\n\n{email_body}",
+            message.content,
+        )
+
+        process_message(get_incoming_valid_message(stream_to_address_with_sender))
+        message = most_recent_message(hamlet)
+        self.assertEqual(truncate_topic(long_subject), message.topic_name())
+        self.assertEqual(
+            f"**From:** {hamlet.delivery_email}\n**Subject:** {long_subject}\n\n{email_body}",
+            message.content,
+        )
+
+        # Two different long subjects that truncate to the same topic name
+        # should each still show their full subject in the body.
+        subject_a = "S" * MAX_TOPIC_NAME_LENGTH + "AAAA"
+        subject_b = "S" * MAX_TOPIC_NAME_LENGTH + "BBBB"
+        self.assertEqual(truncate_topic(subject_a), truncate_topic(subject_b))
+
+        for full_subject in (subject_a, subject_b):
+            process_message(get_incoming_valid_message(stream_to_address, subject=full_subject))
+            message = most_recent_message(hamlet)
+            self.assertEqual(truncate_topic(full_subject), message.topic_name())
+            self.assertEqual(
+                f"**Subject:** {full_subject}\n\n{email_body}",
+                message.content,
+            )
+
 
 # If the Content-Type header didn't specify a charset, the text content
 # of the email used to not be properly found. Test that this is fixed:
@@ -1872,6 +2056,21 @@ class TestContentTypeInvalidCharset(ZulipTestCase):
         message = most_recent_message(user_profile)
 
         self.assertEqual(message.content, "Email fixture 1.txt body")
+
+    def test_israel_encoding_alias(self) -> None:
+        # in hebrew: shalom (שלום)
+        hebrew_text_bytes = b"\xf9\xec\xe5\xed"
+
+        message = EmailMessage()
+        message.set_payload(hebrew_text_bytes)
+
+        # testing exact string
+        message["Content-Type"] = 'text/plain; charset="iso-8859-8-i"'
+
+        # return the decoded string
+        decoded_body = get_message_part_by_type(message, "text/plain")
+
+        self.assertEqual(decoded_body, "שלום")
 
 
 class TestEmailMirrorProcessMessageNoValidRecipient(ZulipTestCase):
@@ -2005,6 +2204,32 @@ class TestEmailMirrorLogAndReport(ZulipTestCase):
 
 
 class TestEmailMirrorServer(ZulipTestCase):
+    def test_parse_listen_address(self) -> None:
+        ipv4_wildcard = "0.0.0.0"  # noqa: S104
+        with mock.patch("socket.has_dualstack_ipv6", return_value=True):
+            self.assertEqual(parse_listen_address("25"), ("::", 25))
+            self.assertEqual(parse_listen_address(":25"), ("::", 25))
+        with mock.patch("socket.has_dualstack_ipv6", return_value=False):
+            self.assertEqual(parse_listen_address("25"), (ipv4_wildcard, 25))
+            self.assertEqual(parse_listen_address(":25"), (ipv4_wildcard, 25))
+        self.assertEqual(parse_listen_address(f"{ipv4_wildcard}:25"), (ipv4_wildcard, 25))
+        self.assertEqual(parse_listen_address("[::]:2525"), ("::", 2525))
+        self.assertEqual(parse_listen_address("[2001:db8::1]:25"), ("2001:db8::1", 25))
+        self.assertEqual(parse_listen_address("mail.example.com:25"), ("mail.example.com", 25))
+        with self.assertRaisesRegex(
+            RuntimeError, "'mail.example.com' does not have a valid port number."
+        ):
+            parse_listen_address("mail.example.com")
+        with self.assertRaisesRegex(RuntimeError, r"'\[::\]' does not have a valid port number."):
+            parse_listen_address("[::]")
+        for unbracketed in ("::", "::1", "2001:db8::1"):
+            with self.assertRaisesRegex(
+                RuntimeError, "IPv6 addresses must be enclosed in square brackets"
+            ):
+                parse_listen_address(unbracketed)
+        with self.assertRaisesRegex(RuntimeError, "is not a valid port, or address:port"):
+            parse_listen_address(f"{ipv4_wildcard}:99999")
+
     def test_send_postmaster(self) -> None:
         email = EmailMessage()
         email.set_content("Hello postmaster!")
@@ -2029,11 +2254,14 @@ class TestEmailMirrorServer(ZulipTestCase):
             self.assertLogs("zerver.lib.email_mirror", "ERROR") as error_log,
         ):
             send_to_postmaster(email)
-            self.assert_length(error_log.output, 1)
+            self.assert_length(error_log.records, 1)
+            self.assertEqual(error_log.records[0].levelname, "ERROR")
             self.assertEqual(
-                error_log.output[0].splitlines()[0],
-                "ERROR:zerver.lib.email_mirror:Error sending bounce email to ['desdemona+admin@zulip.com']: moose",
+                error_log.records[0].getMessage(),
+                "Error sending bounce email to ['desdemona+admin@zulip.com']",
             )
+            assert error_log.records[0].exc_info is not None
+            self.assertEqual(str(error_log.records[0].exc_info[1]), "moose")
 
         with (
             mock.patch.object(
@@ -2323,6 +2551,32 @@ class TestEmailMirrorServer(ZulipTestCase):
         )
 
     @override_settings(EMAIL_GATEWAY_PATTERN="%s@zulip.example.com")
+    async def test_handler_missedmessage_deactivated_user(self) -> None:
+        othello = await sync_to_async(lambda: self.example_user("othello"))()
+        usermessage = await sync_to_async(lambda: most_recent_usermessage(othello))()
+        mm_address = await sync_to_async(
+            lambda: create_missed_message_address(othello, usermessage.message)
+        )()
+        await sync_to_async(lambda: do_deactivate_user(othello, acting_user=None))()
+        self.assertEqual(
+            await self.handler_response(
+                [
+                    "HELO localhost",
+                    "MAIL FROM: <test@example.com>",
+                    f"RCPT TO: <{mm_address}>",
+                    "QUIT",
+                ]
+            ),
+            [
+                "220 testhost Zulip 1.2.3\r\n",
+                "250 testhost\r\n",
+                "250 OK\r\n",
+                "550 5.7.1 Permission denied: Sending user is not active. Ignoring this message notification email.\r\n",
+                "221 Bye\r\n",
+            ],
+        )
+
+    @override_settings(EMAIL_GATEWAY_PATTERN="%s@zulip.example.com")
     async def test_handler_missedmessage(self) -> None:
         othello = await sync_to_async(lambda: self.example_user("othello"))()
         usermessage = await sync_to_async(lambda: most_recent_usermessage(othello))()
@@ -2467,6 +2721,37 @@ class TestEmailMirrorServer(ZulipTestCase):
                 "250 testhost\r\n",
                 "250 OK\r\n",
                 "550 5.7.1 Permission denied: Not authorized to send to channel 'some str'\r\n",
+                "221 Bye\r\n",
+            ],
+        )
+
+    @override_settings(EMAIL_GATEWAY_PATTERN="%s@zulip.example.com")
+    async def test_handler_stream_deactivated_user(self) -> None:
+        stream_name = "some str"
+        realm = await sync_to_async(lambda: get_realm("zulip"))()
+        stream = await sync_to_async(lambda: ensure_stream(realm, stream_name, acting_user=None))()
+        hamlet = await sync_to_async(lambda: self.example_user("hamlet"))()
+        email_token = await sync_to_async(
+            lambda: get_channel_email_token(stream, creator=hamlet, sender=hamlet)
+        )()
+        email_address = encode_email_address(stream.name, email_token)
+
+        await sync_to_async(lambda: do_deactivate_user(hamlet, acting_user=None))()
+
+        self.assertEqual(
+            await self.handler_response(
+                [
+                    "HELO localhost",
+                    "MAIL FROM: <test@example.com>",
+                    f"RCPT TO: <{email_address}>",
+                    "QUIT",
+                ]
+            ),
+            [
+                "220 testhost Zulip 1.2.3\r\n",
+                "250 testhost\r\n",
+                "250 OK\r\n",
+                "550 5.7.1 Permission denied: Sending user is not active. Ignoring this channel message email.\r\n",
                 "221 Bye\r\n",
             ],
         )

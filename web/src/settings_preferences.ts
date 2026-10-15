@@ -1,16 +1,17 @@
-import $ from "jquery";
+import {$} from "jquery";
 import Cookies from "js-cookie";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 import * as z from "zod/mini";
 
 import render_dialog_default_language from "../templates/default_language_modal.hbs";
+import render_confirm_language_change from "../templates/settings/confirm_language_change.hbs";
 
 import * as channel from "./channel.ts";
 import * as dialog_widget from "./dialog_widget.ts";
 import * as dropdown_widget from "./dropdown_widget.ts";
 import * as emojisets from "./emojisets.ts";
-import {$t_html, get_language_list_columns} from "./i18n.ts";
+import {$t, $t_html, get_language_list_columns} from "./i18n.ts";
 import * as information_density from "./information_density.ts";
 import * as loading from "./loading.ts";
 import * as overlays from "./overlays.ts";
@@ -104,16 +105,16 @@ function spectator_default_language_modal_post_render(): void {
 export function launch_default_language_setting_modal_for_spectator(): void {
     const selected_language = user_settings.default_language;
 
-    const html_body = render_dialog_default_language({
+    const modal_content_html = render_dialog_default_language({
         language_list: get_language_list_columns(selected_language).toSorted((a, b) =>
             util.strcmp(a.name_with_percent, b.name_with_percent),
         ),
     });
 
     dialog_widget.launch({
-        html_heading: $t_html({defaultMessage: "Select language"}),
-        html_body,
-        html_submit_button: $t_html({defaultMessage: "Close"}),
+        modal_title_html: $t_html({defaultMessage: "Select language"}),
+        modal_content_html,
+        modal_submit_button_text: $t({defaultMessage: "Close"}),
         id: "language_selection_modal",
         close_on_submit: true,
         focus_submit_on_open: true,
@@ -349,6 +350,14 @@ export function report_user_list_style_change(settings_panel: SettingsPanel): vo
     }
 }
 
+export function update_user_list_style_preview_name(full_name: string): void {
+    $(".user_list_style_values .preview .user-name").text(full_name);
+}
+
+export function update_user_list_style_preview_avatar(avatar_url: string): void {
+    $(".user_list_style_values .preview .user-profile-picture img").attr("src", avatar_url);
+}
+
 export function update_page(property: UserSettingsProperty): void {
     if (!overlays.settings_open()) {
         return;
@@ -387,20 +396,13 @@ function language_select_callback(
     const current_value = widget.current_value;
     assert(current_value !== undefined);
     const data = {default_language: current_value};
+    const language_select_message_html = render_confirm_language_change();
     change_display_setting(
         data,
-        $("#settings_content").find(".general-settings-status"),
+        $("#user-preferences").find(".general-settings-status"),
         undefined,
         undefined,
-        $t_html(
-            {
-                defaultMessage:
-                    "Saved. Please <z-link>reload</z-link> for the change to take effect.",
-            },
-            {
-                "z-link": (content_html) => `<a class='reload_link'>${content_html.join("")}</a>`,
-            },
-        ),
+        language_select_message_html,
         true,
     );
 }

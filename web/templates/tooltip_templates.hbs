@@ -10,6 +10,14 @@
     {{t 'Scroll to bottom' }}
     {{tooltip_hotkey_hints "End"}}
 </template>
+<template id="next-unread-topic-button-tooltip-template">
+    {{t 'Go to next unread topic' }}
+    {{tooltip_hotkey_hints "N"}}
+</template>
+<template id="next-unread-dm-conversation-button-tooltip-template">
+    {{t 'Go to next unread direct message' }}
+    {{tooltip_hotkey_hints "P"}}
+</template>
 <template id="compose_disable_stream_reply_button_tooltip_template">
     {{t 'You do not have permission to post in this channel.' }}
 </template>
@@ -37,7 +45,7 @@
     {{tooltip_hotkey_hints "C"}}
 </template>
 <template id="new_direct_message_button_tooltip_template">
-    {{t 'New direct message' }}
+    {{t 'Start a new DM' }}
     {{tooltip_hotkey_hints "X"}}
 </template>
 <template id="compose_close_tooltip_template">
@@ -133,7 +141,7 @@
     {{tooltip_hotkey_hints "A"}}
 </template>
 <template id="recent-conversations-tooltip-template">
-    <div class="views-tooltip-container" data-view-code="recent_topics">
+    <div class="views-tooltip-container" data-view-code="recent">
         <div>{{t 'Recent conversations' }}</div>
         <div class="tootlip-inner-content views-message-count italic hidden-for-spectators"></div>
         <div class="tooltip-inner-content views-tooltip-home-view-note italic hide hidden-for-spectators">{{t 'This is your home view.' }}</div>
@@ -188,6 +196,7 @@
         <div>{{t 'Mentions' }}</div>
         <div class="tootlip-inner-content views-message-count italic"></div>
     </div>
+    {{tooltip_hotkey_hints "Ctrl" "@"}}
 </template>
 <template id="message-expander-tooltip-template">
     {{t 'Show more' }}
@@ -282,10 +291,6 @@
 <template id="show-unsubscribe-tooltip-template">
     {{t 'Unsubscribe from this channel' }}
     {{tooltip_hotkey_hints "Shift" "S"}}
-</template>
-<template id="view-stream-tooltip-template">
-    {{t 'View channel' }}
-    {{tooltip_hotkey_hints "Shift" "V"}}
 </template>
 <template id="mobile-push-notification-tooltip-template">
     {{t 'Mobile push notifications are not enabled on this server.' }}

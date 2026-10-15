@@ -1,5 +1,5 @@
 from collections.abc import Iterable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import Enum
 
 from django.conf import settings
@@ -11,7 +11,7 @@ from confirmation.models import Confirmation, create_confirmation_link
 from confirmation.settings import STATUS_REVOKED, STATUS_USED
 from zerver.actions.message_send import send_user_profile_update_notification
 from zerver.actions.presence import do_update_user_presence
-from zerver.lib.avatar import avatar_url
+from zerver.lib.avatar import avatar_url, generate_and_upload_jdenticon_avatar
 from zerver.lib.cache import (
     bulk_flush_users,
     cache_delete,
@@ -19,6 +19,17 @@ from zerver.lib.cache import (
     user_profile_by_api_key_cache_key,
 )
 from zerver.lib.create_user import get_display_email_address
+from zerver.lib.event_types import (
+    PersonAvatarFields,
+    PersonDateJoined,
+    PersonDeliveryEmail,
+    PersonEmail,
+    PersonFullName,
+    PersonTimezone,
+    RealmExportConsentEvent,
+    RealmUserUpdateEvent,
+    UserSettingsUpdateEvent,
+)
 from zerver.lib.i18n import get_language_name
 from zerver.lib.queue import queue_event_on_commit
 from zerver.lib.send_email import FromAddress, clear_scheduled_emails, send_email
@@ -35,6 +46,7 @@ from zerver.lib.users import (
 )
 from zerver.lib.utils import generate_api_key
 from zerver.models import (
+    Device,
     Draft,
     EmailChangeStatus,
     Realm,
@@ -46,13 +58,13 @@ from zerver.models import (
 )
 from zerver.models.clients import get_client
 from zerver.models.realm_audit_logs import AuditLogEventType
-from zerver.models.users import bot_owner_user_ids, get_user_profile_by_id
+from zerver.models.users import get_user_profile_by_id
 from zerver.tornado.django_api import send_event_on_commit
 
 
 def send_user_email_update_event(user_profile: UserProfile) -> None:
-    payload = dict(user_id=user_profile.id, new_email=user_profile.email)
-    event = dict(type="realm_user", op="update", person=payload)
+    payload = PersonEmail(user_id=user_profile.id, new_email=user_profile.email)
+    event = RealmUserUpdateEvent(person=payload)
     send_event_on_commit(
         user_profile.realm,
         event,
@@ -95,16 +107,18 @@ def send_delivery_email_update_events(
                 delivery_email_now_invisible_user_ids.append(active_user.id)
 
     if delivery_email_now_visible_user_ids:
-        person = dict(user_id=user_profile.id, delivery_email=user_profile.delivery_email)
-        event = dict(type="realm_user", op="update", person=person)
+        person = PersonDeliveryEmail(
+            user_id=user_profile.id, delivery_email=user_profile.delivery_email
+        )
+        event = RealmUserUpdateEvent(person=person)
         send_event_on_commit(
             user_profile.realm,
             event,
             delivery_email_now_visible_user_ids,
         )
     if delivery_email_now_invisible_user_ids:
-        person = dict(user_id=user_profile.id, delivery_email=None)
-        event = dict(type="realm_user", op="update", person=person)
+        person = PersonDeliveryEmail(user_id=user_profile.id, delivery_email=None)
+        event = RealmUserUpdateEvent(person=person)
         send_event_on_commit(
             user_profile.realm,
             event,
@@ -128,8 +142,8 @@ def do_change_user_delivery_email(
         user_profile.save(update_fields=["delivery_email"])
 
     # We notify all the users who have access to delivery email.
-    payload = dict(user_id=user_profile.id, delivery_email=new_email)
-    event = dict(type="realm_user", op="update", person=payload)
+    payload = PersonDeliveryEmail(user_id=user_profile.id, delivery_email=new_email)
+    event = RealmUserUpdateEvent(person=payload)
     delivery_email_visible_user_ids = get_users_with_access_to_real_email(user_profile)
 
     send_event_on_commit(user_profile.realm, event, delivery_email_visible_user_ids)
@@ -242,18 +256,12 @@ def do_change_full_name(
         event_time=event_time,
         extra_data={RealmAuditLog.OLD_VALUE: old_name, RealmAuditLog.NEW_VALUE: full_name},
     )
-    payload = dict(user_id=user_profile.id, full_name=user_profile.full_name)
+    payload = PersonFullName(user_id=user_profile.id, full_name=user_profile.full_name)
     send_event_on_commit(
         user_profile.realm,
-        dict(type="realm_user", op="update", person=payload),
+        RealmUserUpdateEvent(person=payload),
         get_user_ids_who_can_access_user(user_profile),
     )
-    if user_profile.is_bot:
-        send_event_on_commit(
-            user_profile.realm,
-            dict(type="realm_bot", op="update", bot=payload),
-            bot_owner_user_ids(user_profile),
-        )
 
     if notify:
         changes: list[UserProfileChangeDict] = [
@@ -342,22 +350,11 @@ def do_regenerate_api_key(user_profile: UserProfile, acting_user: UserProfile) -
         event_time=event_time,
     )
 
-    if user_profile.is_bot:
-        send_event_on_commit(
-            user_profile.realm,
-            dict(
-                type="realm_bot",
-                op="update",
-                bot=dict(
-                    user_id=user_profile.id,
-                    api_key=new_api_key,
-                ),
-            ),
-            bot_owner_user_ids(user_profile),
-        )
-
     event = {"type": "clear_push_device_tokens", "user_profile_id": user_profile.id}
     queue_event_on_commit("deferred_work", event)
+
+    # Delete all of the user's Device records to stop sending E2EE push notifications.
+    Device.objects.filter(user_id=user_profile.id).delete()
 
     return new_api_key
 
@@ -369,22 +366,7 @@ def bulk_regenerate_api_keys(user_profile_ids: Iterable[int]) -> None:
 
 
 def notify_avatar_url_change(user_profile: UserProfile) -> None:
-    if user_profile.is_bot:
-        bot_event = dict(
-            type="realm_bot",
-            op="update",
-            bot=dict(
-                user_id=user_profile.id,
-                avatar_url=avatar_url(user_profile),
-            ),
-        )
-        send_event_on_commit(
-            user_profile.realm,
-            bot_event,
-            bot_owner_user_ids(user_profile),
-        )
-
-    payload = dict(
+    payload = PersonAvatarFields(
         avatar_source=user_profile.avatar_source,
         avatar_url=avatar_url(user_profile),
         avatar_url_medium=avatar_url(user_profile, medium=True),
@@ -394,7 +376,7 @@ def notify_avatar_url_change(user_profile: UserProfile) -> None:
         user_id=user_profile.id,
     )
 
-    event = dict(type="realm_user", op="update", person=payload)
+    event = RealmUserUpdateEvent(person=payload)
     send_event_on_commit(
         user_profile.realm,
         event,
@@ -429,11 +411,26 @@ def do_change_avatar_fields(
 
 def do_scrub_avatar_images(user: UserProfile, *, acting_user: UserProfile | None) -> None:
     old_version = user.avatar_version
+    # Note: while scrubbing, no need to generate and upload
+    # avatar when default_avatar_source is jdenticon.
     do_change_avatar_fields(
-        user, UserProfile.AVATAR_FROM_GRAVATAR, skip_notify=True, acting_user=acting_user
+        user, user.realm.default_avatar_source, skip_notify=True, acting_user=acting_user
     )
     for version in range(1, old_version + 1):
         delete_avatar_image(user, version)
+
+
+def set_avatar_to_default(user_profile: UserProfile, *, acting_user: UserProfile | None) -> None:
+    default_avatar_source = user_profile.realm.default_avatar_source
+
+    if user_profile.avatar_source == default_avatar_source:  # nocoverage
+        return
+
+    if default_avatar_source == UserProfile.AVATAR_FROM_JDENTICON:
+        generate_and_upload_jdenticon_avatar(
+            user_profile, realm_uuid=str(user_profile.realm.uuid), future=True
+        )
+    do_change_avatar_fields(user_profile, default_avatar_source, acting_user=acting_user)
 
 
 def update_scheduled_email_notifications_time(
@@ -534,16 +531,11 @@ def bulk_change_user_setting(
             assert isinstance(db_setting_value, int)
             update_scheduled_email_notifications_time(user_profile, old_value, db_setting_value)
 
-    event = {
-        "type": "user_settings",
-        "op": "update",
-        "property": setting_name,
-        "value": event_value,
-    }
+    event = UserSettingsUpdateEvent(property=setting_name, value=event_value)
 
     if setting_name == "default_language":
         assert isinstance(db_setting_value, str)
-        event["language_name"] = get_language_name(db_setting_value)
+        event.language_name = get_language_name(db_setting_value)
 
     transaction.on_commit(lambda: bulk_flush_users(user_profiles=user_profiles, realm=realm))
 
@@ -553,11 +545,8 @@ def bulk_change_user_setting(
     if setting_name == "allow_private_data_export":
         assert len(user_profiles) == 1
         user_profile = user_profiles[0]
-        realm_export_event = {
-            "type": "realm_export_consent",
-            "user_id": user_profile.id,
-            "consented": event_value,
-        }
+        assert isinstance(event_value, bool)
+        realm_export_event = RealmExportConsentEvent(user_id=user_profile.id, consented=event_value)
         send_event_on_commit(
             user_profile.realm,
             realm_export_event,
@@ -568,12 +557,12 @@ def bulk_change_user_setting(
     if setting_name == "timezone":
         assert len(user_profiles) == 1
         user_profile = user_profiles[0]
-        payload = dict(
+        payload = PersonTimezone(
             email=user_profile.email,
             user_id=user_profile.id,
             timezone=canonicalize_timezone(user_profile.timezone),
         )
-        timezone_event = dict(type="realm_user", op="update", person=payload)
+        timezone_event = RealmUserUpdateEvent(person=payload)
         send_event_on_commit(
             realm,
             timezone_event,
@@ -595,6 +584,9 @@ def bulk_change_user_setting(
             # that field, so we can save work and return here.
             return
 
+        # The other cache flushes for this change only see the new
+        # email address, so flush the caches keyed by the old one.
+        delete_user_profile_caches([user_profile], user_profile.realm_id)
         user_profile.email = get_display_email_address(user_profile)
         user_profile.save(update_fields=["email"])
 
@@ -710,3 +702,32 @@ def bulk_change_user_setting(
                 force_send_update=True,
             )
         )
+
+
+@transaction.atomic(durable=True)
+def do_change_user_date_joined(user_profile: UserProfile, date_joined: datetime) -> None:
+    old_date_joined = user_profile.date_joined
+    user_profile.date_joined = date_joined
+    user_profile.save(update_fields=["date_joined"])
+
+    event_time = timezone_now()
+    RealmAuditLog.objects.create(
+        realm=user_profile.realm,
+        acting_user=user_profile,
+        modified_user=user_profile,
+        event_type=AuditLogEventType.USER_DATE_JOINED_CHANGED,
+        event_time=event_time,
+        extra_data={
+            RealmAuditLog.OLD_VALUE: old_date_joined.isoformat(),
+            RealmAuditLog.NEW_VALUE: date_joined.isoformat(),
+        },
+    )
+
+    payload = PersonDateJoined(
+        user_id=user_profile.id, date_joined=date_joined.isoformat(timespec="minutes")
+    )
+    send_event_on_commit(
+        user_profile.realm,
+        RealmUserUpdateEvent(person=payload),
+        get_user_ids_who_can_access_user(user_profile),
+    )

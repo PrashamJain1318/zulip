@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -25,6 +25,7 @@ import * as message_store from "./message_store.ts";
 import type {DisplayRecipientUser, Message, MessageReaction, RawMessage} from "./message_store.ts";
 import * as message_util from "./message_util.ts";
 import * as people from "./people.ts";
+import * as pm_conversations from "./pm_conversations.ts";
 import * as pm_list from "./pm_list.ts";
 import * as recent_view_data from "./recent_view_data.ts";
 import * as rows from "./rows.ts";
@@ -147,11 +148,18 @@ function show_failed_message_success(message_id: number): void {
 }
 
 function failed_message_success(message_id: number): void {
-    message_store.get(message_id)!.failed_request = false;
+    const message = message_store.get(message_id);
+    if (message === undefined) {
+        // A get-events delivery may already have reconciled the message to its
+        // real id, in which case the resend's reify_message_id early-returned
+        // and this (duplicate) id was never stored -- nothing to un-fail.
+        return;
+    }
+    message.failed_request = false;
     show_failed_message_success(message_id);
 }
 
-function resend_message(
+export function resend_message(
     message: LocalMessage,
     $row: JQuery,
     {
@@ -164,11 +172,15 @@ function resend_message(
 ): void {
     message_store.update_message_content(message, message.raw_content!);
     if (show_retry_spinner($row)) {
-        // retry already in in progress
+        // retry already in progress
         return;
     }
 
     message.resend = true;
+
+    // A resend's message event can arrive before its response, and reifying
+    // converts the message in place, so snapshot what we actually sent.
+    const sent_message = {...message};
 
     function on_success(raw_data: unknown): void {
         const data = send_message_api_response_schema.parse(raw_data);
@@ -176,7 +188,7 @@ function resend_message(
 
         hide_retry_spinner($row);
 
-        on_send_message_success(message, data);
+        on_send_message_success(sent_message, data);
 
         // Resend succeeded, so mark as no longer failed
         failed_message_success(message_id);
@@ -273,7 +285,7 @@ export function insert_local_message(
         id: local_id_float,
         resend: false,
         is_me_message: false,
-        topic_links: topic ? markdown.get_topic_links(topic) : [],
+        topic_links: markdown.get_topic_links(topic),
         reactions: [],
     };
 
@@ -356,7 +368,7 @@ export function rewire_try_deliver_locally(value: typeof try_deliver_locally): v
     try_deliver_locally = value;
 }
 
-export function edit_locally(message: Message, request: LocalEditRequest): Message {
+export function edit_locally(message: Message, request: LocalEditRequest): void {
     // Responsible for doing the rendering work of locally editing the
     // content of a message.  This is used in several code paths:
     // * Editing a message where a message was locally echoed but
@@ -372,6 +384,11 @@ export function edit_locally(message: Message, request: LocalEditRequest): Messa
         assert(message.type === "stream");
         const new_stream_id = request.new_stream_id;
         const new_topic = request.new_topic;
+        message_store.process_topic_edit({
+            message_ids: [message.id],
+            new_stream_id: new_stream_id ?? message.stream_id,
+            new_topic: new_topic ?? message.topic,
+        });
         stream_topic_history.remove_messages({
             stream_id: message.stream_id,
             topic_name: message.topic,
@@ -394,7 +411,7 @@ export function edit_locally(message: Message, request: LocalEditRequest): Messa
     }
 
     if (message_content_edited) {
-        message.raw_content = raw_content;
+        message_store.maybe_update_raw_content(message.id, raw_content);
         if (request.content !== undefined) {
             // This happens in the code path where message editing
             // failed and we're trying to undo the local echo.  We use
@@ -410,9 +427,15 @@ export function edit_locally(message: Message, request: LocalEditRequest): Messa
             // all flags, so we need to restore those flags that are
             // properties of how the user has interacted with the
             // message, and not its rendering.
-            const {content, flags, is_me_message} = markdown.render(message.raw_content);
+            const {content, flags, is_me_message} = markdown.render(raw_content);
             message_store.update_message_content(message, content);
-            message.flags = flags;
+            // Recompute the content-driven boolean flags (mentioned,
+            // mentioned_me_directly, etc.) from the freshly rendered
+            // flags. Without this, the message keeps its stale mention
+            // booleans until the server event arrives, which (e.g. when
+            // editing away a personal mention) briefly miscolors the
+            // message as a group mention.
+            message_store.update_booleans(message, flags);
             message.is_me_message = is_me_message;
             if (request.starred !== undefined) {
                 message.starred = request.starred;
@@ -434,7 +457,6 @@ export function edit_locally(message: Message, request: LocalEditRequest): Messa
     }
     stream_list.update_streams_sidebar();
     pm_list.update_private_messages();
-    return message;
 }
 
 export function update_topic_hash_to_contain_with_term(message: Message): void {
@@ -484,15 +506,20 @@ export let reify_message_id = (local_id: string, server_id: number): void => {
     compose_notifications.reify_message_id(opts);
     recent_view_data.reify_message_id_if_available(opts);
 
-    // We add the message to stream_topic_history only after we receive
-    // it from the server i.e., is acked, so as to maintain integer
-    // message id values there.
+    // We count a message toward its conversation only on ack, both to keep
+    // integer message ids in stream_topic_history and so that an un-acked
+    // echo never inflates pm_conversations' counts.
     if (message.type === "stream") {
         stream_topic_history.add_message({
             stream_id: message.stream_id,
             topic_name: message.topic,
             message_id: message.id,
         });
+    } else {
+        const user_ids = people.pm_with_user_ids(message);
+        if (user_ids !== undefined) {
+            pm_conversations.recent.increment_local_message_count(user_ids);
+        }
     }
     update_topic_hash_to_contain_with_term(message);
 };
@@ -585,7 +612,7 @@ export function process_from_server(messages: ServerMessage[]): ServerMessage[] 
             if (!msg_list.data.filter.can_apply_locally()) {
                 // If this message list is a search filter that we
                 // cannot apply locally, we will not have locally
-                // echoed echoed the message at all originally, and
+                // echoed the message at all originally, and
                 // must request the server now whether to add it to the view.
                 message_events_util.maybe_add_narrowed_messages(
                     msgs_to_rerender_or_add_to_narrow,
@@ -617,7 +644,12 @@ export function process_from_server(messages: ServerMessage[]): ServerMessage[] 
 
 export let message_send_error = (message_id: number, error_response: string): void => {
     // Error sending message, show inline
-    const message = message_store.get(message_id)!;
+    const message = message_store.get(message_id);
+    if (message === undefined) {
+        // The message is no longer in the store -- e.g. it was removed while a
+        // (re)send was in flight -- so there is no failed send to surface.
+        return;
+    }
     message.failed_request = true;
     message.show_slow_send_spinner = false;
 
@@ -628,7 +660,7 @@ export function rewire_message_send_error(value: typeof message_send_error): voi
     message_send_error = value;
 }
 
-function abort_message(message: Message): void {
+export function abort_message(message: LocalMessage): void {
     // Update the rendered data first since it is most user visible.
     for (const msg_list of message_lists.all_rendered_message_lists()) {
         msg_list.remove_and_rerender([message.id]);
@@ -637,6 +669,9 @@ function abort_message(message: Message): void {
     for (const msg_list_data of message_lists.non_rendered_data()) {
         msg_list_data.remove([message.id]);
     }
+
+    echo_state.remove_message_from_waiting_for_id(message.local_id);
+    echo_state.remove_message_from_waiting_for_ack(message.local_id);
 }
 
 export function display_slow_send_loading_spinner(message: Message): void {

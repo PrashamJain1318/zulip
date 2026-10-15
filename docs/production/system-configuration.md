@@ -16,6 +16,15 @@ The `zulip-puppet-apply` command will display the configuration
 changes it will make and prompt for you to confirm you'd like to make
 those changes, before executing them (if you approve).
 
+:::{important}
+
+If you are using [Docker](docker.md), see
+{doc}`docker:how-to/compose-settings` and
+{doc}`docker:reference/environment-vars` for configuring
+`zulip.conf` via `CONFIG_*` environment variables.
+
+:::
+
 ### Truthy values
 
 When a setting refers to "set to true" or "set to false", the values
@@ -77,6 +86,10 @@ Options passed by `upgrade-zulip` and `upgrade-zulip-from-git` into
   to run `zulip-puppet-apply` manually after the upgrade.
 - **`--skip-migrations`** skips running database migrations. The
   user will need to run `./manage.py migrate` manually after the upgrade.
+  If you run migrations while the server is running, set
+  `MIGRATIONS_ADD_REMOVE_INDEXES_CONCURRENTLY = True` in
+  `/etc/zulip/settings.py`, so that migrations adding or removing
+  indexes don't lock the table.
 - **`--skip-purge-old-deployments`** skips purging old deployments;
   without it, only deployments with the last two weeks are kept.
 
@@ -103,6 +116,28 @@ SSL/TLS termination.
 
 Set to the port number if you [prefer to listen on a port other than
 443](deployment.md#using-an-alternate-port).
+
+#### `nginx_server_name`
+
+Sets the [`server_name`][nginx_server_name] directive on Zulip's
+nginx `server` blocks; by default it is unset, so they match any
+hostname. Set it if you run other software alongside Zulip whose
+nginx configuration would otherwise claim requests meant for Zulip.
+List every hostname Zulip is served on, separated by spaces,
+including those on its TLS certificate; otherwise automatic
+certificate renewal will fail.
+
+If Zulip is served on more than one hostname, or on a hostname plus
+several subdomains, list them all; nginx's `server_name` supports a
+trailing wildcard for matching subdomains. For example, to serve
+Zulip on both `example.com` and any subdomain of it:
+
+```ini
+[application_server]
+nginx_server_name = example.com *.example.com
+```
+
+[nginx_server_name]: https://nginx.org/en/docs/http/server_names.html
 
 #### `nginx_worker_processes`
 
@@ -132,10 +167,23 @@ memory (currently 3.5GiB) to run a single-server Zulip installation in
 the multiprocess mode.
 
 Set explicitly to true or false to override the automatic
-calculation. This override is useful both Docker systems (where the
-above algorithm might see the host's memory, not the container's)
-and/or when using remote servers for postgres, memcached, redis, and
-RabbitMQ.
+calculation. This override is useful for Docker systems, where the
+above algorithm will see the host's memory size, not the container's,
+unless a [memory limit is set][docker-memory-limit], as well as when
+using remote servers for PostgreSQL, memcached, Redis, and RabbitMQ.
+
+[docker-memory-limit]: https://docs.docker.com/reference/compose-file/deploy/#memory
+
+#### `dedicated_soft_reactivation_queue`
+
+When a long-term-idle user returns, Zulip backfills the message-history
+rows that were skipped while they were idle; this "soft reactivation"
+can take many seconds. By default it runs in the shared `deferred_work`
+queue, alongside jobs such as data exports that can take minutes. Set
+this to true to process soft reactivations in a dedicated queue (and, in
+multiprocess mode, a dedicated worker process), so they aren't delayed
+behind such jobs. This costs an additional worker process, so it is most
+useful on large servers; smaller servers should leave it disabled.
 
 #### `rolling_restart`
 
@@ -489,3 +537,14 @@ The Sentry organization used for the [Sentry deploy hook](deployment.md#sentry-d
 #### `project`
 
 The Sentry project used for the [Sentry deploy hook](deployment.md#sentry-deploy-hook).
+
+### `[email_gateway]`
+
+#### `listen`
+
+The address for the [incoming email gateway's](email-gateway.md) SMTP
+server to bind to, as a bare port number, or `address:port`; IPv6
+addresses must be enclosed in square brackets (e.g.,
+`[2001:db8::1]:25`). Defaults to listening on port 25 on all
+addresses, both IPv4 and IPv6. This only applies to the local
+delivery mode of the gateway, not the polling mode.

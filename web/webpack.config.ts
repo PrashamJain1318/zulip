@@ -1,7 +1,6 @@
 /// <reference types="webpack-dev-server" />
 
 import path from "node:path";
-import * as url from "node:url";
 
 import type {ZopfliOptions} from "@gfx/zopfli";
 import {gzip} from "@gfx/zopfli";
@@ -35,6 +34,9 @@ const config = (
             buildDependencies: {
                 config: [import.meta.filename],
             },
+        },
+        resolve: {
+            tsconfig: false,
         },
     };
 
@@ -92,11 +94,6 @@ const config = (
                     test: path.resolve(import.meta.dirname, "debug-require.cjs"),
                     loader: "expose-loader",
                     options: {exposes: "require"},
-                },
-                {
-                    test: url.fileURLToPath(import.meta.resolve("jquery")),
-                    loader: "expose-loader",
-                    options: {exposes: ["$", "jQuery"]},
                 },
                 // Generate webfont
                 {
@@ -277,8 +274,9 @@ const config = (
         name: "server",
         target: "node",
         entry: {
-            katex_server: "babel-loader!./server/katex_server.ts",
+            katex_server: "./server/katex_server.ts",
             "katex-cli": "shebang-loader!katex/cli",
+            jdenticon: "shebang-loader!../node_modules/jdenticon/bin/jdenticon.js",
         },
         output: {
             path: path.resolve(import.meta.dirname, "../static/webpack-bundles"),

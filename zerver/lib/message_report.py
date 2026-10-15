@@ -1,14 +1,20 @@
 from django.conf import settings
 from django.utils.translation import gettext as _
+from django.utils.translation import override as override_language
 
-from zerver.actions.message_send import internal_send_stream_message
+from zerver.actions.message_send import internal_send_private_message, internal_send_stream_message
 from zerver.lib.display_recipient import get_display_recipient
 from zerver.lib.markdown.fenced_code import get_unused_fence
 from zerver.lib.mention import silent_mention_syntax_for_user
-from zerver.lib.message import is_1_to_1_message, truncate_content
+from zerver.lib.message import (
+    get_user_mentions_for_display,
+    is_1_to_1_message,
+    is_message_to_self,
+    truncate_content,
+)
 from zerver.lib.timestamp import datetime_to_global_time
 from zerver.lib.topic_link_util import get_message_link_syntax
-from zerver.lib.url_encoding import pm_message_url
+from zerver.lib.url_encoding import pm_message_url, stream_message_url
 from zerver.models import Message, Realm, UserProfile
 from zerver.models.recipients import Recipient
 from zerver.models.streams import StreamTopicsPolicyEnum
@@ -29,7 +35,7 @@ def send_message_report(
     reported_message: Message,
     report_type: str,
     description: str,
-) -> None:
+) -> int | None:
     moderation_request_channel = realm.moderation_request_channel
     assert moderation_request_channel is not None
 
@@ -43,7 +49,7 @@ def send_message_report(
     if is_1_to_1_message(reported_message):
         if reported_user != reporting_user:
             report_header = _(
-                "{reporting_user_mention} reported a direct message sent by {reported_user_mention} at {reported_message_date_sent}."
+                "{reporting_user_mention} reported a message sent by {reported_user_mention} at {reported_message_date_sent}."
             ).format(
                 reporting_user_mention=reporting_user_mention,
                 reported_user_mention=reported_user_mention,
@@ -52,7 +58,7 @@ def send_message_report(
         else:
             # Clearly mention the direct message recipient if someone is
             # reporting their own message in a 1-on-1 direct message.
-            if reported_message.recipient.type_id != reporting_user.id:
+            if not is_message_to_self(reported_message):
                 recipient_user = next(
                     silent_mention_syntax_for_user(user)
                     for user in get_display_recipient(reported_message.recipient)
@@ -61,7 +67,7 @@ def send_message_report(
             else:
                 recipient_user = reporting_user_mention
             report_header = _(
-                "{reporting_user_mention} reported a direct message sent by {reported_user_mention} to {recipient_user} at {reported_message_date_sent}."
+                "{reporting_user_mention} reported a message sent by {reported_user_mention} to {recipient_user} at {reported_message_date_sent}."
             ).format(
                 reporting_user_mention=reporting_user_mention,
                 reported_user_mention=reported_user_mention,
@@ -69,24 +75,18 @@ def send_message_report(
                 reported_message_date_sent=reported_message_date_sent,
             )
     elif reported_message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
-        recipient_list = sorted(
-            [
-                silent_mention_syntax_for_user(user)
-                for user in get_display_recipient(reported_message.recipient)
-                if user["id"] is not reported_user.id
-            ]
-        )
-        last_recipient_user = recipient_list.pop()
-        recipient_users: str = ", ".join(recipient_list)
-        if len(recipient_list) > 1:
-            recipient_users += ","
         report_header = _(
-            "{reporting_user_mention} reported a direct message sent by {reported_user_mention} to {recipient_users} and {last_recipient_user} at {reported_message_date_sent}."
+            "{reporting_user_mention} reported a message sent by {reported_user_mention} to {list_of_direct_message_recipients} at {reported_message_date_sent}."
         ).format(
             reporting_user_mention=reporting_user_mention,
             reported_user_mention=reported_user_mention,
-            recipient_users=recipient_users,
-            last_recipient_user=last_recipient_user,
+            list_of_direct_message_recipients=get_user_mentions_for_display(
+                [
+                    user
+                    for user in get_display_recipient(reported_message.recipient)
+                    if user["id"] != reported_user.id
+                ]
+            ),
             reported_message_date_sent=reported_message_date_sent,
         )
     else:
@@ -151,10 +151,48 @@ def send_message_report(
     if moderation_request_channel.topics_policy == StreamTopicsPolicyEnum.empty_topic_only.value:
         topic_name = ""
 
-    internal_send_stream_message(
+    return internal_send_stream_message(
         sender=get_system_bot(settings.NOTIFICATION_BOT, moderation_request_channel.realm.id),
         stream=moderation_request_channel,
         topic_name=topic_name,
         content=content,
         acting_user=reporting_user,
+    )
+
+
+def send_report_confirmation_dm(
+    reporting_user: UserProfile,
+    realm: Realm,
+    reported_message: Message,
+    report_type: str,
+) -> None:
+    if reported_message.is_channel_message:
+        message_url = stream_message_url(
+            realm=realm,
+            message=dict(
+                id=reported_message.id,
+                stream_id=reported_message.recipient.type_id,
+                display_recipient=reported_message.recipient.label(),
+                topic=reported_message.topic_name(),
+            ),
+        )
+    else:
+        message_url = pm_message_url(
+            realm,
+            dict(
+                id=reported_message.id,
+                display_recipient=get_display_recipient(reported_message.recipient),
+            ),
+        )
+
+    with override_language(reporting_user.default_language):
+        reason = str(Realm.REPORT_MESSAGE_REASONS[report_type]).lower()
+        content = _("You reported [a message]({message_url}) for {reason}.").format(
+            message_url=message_url, reason=reason
+        )
+
+    internal_send_private_message(
+        get_system_bot(settings.NOTIFICATION_BOT, realm.id),
+        reporting_user,
+        content,
     )

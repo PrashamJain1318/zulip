@@ -53,15 +53,22 @@ from zerver.lib.user_groups import (
     get_group_setting_value_for_api,
     get_system_user_group_by_name,
     parse_group_setting_value,
+    validate_can_manage_all_groups,
     validate_group_setting_value_change,
 )
 from zerver.lib.validator import check_capped_url, check_string
+from zerver.lib.workplace_users import (
+    realm_eligible_for_non_workplace_pricing,
+    realm_on_discounted_cloud_plan,
+    validate_workplace_users_group,
+)
 from zerver.models import Realm, RealmReactivationStatus, RealmUserDefault, UserProfile
 from zerver.models.groups import SystemGroups
 from zerver.models.realms import (
     DigestWeekdayEnum,
     MessageEditHistoryVisibilityPolicyEnum,
     OrgTypeEnum,
+    RealmMediaPreviewSizeEnum,
     RealmTopicsPolicyEnum,
 )
 from zerver.models.users import ResolvedTopicNoticeAutoReadPolicyEnum
@@ -90,6 +97,9 @@ def check_jitsi_url(value: str) -> str:
         return validator(var_name, value)
     except ValidationError:
         raise JsonableError(_("{var_name} is not an allowed_type").format(var_name=var_name))
+
+
+DEFAULT_AVATAR_SOURCES = [key for key, _ in Realm.AVATAR_SOURCES]
 
 
 @require_realm_admin
@@ -123,6 +133,8 @@ def update_realm(
     can_set_topics_policy_group: Json[GroupSettingChangeRequest] | None = None,
     can_summarize_topics_group: Json[GroupSettingChangeRequest] | None = None,
     create_multiuse_invite_group: Json[GroupSettingChangeRequest] | None = None,
+    default_avatar_source: Annotated[str, check_string_in_validator(DEFAULT_AVATAR_SOURCES)]
+    | None = None,
     default_code_block_language: str | None = None,
     default_language: str | None = None,
     description: Annotated[
@@ -140,12 +152,13 @@ def update_realm(
     enable_read_receipts: Json[bool] | None = None,
     enable_spectator_access: Json[bool] | None = None,
     gif_rating_policy: Json[int] | None = None,
+    media_preview_size: Json[RealmMediaPreviewSizeEnum] | None = None,
     inline_image_preview: Json[bool] | None = None,
     inline_url_embed_preview: Json[bool] | None = None,
     invite_required: Json[bool] | None = None,
     jitsi_server_url_raw: Annotated[
         Json[str] | None,
-        AfterValidator(lambda val: check_jitsi_url(val)),
+        AfterValidator(check_jitsi_url),
         ApiParamConfig("jitsi_server_url"),
     ] = None,
     message_content_allowed_in_email_notifications: Json[bool] | None = None,
@@ -212,6 +225,7 @@ def update_realm(
             max_length=Realm.MAX_REALM_WELCOME_MESSAGE_CUSTOM_TEXT_LENGTH,
         ),
     ] = None,
+    workplace_users_group: Json[GroupSettingChangeRequest] | None = None,
 ) -> HttpResponse:
     # Realm object is being refetched here to make sure that we
     # do not use stale object from cache which can happen when a
@@ -378,6 +392,22 @@ def update_realm(
 
             data["jitsi_server_url"] = jitsi_server_url
 
+    if workplace_users_group is not None:
+        # Remove this when the feature is ready for production.
+        assert settings.DEVELOPMENT
+
+        if not realm_eligible_for_non_workplace_pricing(realm):
+            raise JsonableError(
+                _("Organization is not eligible for discounted pricing for non workplace users.")
+            )
+
+        if realm_on_discounted_cloud_plan(realm):
+            raise JsonableError(
+                _(
+                    "Discounted pricing for workplace users cannot be enabled with current discounted plan."
+                )
+            )
+
     # The user of `locals()` here is a bit of a code smell, but it's
     # restricted to the elements present in realm.property_types.
     #
@@ -432,6 +462,13 @@ def update_realm(
                     permission_configuration=permission_configuration,
                     current_setting_value=current_value,
                 )
+
+                if setting_name == "workplace_users_group":
+                    validate_workplace_users_group(new_setting_value, realm)
+
+                if setting_name == "can_manage_all_groups":
+                    validate_can_manage_all_groups(new_setting_value, realm)
+
                 do_change_realm_permission_group_setting(
                     realm,
                     setting_name,

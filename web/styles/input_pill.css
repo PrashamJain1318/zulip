@@ -57,6 +57,15 @@
             background-color: var(--color-background-input-pill-hover);
         }
 
+        .invited-user-name {
+            flex: 1;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-right: 3px;
+        }
+
         .pill-image {
             height: var(--height-input-pill);
             width: var(--height-input-pill);
@@ -71,10 +80,6 @@
             border: 1px solid;
             border-radius: 4px;
             border-color: var(--color-border-input-pill-image);
-        }
-
-        .channel-privacy-type-icon {
-            padding-right: 2px;
         }
 
         .pill-label {
@@ -102,7 +107,6 @@
         .pill-close-button,
         .pill-expand-button {
             font-size: 0.7142em; /* 10px at 14px em */
-            text-decoration: none;
             /* Let the close button's box stretch,
                but no larger than the height of the
                banner box when the action button
@@ -117,8 +121,7 @@
                ::before content where the icon sits. */
             display: flex;
             align-items: center;
-            /* !important overrides `.dark-theme:root a:hover` */
-            color: var(--color-input-pill-close) !important;
+            color: var(--color-input-pill-close);
             opacity: 0.7;
         }
 
@@ -128,7 +131,7 @@
             height: var(--length-input-pill-exit);
             display: flex;
             justify-content: center;
-            margin-right: 2px;
+            margin-right: var(--length-input-pill-exit-margin);
             border-radius: 2px;
 
             &:hover {
@@ -154,8 +157,7 @@
             }
 
             .pill-close-button {
-                /* !important overrides `.dark-theme:root a:hover` */
-                color: var(--color-close-deactivated-user-pill) !important;
+                color: var(--color-close-deactivated-user-pill);
             }
 
             .exit:hover {
@@ -215,17 +217,11 @@
         flex: 1 1 auto;
 
         outline: none;
-
-        &.shake {
-            animation: shake 0.3s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
-            transform: translate3d(0, 0, 0);
-            backface-visibility: hidden;
-            perspective: 1000px;
-        }
     }
 
     &.not-editable-by-user {
         cursor: not-allowed;
+        background-color: var(--color-background-pill-container-input-disabled);
 
         .pill {
             cursor: not-allowed;
@@ -258,6 +254,26 @@
 
     &:has(.input:focus) {
         border-color: var(--color-compose-recipient-box-has-focus);
+    }
+}
+
+.low-attention-recipient-row #compose-direct-recipient .pill-container {
+    &:has(.pill):not(:focus-within) {
+        /* In the low-attention state, prevent this from being
+           part of the flex layout on .pill-container when there
+           are already user pills (when the "Add user" text is
+           never displayed, as specified on the
+           .input:first-child:empty::before selector above).
+           We avoid doing this when there is focus inside the
+           pill container, so that typing in the recipient row
+           after narrowing to a DM conversation with `Ctrl + .`
+           doesn't create a palimpsest of text over the existing
+           user pill. */
+        #private_message_recipient {
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
     }
 }
 
@@ -408,10 +424,11 @@
     }
 }
 
+.group_entirely_not_subscribed .display_only_group_pill,
 .creator_details > .display_only_pill {
-    /* On channel and group creation details,
-       align the pill contents better with
-       the surrounding text. */
+    /* In places where the pills are not used in tables,
+       but instead alongside text, we revert back to the
+       baseline vertical alignment. */
     vertical-align: baseline;
 }
 
@@ -450,27 +467,4 @@
     display: flex;
     align-items: center;
     justify-content: center;
-}
-
-@keyframes shake {
-    10%,
-    90% {
-        transform: translate3d(-1px, 0, 0);
-    }
-
-    20%,
-    80% {
-        transform: translate3d(2px, 0, 0);
-    }
-
-    30%,
-    50%,
-    70% {
-        transform: translate3d(-3px, 0, 0);
-    }
-
-    40%,
-    60% {
-        transform: translate3d(3px, 0, 0);
-    }
 }

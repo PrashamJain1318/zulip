@@ -3,9 +3,8 @@
 const assert = require("node:assert/strict");
 
 const {make_stream} = require("./lib/example_stream.cjs");
-const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
+const {mock_esm, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
-const $ = require("./lib/zjquery.cjs");
 
 /*
 
@@ -51,8 +50,6 @@ const $ = require("./lib/zjquery.cjs");
           value.)
 */
 
-set_global("document", {hasFocus: () => true});
-
 const channel = mock_esm("../src/channel");
 const desktop_notifications = mock_esm("../src/desktop_notifications");
 const message_lists = mock_esm("../src/message_lists");
@@ -75,10 +72,6 @@ const denmark_stream = make_stream({
 });
 
 run_test("unread_ops", ({override}) => {
-    $("#message_feed_container").css = (property) => {
-        assert.equal(property, "display");
-        return "block";
-    };
     stream_data.clear_subscriptions();
     stream_data.add_sub_for_tests(denmark_stream);
     message_store.clear_for_testing();
@@ -89,6 +82,7 @@ run_test("unread_ops", ({override}) => {
         {
             id: message_id,
             type: "stream",
+            content: "",
             stream_id: denmark_stream.stream_id,
             topic: "copenhagen",
             unread: true,
@@ -104,7 +98,7 @@ run_test("unread_ops", ({override}) => {
     unread.process_loaded_messages(test_messages);
 
     // Make our message_viewport appear visible.
-    $("#message_feed_container").show();
+    override(message_viewport, "viewport_is_visible_and_focused", () => true);
 
     // Make our "test" message appear visible.
     override(message_viewport, "bottom_rendered_message_visible", () => true);

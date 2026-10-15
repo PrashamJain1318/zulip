@@ -1,12 +1,13 @@
 "use strict";
 
+const {Role} = require("./example_user.cjs");
+
 //  These events are not guaranteed to be perfectly
 //  representative of what the server sends.  We
-//  have a tool called check-schemas that tries
-//  to validate this data against server side schemas,
-//  but there are certain edge cases that the tool now
-//  skips.  And even when the data matches the schema,
-//  it may not be completely representative.
+//  have a tool called check-schemas that validates
+//  this data against server side schemas, but even
+//  when the data matches the schema, it may not be
+//  completely representative.
 
 const test_user = {
     email: "test@example.com",
@@ -55,6 +56,7 @@ exports.test_streams = {
         message_retention_days: null,
         stream_post_policy: 1,
         topics_policy: "inherit",
+        can_add_subscribers_group: 2,
         can_administer_channel_group: 2,
         can_create_topic_group: 2,
         can_delete_any_message_group: 2,
@@ -63,7 +65,11 @@ exports.test_streams = {
         can_move_messages_within_channel_group: 2,
         can_send_message_group: 2,
         can_remove_subscribers_group: 2,
+        can_resolve_topics_group: 2,
+        can_subscribe_group: 2,
+        folder_id: null,
         is_recently_active: true,
+        default_push_notifications: false,
         subscriber_count: 10,
     },
     test: {
@@ -82,6 +88,7 @@ exports.test_streams = {
         message_retention_days: null,
         stream_post_policy: 1,
         topics_policy: "inherit",
+        can_add_subscribers_group: 2,
         can_administer_channel_group: 2,
         can_create_topic_group: 2,
         can_delete_any_message_group: 2,
@@ -90,7 +97,11 @@ exports.test_streams = {
         can_move_messages_within_channel_group: 2,
         can_send_message_group: 2,
         can_remove_subscribers_group: 2,
+        can_resolve_topics_group: 2,
+        can_subscribe_group: 2,
+        folder_id: null,
         is_recently_active: true,
+        default_push_notifications: false,
         subscriber_count: 2,
     },
 };
@@ -141,12 +152,7 @@ exports.fixtures = {
             size: 4096,
             path_id: "path_id",
             create_time: fake_now,
-            messages: [
-                {
-                    id: 1000,
-                    date_sent: fake_now,
-                },
-            ],
+            message_ids: [1000],
         },
         upload_space_used: 90000,
     },
@@ -159,6 +165,7 @@ exports.fixtures = {
             name: "Frontend",
             description: "Channels for frontend discussions",
             rendered_description: "<p>Channels for frontend discussions</p>",
+            order: 1,
             date_created: 1681662420,
             creator_id: 10,
             is_archived: false,
@@ -246,6 +253,11 @@ exports.fixtures = {
         message_type: "stream",
         stream_id: 99,
         topic: "topic1",
+    },
+
+    has_webex_token: {
+        type: "has_webex_token",
+        value: true,
     },
 
     has_zoom_token: {
@@ -348,11 +360,6 @@ exports.fixtures = {
         emoji_name: "airplane",
         emoji_code: "2708",
         user_id: test_user.user_id,
-        user: {
-            email: test_user.email,
-            full_name: test_user.full_name,
-            user_id: test_user.user_id,
-        },
     },
 
     reaction__remove: {
@@ -363,11 +370,6 @@ exports.fixtures = {
         emoji_name: "8ball",
         emoji_code: "1f3b1",
         user_id: test_user.user_id,
-        user: {
-            email: test_user.email,
-            full_name: test_user.full_name,
-            user_id: test_user.user_id,
-        },
     },
 
     realm__deactivated: {
@@ -409,6 +411,13 @@ exports.fixtures = {
         op: "update",
         property: "invite_required",
         value: false,
+    },
+
+    realm__update__media_preview_size: {
+        type: "realm",
+        op: "update",
+        property: "media_preview_size",
+        value: 150,
     },
 
     realm__update__moderation_request_channel_id: {
@@ -460,17 +469,32 @@ exports.fixtures = {
         value: 42,
     },
 
-    realm__update_dict__default: {
+    realm__update_dict__allow_message_editing: {
         type: "realm",
         op: "update_dict",
         property: "default",
         data: {
             allow_message_editing: true,
-            message_content_edit_limit_seconds: 5,
-            create_multiuse_invite_group: 3,
+        },
+    },
+
+    realm__update_dict__authentication_methods: {
+        type: "realm",
+        op: "update_dict",
+        property: "default",
+        data: {
             authentication_methods: {
                 Google: {enabled: true, available: true},
             },
+        },
+    },
+
+    realm__update_dict__group_settings: {
+        type: "realm",
+        op: "update_dict",
+        property: "default",
+        data: {
+            create_multiuse_invite_group: 3,
             can_add_custom_emoji_group: 3,
             can_add_subscribers_group: 3,
             can_create_bots_group: 3,
@@ -479,10 +503,6 @@ exports.fixtures = {
             can_move_messages_between_topics_group: 3,
             can_resolve_topics_group: 1,
             direct_message_permission_group: 3,
-            plan_type: 3,
-            upload_quota_mib: 50000,
-            max_file_upload_size_mib: 1024,
-            topics_policy: "disable_empty_topic",
         },
     },
 
@@ -506,6 +526,15 @@ exports.fixtures = {
         },
     },
 
+    realm__update_dict__message_content_edit_limit_seconds: {
+        type: "realm",
+        op: "update_dict",
+        property: "default",
+        data: {
+            message_content_edit_limit_seconds: 5,
+        },
+    },
+
     realm__update_dict__night_logo: {
         type: "realm",
         op: "update_dict",
@@ -516,21 +545,35 @@ exports.fixtures = {
         },
     },
 
+    realm__update_dict__plan_type: {
+        type: "realm",
+        op: "update_dict",
+        property: "default",
+        data: {
+            plan_type: 3,
+            upload_quota_mib: 50000,
+            max_file_upload_size_mib: 1024,
+        },
+    },
+
+    realm__update_dict__topics_policy: {
+        type: "realm",
+        op: "update_dict",
+        property: "default",
+        data: {
+            topics_policy: "disable_empty_topic",
+            mandatory_topics: true,
+        },
+    },
+
     realm_bot__add: {
         type: "realm_bot",
         op: "add",
         bot: {
-            email: "the-bot@example.com",
             user_id: 42,
-            avatar_url: "/avatar/42",
-            api_key: "SOME_KEY",
-            full_name: "The Bot",
-            bot_type: 1,
             default_all_public_streams: true,
             default_events_register_stream: "whatever",
             default_sending_stream: "whatever",
-            is_active: true,
-            owner_id: test_user.user_id,
             services: [],
         },
     },
@@ -548,25 +591,7 @@ exports.fixtures = {
         op: "update",
         bot: {
             user_id: 4321,
-            full_name: "The Bot Has A New Name",
-        },
-    },
-
-    realm_bot__update_is_active: {
-        type: "realm_bot",
-        op: "update",
-        bot: {
-            user_id: 4321,
-            is_active: false,
-        },
-    },
-
-    realm_bot__update_owner: {
-        type: "realm_bot",
-        op: "update",
-        bot: {
-            user_id: 4321,
-            owner_id: test_user.user_id,
+            default_sending_stream: "new-stream",
         },
     },
 
@@ -594,10 +619,26 @@ exports.fixtures = {
         domain: "ramen",
     },
 
-    realm_emoji__update: {
+    realm_emoji__add: {
         type: "realm_emoji",
-        op: "update",
-        realm_emoji: exports.test_realm_emojis,
+        op: "add",
+        emoji: {
+            id: "101",
+            name: "spain",
+            source_url: "/some/path/to/spain.gif",
+            still_url: "/some/path/to/spain.png",
+            deactivated: false,
+            author_id: test_user.user_id,
+        },
+    },
+
+    realm_emoji__update_one: {
+        type: "realm_emoji",
+        op: "update_one",
+        emoji_id: "101",
+        data: {
+            deactivated: true,
+        },
     },
 
     realm_export: {
@@ -611,6 +652,7 @@ exports.fixtures = {
                 deleted_timestamp: null,
                 failed_timestamp: null,
                 pending: true,
+                export_from_prior_server: false,
                 export_type: "public",
             },
         ],
@@ -655,9 +697,10 @@ exports.fixtures = {
             is_admin: false,
             is_active: true,
             is_owner: false,
-            role: 400,
+            role: Role.MEMBER,
             is_bot: false,
             is_guest: false,
+            is_imported_stub: false,
             profile_data: {},
             timezone: "America/New_York",
             date_joined: "2020-01-01",
@@ -675,10 +718,12 @@ exports.fixtures = {
             is_admin: false,
             is_active: true,
             is_owner: false,
-            role: 400,
+            role: Role.MEMBER,
             is_bot: true,
             is_guest: false,
-            profile_data: {},
+            is_imported_stub: false,
+            bot_type: 1,
+            bot_owner_id: 11,
             timezone: "America/New_York",
             date_joined: "2020-01-01",
             delivery_email: "test-delivery@example.com",
@@ -954,6 +999,42 @@ exports.fixtures = {
         recipients: [typing_person2],
     },
 
+    update_message_flags__collapsed_add: {
+        type: "update_message_flags",
+        op: "add",
+        operation: "add",
+        flag: "collapsed",
+        messages: [exports.test_message.id],
+        all: false,
+    },
+
+    update_message_flags__collapsed_remove: {
+        type: "update_message_flags",
+        op: "remove",
+        operation: "remove",
+        flag: "collapsed",
+        messages: [exports.test_message.id],
+        all: false,
+    },
+
+    update_message_flags__hide_link_previews_add: {
+        type: "update_message_flags",
+        op: "add",
+        operation: "add",
+        flag: "hide_link_previews",
+        messages: [exports.test_message.id],
+        all: false,
+    },
+
+    update_message_flags__hide_link_previews_remove: {
+        type: "update_message_flags",
+        op: "remove",
+        operation: "remove",
+        flag: "hide_link_previews",
+        messages: [exports.test_message.id],
+        all: false,
+    },
+
     update_message_flags__read: {
         type: "update_message_flags",
         op: "add",
@@ -989,6 +1070,12 @@ exports.fixtures = {
         flag: "starred",
         messages: [exports.test_message.id],
         all: false,
+    },
+
+    url_embed_data: {
+        type: "url_embed_data",
+        content: "http://example.com/",
+        rendered_content: '<p><a href="http://example.com/">http://example.com/</a></p>',
     },
 
     user_group__add: {

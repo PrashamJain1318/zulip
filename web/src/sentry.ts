@@ -47,7 +47,11 @@ export function shouldCreateSpanForRequest(url: string): boolean {
     return parsed.pathname !== "/json/events";
 }
 
-if (sentry_params !== undefined && !is_browser_unsupported_old_version()) {
+if (
+    sentry_params !== undefined &&
+    !is_browser_unsupported_old_version() &&
+    !window.navigator.userAgent.includes("HeadlessChrome")
+) {
     const sample_rates = new Map([
         // This is controlled by shouldCreateSpanForRequest, above, but also put here for consistency
         ["call GET /json/events", 0],
@@ -104,6 +108,10 @@ if (sentry_params !== undefined && !is_browser_unsupported_old_version()) {
         ignoreErrors: [
             // https://github.com/tus/tus-js-client/issues/808
             "ERR_UPLOAD_TERMINATION_REJECTED",
+            // base_page_params.ts schedules a deferred-shell reload
+            // on parse failure; only the terminal post-cap throw
+            // should reach Sentry, not each self-healing retry.
+            "page_params parse failed; reload scheduled",
         ],
     });
 } else {

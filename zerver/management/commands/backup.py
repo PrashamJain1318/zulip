@@ -1,4 +1,5 @@
 import os
+import platform
 import re
 import tempfile
 from argparse import ArgumentParser, RawTextHelpFormatter
@@ -11,7 +12,7 @@ from django.db import connection
 from django.utils.timezone import now as timezone_now
 from typing_extensions import override
 
-from scripts.lib.zulip_tools import TIMESTAMP_FORMAT, parse_os_release, run
+from scripts.lib.zulip_tools import TIMESTAMP_FORMAT, run
 from version import ZULIP_VERSION
 from zerver.lib.management import ZulipBaseCommand
 from zerver.logging_handlers import try_git_describe
@@ -51,7 +52,7 @@ class Command(ZulipBaseCommand):
 
             with open(os.path.join(tmp, "zulip-backup", "os-version"), "w") as f:
                 print(
-                    "{ID} {VERSION_ID}".format(**parse_os_release()),
+                    "{ID} {VERSION_ID}".format(**platform.freedesktop_os_release()),
                     file=f,
                 )
             members.append("zulip-backup/os-version")
@@ -121,18 +122,18 @@ class Command(ZulipBaseCommand):
                 for name, path in paths
             ]
 
-            try:
-                if options["output"] is None:
-                    tarball_path = stack.enter_context(
-                        tempfile.NamedTemporaryFile(
-                            prefix=f"zulip-backup-{timestamp}-",
-                            suffix=".tar.gz",
-                            delete=False,
-                        )
-                    ).name
-                else:
-                    tarball_path = options["output"]
+            if options["output"] is None:
+                tarball_path = stack.enter_context(
+                    tempfile.NamedTemporaryFile(
+                        prefix=f"zulip-backup-{timestamp}-",
+                        suffix=".tar.gz",
+                        delete=False,
+                    )
+                ).name
+            else:
+                tarball_path = options["output"]
 
+            try:
                 run(
                     [
                         "tar",

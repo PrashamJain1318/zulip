@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
 
@@ -6,6 +6,7 @@ import * as drafts from "./drafts.ts";
 import {$t} from "./i18n.ts";
 import * as scheduled_messages from "./scheduled_messages.ts";
 import * as settings_data from "./settings_data.ts";
+import {disconnect_toggle_class, observe_toggle_class} from "./sidebar_tooltip_helpers.ts";
 import * as starred_messages from "./starred_messages.ts";
 import {
     EXTRA_LONG_HOVER_DELAY,
@@ -23,8 +24,18 @@ export function initialize(): void {
         delay: EXTRA_LONG_HOVER_DELAY,
         appendTo: () => document.body,
         onShow(instance) {
+            // Popover menus focus their first item when opened by a mouse click;
+            // don't show the tooltip for this programmatic focus. Keyboard focus
+            // should still show the tooltip without a hover.
+            if (
+                instance.reference.matches(":focus:not(:focus-visible)") &&
+                !instance.reference.matches(":hover")
+            ) {
+                return false;
+            }
+
             const $container = $(instance.popper).find(".views-tooltip-container");
-            let display_count = 0;
+            let display_count;
             const sidebar_option = $container.attr("data-view-code");
 
             switch (sidebar_option) {
@@ -100,6 +111,7 @@ export function initialize(): void {
                     offset: [0, 40],
                 });
             }
+            return undefined;
         },
         onHidden(instance) {
             instance.destroy();
@@ -138,12 +150,12 @@ export function initialize(): void {
     });
 
     tippy.delegate("body", {
-        target: ".stream-list-section-container .add-stream-tooltip",
+        target: ".stream-list-section-container .add-stream-tooltip, .left-sidebar-controls .channel-new-topic-button, .left-sidebar-controls .channel-search-topics-button",
         appendTo: () => document.body,
     });
 
     tippy.delegate("body", {
-        target: "#add_streams_tooltip",
+        target: "#streams_inline_icon",
         onShow(instance) {
             const can_create_streams =
                 settings_data.user_can_create_private_streams() ||
@@ -160,15 +172,16 @@ export function initialize(): void {
     tippy.delegate("body", {
         target: ".views-tooltip-target",
         onShow(instance) {
-            if ($("#toggle-top-left-navigation-area-icon").hasClass("rotate-icon-down")) {
-                instance.setContent(
-                    $t({
-                        defaultMessage: "Collapse views",
-                    }),
-                );
-            } else {
-                instance.setContent($t({defaultMessage: "Expand views"}));
-            }
+            observe_toggle_class(instance, () => {
+                if ($("#toggle-top-left-navigation-area-icon").hasClass("rotate-icon-down")) {
+                    instance.setContent($t({defaultMessage: "Collapse views"}));
+                } else {
+                    instance.setContent($t({defaultMessage: "Expand views"}));
+                }
+            });
+        },
+        onHidden(instance) {
+            disconnect_toggle_class(instance);
         },
         delay: EXTRA_LONG_HOVER_DELAY,
         appendTo: () => document.body,
@@ -177,30 +190,51 @@ export function initialize(): void {
     tippy.delegate("body", {
         target: ".dm-tooltip-target",
         onShow(instance) {
-            if ($(".direct-messages-container").hasClass("zoom-in")) {
+            // Collapsing doesn't happen when the modal is shown.
+            const modal_hidden = $("#direct-messages-modal").hasClass("no-display");
+            if (!modal_hidden) {
                 return false;
             }
 
-            if ($("#toggle-direct-messages-section-icon").hasClass("rotate-icon-down")) {
-                instance.setContent(
-                    $t({
-                        defaultMessage: "Collapse direct messages",
-                    }),
-                );
-            } else {
-                instance.setContent($t({defaultMessage: "Expand direct messages"}));
-            }
+            observe_toggle_class(instance, () => {
+                if ($("#toggle-direct-messages-section-icon").hasClass("rotate-icon-down")) {
+                    instance.setContent($t({defaultMessage: "Collapse direct messages"}));
+                } else {
+                    instance.setContent($t({defaultMessage: "Expand direct messages"}));
+                }
+            });
             return undefined;
         },
         delay: EXTRA_LONG_HOVER_DELAY,
         appendTo: () => document.body,
         onHidden(instance) {
+            disconnect_toggle_class(instance);
             instance.destroy();
         },
     });
 
     tippy.delegate("body", {
-        target: ".header-main .column-left .left-sidebar-toggle-button",
+        target: ".folder-toggle-tooltip-target",
+        onShow(instance) {
+            const $toggle = $(instance.reference);
+            observe_toggle_class(instance, () => {
+                if ($toggle.hasClass("rotate-icon-down")) {
+                    instance.setContent($t({defaultMessage: "Collapse folder"}));
+                } else {
+                    instance.setContent($t({defaultMessage: "Expand folder"}));
+                }
+            });
+        },
+        delay: EXTRA_LONG_HOVER_DELAY,
+        appendTo: () => document.body,
+        onHidden(instance) {
+            disconnect_toggle_class(instance);
+            instance.destroy();
+        },
+    });
+
+    tippy.delegate("body", {
+        target: ".header-main .column-left .left-sidebar-toggle-button, #streamlist-toggle",
         delay: LONG_HOVER_DELAY,
         placement: "bottom",
         appendTo: () => document.body,

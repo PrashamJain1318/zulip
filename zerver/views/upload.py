@@ -41,6 +41,7 @@ from zerver.lib.upload import (
     check_upload_within_quota,
     get_public_upload_root_url,
     maybe_add_charset,
+    needs_charset_detection,
     upload_message_attachment_from_request,
 )
 from zerver.lib.upload.local import assert_is_local_storage_path
@@ -96,10 +97,11 @@ def serve_s3(
     # (as nginx does by default with the `slice` directive) for a
     # 0-byte file.
     if attachment.size == 0:
-        content_type = maybe_add_charset(
-            attachment.content_type or guess_type(filename)[0] or "application/octet-stream",
-            attachment_source(path_id),
+        content_type = (
+            attachment.content_type or guess_type(filename)[0] or "application/octet-stream"
         )
+        if needs_charset_detection(content_type):
+            content_type = maybe_add_charset(content_type, attachment_source(path_id))
         download = force_download or bare_content_type(content_type) not in INLINE_MIME_TYPES
 
         response = HttpResponse("", content_type=content_type)
@@ -122,8 +124,6 @@ def serve_s3(
     # get the _unescaped_ new internal request URL in nginx.
     parsed_url = urlsplit(url)
     assert parsed_url.hostname is not None
-    assert parsed_url.path is not None
-    assert parsed_url.query is not None
     escaped_path_parts = parsed_url.hostname + quote(parsed_url.path) + "?" + parsed_url.query
     response = internal_nginx_redirect("/internal/s3/" + escaped_path_parts)
 
@@ -154,7 +154,8 @@ def serve_local(
     if content_type is None:
         content_type = guess_type(filename)[0] or "application/octet-stream"
 
-    content_type = maybe_add_charset(content_type, attachment_source(path_id))
+    if needs_charset_detection(content_type):
+        content_type = maybe_add_charset(content_type, attachment_source(path_id))
     download = force_download or bare_content_type(content_type) not in INLINE_MIME_TYPES
 
     if settings.DEVELOPMENT:
@@ -343,7 +344,11 @@ def serve_file(
             # currently processing the row.
             with transaction.atomic(savepoint=False):
                 ensure_thumbnails(
-                    ImageAttachment.objects.select_for_update().get(id=image_attachment.id),
+                    # ensure_thumbnails can in rare cases end up deleting the ImageAttachment row, if thumbnailing
+                    # fails. Since a DELETE can happen, we want a full FOR UPDATE lock.
+                    ImageAttachment.objects.select_for_update(no_key=False).get(
+                        id=image_attachment.id
+                    ),
                 )
 
         # Update the path that we are fetching to be the thumbnail
@@ -379,7 +384,7 @@ def generate_unauthed_file_access_url(path_id: str) -> str:
     signed_data = TimestampSigner(salt=USER_UPLOADS_ACCESS_TOKEN_SALT).sign(path_id)
     token = base64.b16encode(signed_data.encode()).decode()
 
-    filename = path_id.split("/")[-1]
+    filename = path_id.rsplit("/", 1)[-1]
     return reverse("file_unauthed_from_token", args=[token, filename])
 
 
@@ -390,7 +395,7 @@ def get_file_path_id_from_token(token: str) -> str | None:
         path_id = signer.unsign(
             signed_data, max_age=timedelta(seconds=settings.SIGNED_ACCESS_TOKEN_VALIDITY_IN_SECONDS)
         )
-    except (BadSignature, binascii.Error):
+    except (BadSignature, UnicodeDecodeError, binascii.Error):
         return None
 
     return path_id

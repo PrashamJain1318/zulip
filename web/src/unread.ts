@@ -35,7 +35,7 @@ import * as util from "./util.ts";
 export let old_unreads_missing = false;
 // Note this doesn't handle the case of `old_unreads_missing` because
 // it is simpler and we as a client are not expected to.
-export let first_unread_unmuted_message_id = Number.POSITIVE_INFINITY;
+export let first_unread_unmuted_message_id = Infinity;
 
 export function clear_old_unreads_missing(): void {
     old_unreads_missing = false;
@@ -281,6 +281,26 @@ class UnreadTopicCounter {
         const {stream_id, topic} = stream_topic;
         this.bucketer.get(stream_id)?.get(topic)?.delete(message_id);
         this.reverse_lookup.delete(message_id);
+    }
+
+    update_topic_name_case(stream_id: number, old_topic: string, new_topic: string): void {
+        const per_stream_bucketer = this.bucketer.get(stream_id);
+        if (per_stream_bucketer === undefined) {
+            return;
+        }
+
+        const topic_bucket = per_stream_bucketer.get(old_topic);
+        if (topic_bucket === undefined) {
+            return;
+        }
+
+        // Resetting with new_topic updates the display casing for
+        // topic_bucket.
+        per_stream_bucketer.set(new_topic, topic_bucket);
+
+        for (const message_id of topic_bucket) {
+            this.reverse_lookup.set(message_id, {stream_id, topic: new_topic});
+        }
     }
 
     get_counts_per_topic(): UnreadTopicCounts {
@@ -568,6 +588,21 @@ class UnreadTopicCounter {
         return followed_topic_unread_mentions;
     }
 
+    get_topics_with_unreads(stream_id: number): string[] {
+        const per_stream_bucketer = this.bucketer.get(stream_id);
+        if (!per_stream_bucketer) {
+            return [];
+        }
+
+        const topics = [];
+        for (const [topic, msgs] of per_stream_bucketer) {
+            if (msgs.size > 0) {
+                topics.push(topic);
+            }
+        }
+        return topics;
+    }
+
     topic_has_any_unread(stream_id: number, topic: string): boolean {
         const per_stream_bucketer = this.bucketer.get(stream_id);
 
@@ -701,6 +736,16 @@ export function get_unread_messages(messages: Message[]): Message[] {
     return messages.filter((message) => unread_messages.has(message.id));
 }
 
+// The key recent view uses for the message's conversation, known here
+// even for a message the client never fetched.
+export function get_unread_message_conversation_key(message_id: number): string | undefined {
+    const stream_topic = unread_topic_counter.reverse_lookup.get(message_id);
+    if (stream_topic !== undefined) {
+        return recent_view_util.get_topic_key(stream_topic.stream_id, stream_topic.topic);
+    }
+    return unread_direct_message_counter.reverse_lookup.get(message_id);
+}
+
 export function get_unread_message_count(): number {
     return unread_messages.size;
 }
@@ -729,20 +774,28 @@ export function update_unread_topics(
     });
 }
 
+export function update_unread_topic_name_case(
+    stream_id: number,
+    old_topic: string,
+    new_topic: string,
+): void {
+    unread_topic_counter.update_topic_name_case(stream_id, old_topic, new_topic);
+}
+
 export function process_loaded_messages(
     messages: Message[],
     expect_no_new_unreads = false,
-): boolean {
+): Message[] {
     // Process a set of messages that we have full copies of from the
     // server for whether any are unread but not tracked as such by
     // our data structures. This can occur due to old_unreads_missing,
     // changes in muting configuration, innocent races, or potentially bugs.
     //
-    // Returns whether there were any new unread messages; in that
-    // case, the caller will need to trigger a rerender of UI
+    // Returns the messages newly discovered to be unread; if there
+    // are any, the caller will need to trigger a rerender of UI
     // displaying unread counts.
 
-    let any_untracked_unread_messages = false;
+    const untracked_unread_messages: Message[] = [];
     for (const message of messages) {
         if (message.unread) {
             if (unread_messages.has(message.id)) {
@@ -778,11 +831,11 @@ export function process_loaded_messages(
                     unread: true,
                 });
             }
-            any_untracked_unread_messages = true;
+            untracked_unread_messages.push(message);
         }
     }
 
-    return any_untracked_unread_messages;
+    return untracked_unread_messages;
 }
 
 type UnreadMessageData = {
@@ -814,9 +867,7 @@ export function process_unread_message(message: UnreadMessageData): void {
             message_id: message.id,
             user_ids_string: message.user_ids_string,
         });
-    }
-
-    if (message.type === "stream") {
+    } else if (message.type === "stream") {
         unread_topic_counter.add({
             message_id: message.id,
             stream_id: message.stream_id,
@@ -938,7 +989,7 @@ export function get_counts(): FullUnreadCountsData {
     const update_first_unmuted_message_id = true;
     // Reset the first_unread_unmuted_message_id, to ensure it is always capture the
     // minimum of current unread messages between topics and DMs.
-    first_unread_unmuted_message_id = Number.POSITIVE_INFINITY;
+    first_unread_unmuted_message_id = Infinity;
     const topic_res = unread_topic_counter.get_counts(update_first_unmuted_message_id);
     const pm_res = unread_direct_message_counter.get_counts(update_first_unmuted_message_id);
 
@@ -966,7 +1017,7 @@ export function get_counts(): FullUnreadCountsData {
 
 // Saves us from calling to get_counts() when we can avoid it.
 export function calculate_notifiable_count(res: FullUnreadCountsData): number {
-    let new_message_count = 0;
+    let new_message_count;
 
     const only_show_dm_mention =
         user_settings.desktop_icon_count_display ===
@@ -1047,6 +1098,10 @@ export function topic_has_any_unread_mentions(stream_id: number, topic: string):
     return (unread_mention_topics.get(topic_key)?.size ?? 0) > 0;
 }
 
+export function get_topics_with_unreads(stream_id: number): string[] {
+    return unread_topic_counter.get_topics_with_unreads(stream_id);
+}
+
 export function topic_has_any_unread(stream_id: number, topic: string): boolean {
     return unread_topic_counter.topic_has_any_unread(stream_id, topic);
 }
@@ -1120,9 +1175,10 @@ export function initialize(params: StateData["unread"]): void {
     unread_direct_message_counter.set_direct_message_groups(unread_msgs.huddles);
     unread_direct_message_counter.set_pms(unread_msgs.pms);
     unread_topic_counter.set_streams(unread_msgs.streams);
+    const direct_message_ids = new Set(unread_direct_message_counter.get_msg_ids());
     for (const message_id of unread_msgs.mentions) {
         unread_mentions_counter.add(message_id);
-        if (unread_direct_message_counter.get_msg_ids().includes(message_id)) {
+        if (direct_message_ids.has(message_id)) {
             direct_message_with_mention_count.add(message_id);
         }
     }

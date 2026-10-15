@@ -17,6 +17,14 @@ from zerver.actions.message_delete import do_delete_messages_by_sender
 from zerver.actions.user_groups import update_users_in_full_members_system_group
 from zerver.actions.user_settings import do_scrub_avatar_images
 from zerver.lib.demo_organizations import demo_organization_owner_email_exists
+from zerver.lib.event_types import (
+    BaseEvent,
+    RealmDeactivatedEvent,
+    RealmUpdateDictData,
+    RealmUpdateDictEvent,
+    RealmUpdateEvent,
+    RealmUserSettingsDefaultsUpdateEvent,
+)
 from zerver.lib.exceptions import JsonableError
 from zerver.lib.message import parse_message_time_limit_setting, update_first_visible_message_id
 from zerver.lib.queue import queue_json_publish_rollback_unsafe
@@ -27,7 +35,7 @@ from zerver.lib.timestamp import datetime_to_timestamp, timestamp_to_datetime
 from zerver.lib.timezone import canonicalize_timezone
 from zerver.lib.types import UserGroupMembersData
 from zerver.lib.upload import delete_message_attachments
-from zerver.lib.user_counts import realm_user_count_by_role
+from zerver.lib.user_counts import realm_user_count_by_role, update_billing_records_if_needed
 from zerver.lib.user_groups import (
     convert_to_user_group_members_dict,
     get_group_setting_value_for_api,
@@ -37,6 +45,8 @@ from zerver.lib.utils import optional_bytes_to_mib
 from zerver.models import (
     ArchivedAttachment,
     Attachment,
+    DirectMessageGroup,
+    ImageAttachment,
     Message,
     NamedUserGroup,
     Realm,
@@ -85,43 +95,56 @@ def do_set_realm_property(
         return
 
     setattr(realm, name, value)
-    realm.save(update_fields=[name])
+    if name == "description":
+        from zerver.lib.realm_description import render_realm_description
 
-    event = dict(
-        type="realm",
-        op="update",
-        property=name,
-        value=value,
-    )
+        rendered_description, version = render_realm_description(value, realm)
+        realm.rendered_description = rendered_description
+        realm.rendered_description_version = version
+        realm.save(update_fields=[name, "rendered_description", "rendered_description_version"])
+    else:
+        realm.save(update_fields=[name])
+
+    if name == "enable_spectator_access":
+        Attachment.objects.filter(realm=realm).update(is_web_public=None)
+        # We need to do the same for ArchivedAttachment to avoid
+        # bugs if deleted attachments are later restored.
+        ArchivedAttachment.objects.filter(realm=realm).update(is_web_public=None)
+
+    event: BaseEvent = RealmUpdateEvent(property=name, value=value)
 
     # These settings have a different event format due to their history.
-    message_edit_settings = [
-        "allow_message_editing",
-        "message_content_edit_limit_seconds",
-    ]
-    if name in message_edit_settings:
-        event = dict(
-            type="realm",
-            op="update_dict",
+    if name == "allow_message_editing":
+        event = RealmUpdateDictEvent(
             property="default",
-            data={name: value},
+            data=RealmUpdateDictData(allow_message_editing=value),
+        )
+    if name == "message_content_edit_limit_seconds":
+        event = RealmUpdateDictEvent(
+            property="default",
+            data=RealmUpdateDictData(message_content_edit_limit_seconds=value),
         )
     if name == "message_edit_history_visibility_policy":
-        event = dict(
-            type="realm",
-            op="update",
+        event = RealmUpdateEvent(
             property=name,
             value=MessageEditHistoryVisibilityPolicyEnum(value).name,
         )
     if name == "topics_policy":
-        event = dict(
-            type="realm",
-            op="update_dict",
+        event = RealmUpdateDictEvent(
             property="default",
-            data={
-                name: RealmTopicsPolicyEnum(value).name,
-                "mandatory_topics": value == RealmTopicsPolicyEnum.disable_empty_topic.value,
-            },
+            data=RealmUpdateDictData(
+                topics_policy=RealmTopicsPolicyEnum(value).name,
+                mandatory_topics=value == RealmTopicsPolicyEnum.disable_empty_topic.value,
+            ),
+        )
+    if name == "description":
+        assert realm.rendered_description is not None
+        event = RealmUpdateDictEvent(
+            property="default",
+            data=RealmUpdateDictData(
+                description=realm.description,
+                rendered_description=realm.rendered_description,
+            ),
         )
 
     send_event_on_commit(realm, event, active_user_ids(realm.id))
@@ -178,12 +201,7 @@ def do_set_push_notifications_enabled_end_timestamp(
         },
     )
 
-    event = dict(
-        type="realm",
-        op="update",
-        property=name,
-        value=value,
-    )
+    event = RealmUpdateEvent(property=name, value=value)
     send_event_on_commit(realm, event, active_user_ids(realm.id))
 
 
@@ -221,11 +239,11 @@ def do_change_realm_permission_group_setting(
         # a combination of users and groups.
         old_value.delete()
 
-    event = dict(
-        type="realm",
-        op="update_dict",
+    event = RealmUpdateDictEvent(
         property="default",
-        data={setting_name: convert_to_user_group_members_dict(new_setting_api_value)},
+        data=RealmUpdateDictData.model_validate(
+            {setting_name: convert_to_user_group_members_dict(new_setting_api_value)}
+        ),
     )
 
     send_event_on_commit(realm, event, active_user_ids(realm.id))
@@ -246,6 +264,20 @@ def do_change_realm_permission_group_setting(
             "property": setting_name,
         },
     )
+
+    if setting_name == "workplace_users_group":
+        RealmAuditLog.objects.create(
+            realm=realm,
+            event_type=AuditLogEventType.WORKPLACE_USERS_COUNT_CHANGED,
+            event_time=event_time,
+            acting_user=acting_user,
+            extra_data={
+                RealmAuditLog.ROLE_COUNT: realm_user_count_by_role(realm),
+                "trigger": "setting_changed",
+            },
+        )
+
+        update_billing_records_if_needed(realm, user=acting_user, event_time=event_time)
 
 
 def parse_and_set_setting_value_if_required(
@@ -390,16 +422,13 @@ def do_set_realm_authentication_methods(
         },
     )
 
-    event_data = dict(
-        authentication_methods=get_realm_authentication_methods_for_page_params_api(
-            realm, updated_value
-        )
-    )
-    event = dict(
-        type="realm",
-        op="update_dict",
+    event = RealmUpdateDictEvent(
         property="default",
-        data=event_data,
+        data=RealmUpdateDictData(
+            authentication_methods=get_realm_authentication_methods_for_page_params_api(
+                realm, updated_value
+            )
+        ),
     )
     send_event_on_commit(realm, event, active_user_ids(realm.id))
 
@@ -454,12 +483,7 @@ def do_set_realm_stream(
             },
         )
 
-        event = dict(
-            type="realm",
-            op="update",
-            property=property,
-            value=stream_id,
-        )
+        event = RealmUpdateEvent(property=property, value=stream_id)
         send_event_on_commit(realm, event, active_user_ids(realm.id))
 
 
@@ -531,12 +555,7 @@ def do_set_realm_user_default_setting(
         },
     )
 
-    event = dict(
-        type="realm_user_settings_defaults",
-        op="update",
-        property=name,
-        value=event_value,
-    )
+    event = RealmUserSettingsDefaultsUpdateEvent(property=name, value=event_value)
     send_event_on_commit(realm, event, active_user_ids(realm.id))
 
 
@@ -610,15 +629,15 @@ def do_deactivate_realm(
         # immediate reload into the page explaining the realm was
         # deactivated). So the purpose of sending this is to flush all
         # active longpoll connections for the realm.
-        event = dict(type="realm", op="deactivated", realm_id=realm.id)
+        event = RealmDeactivatedEvent(realm_id=realm.id)
         send_event_on_commit(realm, event, active_user_ids(realm.id))
 
         if deletion_delay_days == 0:
-            event = {
+            deferred_work_event = {
                 "type": "scrub_deactivated_realm",
                 "realm_id": realm.id,
             }
-            queue_json_publish_rollback_unsafe("deferred_work", event)
+            queue_json_publish_rollback_unsafe("deferred_work", deferred_work_event)
 
     # Don't deactivate the users, as that would lose a lot of state if
     # the realm needs to be reactivated, but do delete their sessions
@@ -692,23 +711,71 @@ def do_add_deactivated_redirect(realm: Realm, redirect_url: str) -> None:
     realm.save(update_fields=["deactivated_redirect"])
 
 
-def do_delete_all_realm_attachments(realm: Realm, *, batch_size: int = 1000) -> None:
+def do_delete_all_realm_attachments(realm: Realm) -> None:
     # Delete attachment files from the storage backend, so that we
     # don't leave them dangling.
-    for obj_class in Attachment, ArchivedAttachment:
-        last_id = 0
-        while True:
+    with delete_message_attachments(delete_from=(ImageAttachment,)) as delete_one:
+        for obj_class in Attachment, ArchivedAttachment:
             to_delete = (
-                obj_class._default_manager.filter(realm_id=realm.id, pk__gt=last_id)
+                obj_class._default_manager.filter(realm_id=realm.id)
                 .order_by("pk")
-                .values_list("pk", "path_id")[:batch_size]
+                .select_for_update(no_key=False)
+                .values_list("path_id", flat=True)
             )
-            if len(to_delete) > 0:
-                delete_message_attachments([row[1] for row in to_delete])
-                last_id = to_delete[len(to_delete) - 1][0]
-            if len(to_delete) < batch_size:
-                break
-        obj_class._default_manager.filter(realm=realm).delete()
+            for path_id in to_delete.iterator():
+                delete_one(path_id)
+            obj_class._default_manager.filter(realm_id=realm.id).delete()
+
+
+@transaction.atomic(durable=True)
+def do_delete_realm(realm: Realm) -> None:
+    """Permanently delete a Realm.
+
+    Prefer do_deactivate_realm + do_scrub_realm for production use;
+    they preserve UserProfile rows.
+    """
+    realm = Realm.objects.select_for_update(no_key=False).get(id=realm.id)
+    do_delete_all_realm_attachments(realm)
+
+    # realm.delete() leaves DirectMessageGroup and Recipient rows
+    # behind (no FK back to Realm), and for DMGs with cross-realm
+    # bot subs the bot Subscription survives too.  Human-to-human
+    # cross-realm DMs aren't currently possible, so every DMG our
+    # users were in becomes orphan on realm.delete(): any survivor
+    # must be a system bot.  Snapshot the Recipients now, while
+    # the Subscription join still exists.
+    #
+    # TODO: if cross-realm human DMs become possible, this has to
+    # filter out DMGs that still have a non-bot subscriber from
+    # another realm.
+    orphan_dmg_recipient_ids = set(
+        Subscription.objects.filter(
+            recipient__type=Recipient.DIRECT_MESSAGE_GROUP,
+            user_profile__realm_id=realm.id,
+        )
+        .distinct("recipient_id")
+        .values_list("recipient_id", flat=True)
+    )
+    orphan_huddle_ids = set(
+        Recipient.objects.filter(id__in=orphan_dmg_recipient_ids).values_list("type_id", flat=True)
+    )
+
+    # Stream Recipients have no FK back to Stream either, so the
+    # realm's Stream cascade strands them in the same way.  Capture
+    # them alongside the DMG Recipients.
+    orphan_stream_recipient_ids = set(
+        Stream.objects.filter(realm=realm)
+        .exclude(recipient__isnull=True)
+        .values_list("recipient_id", flat=True)
+    )
+
+    realm.delete()
+
+    # Recipient.delete() cascades Subscription and Message;
+    # DirectMessageGroup.recipient is SET_NULL, so the DMG row
+    # needs an explicit delete.
+    Recipient.objects.filter(id__in=orphan_dmg_recipient_ids | orphan_stream_recipient_ids).delete()
+    DirectMessageGroup.objects.filter(id__in=orphan_huddle_ids).delete()
 
 
 @transaction.atomic(durable=True)
@@ -741,7 +808,6 @@ def do_scrub_realm(realm: Realm, *, acting_user: UserProfile | None) -> None:
         Stream.objects.filter(realm=realm)
         .values_list("recipient_id", flat=True)
         .union(
-            UserProfile.objects.filter(realm=realm).values_list("recipient_id", flat=True),
             Subscription.objects.filter(
                 recipient__type=Recipient.DIRECT_MESSAGE_GROUP, user_profile__realm=realm
             ).values_list("recipient_id", flat=True),
@@ -823,7 +889,7 @@ def do_change_realm_org_type(
         },
     )
 
-    event = dict(type="realm", op="update", property="org_type", value=org_type)
+    event = RealmUpdateEvent(property="org_type", value=org_type)
     send_event_on_commit(realm, event, active_user_ids(realm.id))
 
 
@@ -922,15 +988,13 @@ def do_change_realm_plan_type(
 
     realm.save(update_fields=["_max_invites", "message_visibility_limit"])
 
-    event = dict(
-        type="realm",
-        op="update_dict",
+    event = RealmUpdateDictEvent(
         property="default",
-        data={
-            "plan_type": plan_type,
-            "upload_quota_mib": optional_bytes_to_mib(realm.upload_quota_bytes()),
-            "max_file_upload_size_mib": realm.get_max_file_upload_size_mebibytes(),
-        },
+        data=RealmUpdateDictData(
+            plan_type=plan_type,
+            upload_quota_mib=optional_bytes_to_mib(realm.upload_quota_bytes()),
+            max_file_upload_size_mib=realm.get_max_file_upload_size_mebibytes(),
+        ),
     )
     send_event_on_commit(realm, event, active_user_ids(realm.id))
 

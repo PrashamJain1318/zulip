@@ -9,17 +9,19 @@ import * as timerender from "./timerender.ts";
 export type ScheduledMessage = z.infer<typeof scheduled_message_schema>;
 
 type TimeKey =
-    | "today_nine_am"
-    | "today_four_pm"
-    | "tomorrow_nine_am"
-    | "tomorrow_four_pm"
-    | "monday_nine_am";
+    "today_nine_am" | "today_four_pm" | "tomorrow_nine_am" | "tomorrow_four_pm" | "monday_nine_am";
 
 type SendOption = Partial<Record<TimeKey, {text: string; stamp: number}>>;
 
 export const MINIMUM_SCHEDULED_MESSAGE_DELAY_SECONDS = 5 * 60;
 
-export const scheduled_messages_by_id = new Map<number, ScheduledMessage>();
+export let scheduled_messages_by_id = new Map<number, ScheduledMessage>();
+
+export function set_scheduled_messages_by_id_for_testing(
+    scheduled_messages: Map<number, ScheduledMessage>,
+): void {
+    scheduled_messages_by_id = scheduled_messages;
+}
 
 let selected_send_later_timestamp: number | undefined;
 
@@ -29,7 +31,7 @@ let selected_send_later_timestamp: number | undefined;
 export let show_minimum_scheduled_message_delay_minutes_note = false;
 
 export function get_all_scheduled_messages(): ScheduledMessage[] {
-    return [...scheduled_messages_by_id.values()];
+    return scheduled_messages_by_id.values().toArray();
 }
 
 function compute_send_times(now = new Date()): Record<TimeKey, number> {
@@ -170,7 +172,7 @@ export function get_filtered_send_opts(date: Date): {
     };
 
     let possible_send_later_today: SendOption | false = {};
-    let possible_send_later_monday: SendOption | false = {};
+    let possible_send_later_monday: SendOption | false;
 
     const minutes_into_day = date.getHours() * 60 + date.getMinutes();
     // Show Today send options based on time of day

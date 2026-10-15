@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -86,7 +86,7 @@ export function show_configure_email_banner(): void {
 
     $configure_email_banner_container.on("click", ".demo-organization-add-email", (e) => {
         e.preventDefault();
-        window.location.href = "/#settings/account-and-privacy";
+        window.location.assign("/#settings/account-and-privacy");
     });
 }
 
@@ -99,7 +99,7 @@ export function show_convert_demo_organization_modal(): void {
     const parts = new URL(realm.realm_url).hostname.split(".");
     parts.shift();
     const domain = parts.join(".");
-    const html_body = render_convert_demo_organization_form({
+    const modal_content_html = render_convert_demo_organization_form({
         realm_domain: domain,
         user_has_email_set: email_set,
     });
@@ -132,18 +132,18 @@ export function show_convert_demo_organization_modal(): void {
         const opts: RequestOpts = {
             success_continuation(raw_data) {
                 const data = z.object({realm_url: z.string()}).parse(raw_data);
-                window.location.href = data.realm_url;
+                window.location.assign(data.realm_url);
             },
         };
         dialog_widget.submit_api_request(channel.patch, "/json/realm", data, opts);
     }
 
     dialog_widget.launch({
-        html_heading: $t({defaultMessage: "Make organization permanent"}),
-        html_body,
+        modal_title_html: $t({defaultMessage: "Make organization permanent"}),
+        modal_content_html,
         on_click: submit_subdomain,
         post_render: demo_organization_conversion_post_render,
-        html_submit_button: $t({defaultMessage: "Convert"}),
+        modal_submit_button_text: $t({defaultMessage: "Convert"}),
         id: "demo-organization-conversion-modal",
         loading_spinner: true,
         help_link:

@@ -12,14 +12,16 @@ from zerver.actions.message_edit import (
     build_message_edit_request,
     check_update_message,
     do_update_message,
+    get_participant_user_ids_in_moved_messages,
     maybe_send_resolve_topic_notifications,
 )
-from zerver.actions.reactions import do_add_reaction
+from zerver.actions.reactions import check_add_reaction, do_add_reaction
 from zerver.actions.realm_settings import (
     do_change_realm_permission_group_setting,
     do_set_realm_property,
 )
 from zerver.actions.streams import do_change_stream_group_based_setting, do_set_stream_property
+from zerver.actions.submessage import do_add_submessage
 from zerver.actions.user_groups import check_add_user_group
 from zerver.actions.user_settings import do_change_user_setting
 from zerver.actions.user_topics import do_set_user_topic_visibility_policy
@@ -28,6 +30,7 @@ from zerver.lib.test_classes import ZulipTestCase, get_topic_messages
 from zerver.lib.timestamp import datetime_to_timestamp
 from zerver.lib.topic import RESOLVED_TOPIC_PREFIX
 from zerver.lib.types import StreamMessageEditRequest, UserGroupMembersData
+from zerver.lib.user_message import create_historical_user_messages
 from zerver.lib.user_topics import (
     get_users_with_user_topic_visibility_policy,
     set_topic_visibility_policy,
@@ -132,7 +135,7 @@ class MessageMoveTopicTest(ZulipTestCase):
                 "propagate_mode": "change_all",
             },
         )
-        self.assert_json_error(result, "Invalid propagate_mode without topic edit")
+        self.assert_json_error(result, "Invalid propagate_mode without topic or channel edit")
         self.check_topic(id1, topic_name="topic1")
 
     def test_edit_message_empty_topic_with_extra_space(self) -> None:
@@ -268,6 +271,71 @@ class MessageMoveTopicTest(ZulipTestCase):
         )
         self.assert_json_error(result, "Invalid character in topic, at position 1!")
 
+    def test_get_participant_user_ids_in_moved_messages(self) -> None:
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        desdemona = self.example_user("desdemona")
+        iago = self.example_user("iago")
+        othello = self.example_user("othello")
+        aaron = self.example_user("aaron")
+        shiva = self.example_user("shiva")
+        stream = self.make_stream("new_stream")
+
+        for user in [hamlet, cordelia, desdemona, iago, othello, aaron]:
+            self.subscribe(user, stream.name)
+
+        original_topic = "original"
+
+        first_message_id = self.send_stream_message(
+            sender=hamlet,
+            stream_name=stream.name,
+            topic_name=original_topic,
+            content=f"Hello @**{cordelia.full_name}**",
+        )
+
+        second_message_id = self.send_stream_message(
+            sender=desdemona,
+            stream_name=stream.name,
+            topic_name=original_topic,
+            content="Hello again",
+        )
+
+        check_add_reaction(
+            user_profile=iago,
+            message_id=first_message_id,
+            emoji_name="smile",
+            emoji_code=None,
+            reaction_type=None,
+        )
+
+        do_add_submessage(
+            realm=hamlet.realm,
+            sender_id=othello.id,
+            message_id=second_message_id,
+            msg_type="whatever",
+            content="submessage",
+        )
+
+        # shiva has a historical UserMessage with a mention flag — should be excluded
+        # since they have not been subscribed to the stream when mention happened and so
+        # they are not a real participant of the moved message.
+        create_historical_user_messages(
+            user_id=shiva.id,
+            message_ids=[second_message_id],
+            flagattr=UserMessage.flags.mentioned,
+            flag_target=UserMessage.flags.mentioned,
+        )
+
+        # hamlet (sender, msg1), desdemona (sender, msg2), cordelia (mentioned, msg1),
+        # iago (reaction, msg1), othello (submessage (poll/todo participation), msg2)
+        # — all these are included since they are participants of moved messages.
+        # aaron (plain subscriber) and shiva (historically mentioned)
+        # — both excluded.
+        self.assertEqual(
+            get_participant_user_ids_in_moved_messages([first_message_id, second_message_id]),
+            {hamlet.id, cordelia.id, desdemona.id, iago.id, othello.id},
+        )
+
     @mock.patch("zerver.actions.message_edit.send_event_on_commit")
     def test_edit_topic_public_history_stream(self, mock_send_event: mock.MagicMock) -> None:
         stream_name = "Macbeth"
@@ -356,6 +424,97 @@ class MessageMoveTopicTest(ZulipTestCase):
         do_update_message_topic_success(hamlet, message, "Change again", users_to_be_notified)
 
     @mock.patch("zerver.actions.user_topics.send_event_on_commit")
+    def test_case_only_topic_rename_preserves_visibility_policy(
+        self, mock_send_event_on_commit: mock.MagicMock
+    ) -> None:
+        # Renaming a topic with only a case change is, for matching
+        # purposes, the same topic; each user's visibility policy must
+        # survive the rename rather than being reset to inherit.
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        stream = self.make_stream("case rename stream")
+        self.subscribe(hamlet, stream.name)
+        self.subscribe(cordelia, stream.name)
+        self.login_user(hamlet)
+
+        message_id = self.send_stream_message(hamlet, stream.name, topic_name="Test Topic")
+        do_set_user_topic_visibility_policy(
+            hamlet, stream, "Test Topic", visibility_policy=UserTopic.VisibilityPolicy.MUTED
+        )
+        do_set_user_topic_visibility_policy(
+            cordelia, stream, "Test Topic", visibility_policy=UserTopic.VisibilityPolicy.FOLLOWED
+        )
+        mock_send_event_on_commit.reset_mock()
+
+        result = self.client_patch(
+            f"/json/messages/{message_id}",
+            {"topic": "test topic", "propagate_mode": "change_all"},
+        )
+        self.assert_json_success(result)
+
+        # Each affected user is notified just like for a regular move: a
+        # user_topic event removing the old row, one adding the row under
+        # the new casing, and a muted_topics event with the full updated
+        # set of muted topics.
+        user_topic_events: dict[int, list[tuple[str, int]]] = {hamlet.id: [], cordelia.id: []}
+        muted_topics_events: dict[int, list[list[list[str | int]]]] = {
+            hamlet.id: [],
+            cordelia.id: [],
+        }
+        for call_args in mock_send_event_on_commit.call_args_list:
+            (_arg_realm, arg_event, arg_notified_users) = call_args[0]
+            [notified_user_id] = arg_notified_users
+            if arg_event.type == "user_topic":
+                self.assertEqual(arg_event.stream_id, stream.id)
+                user_topic_events[notified_user_id].append(
+                    (arg_event.topic_name, arg_event.visibility_policy)
+                )
+            elif arg_event.type == "muted_topics":
+                muted_topics_events[notified_user_id].append(arg_event.muted_topics)
+        self.assertEqual(
+            user_topic_events[hamlet.id],
+            [
+                ("Test Topic", UserTopic.VisibilityPolicy.INHERIT),
+                ("test topic", UserTopic.VisibilityPolicy.MUTED),
+            ],
+        )
+        self.assertEqual(
+            user_topic_events[cordelia.id],
+            [
+                ("Test Topic", UserTopic.VisibilityPolicy.INHERIT),
+                ("test topic", UserTopic.VisibilityPolicy.FOLLOWED),
+            ],
+        )
+        self.assertEqual(muted_topics_events[hamlet.id], [[[stream.name, "test topic", mock.ANY]]])
+        self.assertEqual(muted_topics_events[cordelia.id], [[]])
+
+        # The policies survive and still apply to the renamed topic
+        # (matched case-insensitively).
+        self.assertTrue(
+            topic_has_visibility_policy(
+                hamlet, stream.id, "test topic", UserTopic.VisibilityPolicy.MUTED
+            )
+        )
+        self.assertTrue(
+            topic_has_visibility_policy(
+                cordelia, stream.id, "test topic", UserTopic.VisibilityPolicy.FOLLOWED
+            )
+        )
+        # The stored topic name is updated to the new casing, and no row
+        # is duplicated or lost.
+        self.assertEqual(
+            sorted(
+                UserTopic.objects.filter(stream_id=stream.id).values_list(
+                    "topic_name", "visibility_policy"
+                )
+            ),
+            [
+                ("test topic", UserTopic.VisibilityPolicy.MUTED),
+                ("test topic", UserTopic.VisibilityPolicy.FOLLOWED),
+            ],
+        )
+
+    @mock.patch("zerver.actions.user_topics.send_event_on_commit")
     def test_edit_muted_topic(self, mock_send_event_on_commit: mock.MagicMock) -> None:
         stream_name = "Stream 123"
         stream = self.make_stream(stream_name)
@@ -420,7 +579,7 @@ class MessageMoveTopicTest(ZulipTestCase):
         # state + 1/user with a UserTopic row for the events data)
         # beyond what is typical were there not UserTopic records to
         # update. Ideally, we'd eliminate the per-user component.
-        with self.assert_database_query_count(28):
+        with self.assert_database_query_count(26):
             check_update_message(
                 user_profile=hamlet,
                 message_id=message_id,
@@ -438,9 +597,9 @@ class MessageMoveTopicTest(ZulipTestCase):
         users_notified_via_user_topic_event: list[int] = []
         for call_args in mock_send_event_on_commit.call_args_list:
             (_arg_realm, arg_event, arg_notified_users) = call_args[0]
-            if arg_event["type"] == "user_topic":
+            if arg_event.type == "user_topic":
                 users_notified_via_user_topic_event.append(*arg_notified_users)
-            elif arg_event["type"] == "muted_topics":
+            elif arg_event.type == "muted_topics":
                 users_notified_via_muted_topics_event.append(*arg_notified_users)
         self.assertEqual(
             sorted(users_notified_via_muted_topics_event),
@@ -517,7 +676,7 @@ class MessageMoveTopicTest(ZulipTestCase):
         set_topic_visibility_policy(desdemona, muted_topics, UserTopic.VisibilityPolicy.MUTED)
         set_topic_visibility_policy(cordelia, muted_topics, UserTopic.VisibilityPolicy.MUTED)
 
-        with self.assert_database_query_count(30):
+        with self.assert_database_query_count(27):
             check_update_message(
                 user_profile=desdemona,
                 message_id=message_id,
@@ -547,7 +706,7 @@ class MessageMoveTopicTest(ZulipTestCase):
         ]
         set_topic_visibility_policy(desdemona, muted_topics, UserTopic.VisibilityPolicy.MUTED)
         set_topic_visibility_policy(cordelia, muted_topics, UserTopic.VisibilityPolicy.MUTED)
-        with self.assert_database_query_count(36):
+        with self.assert_database_query_count(34):
             check_update_message(
                 user_profile=desdemona,
                 message_id=message_id,
@@ -580,7 +739,7 @@ class MessageMoveTopicTest(ZulipTestCase):
         set_topic_visibility_policy(desdemona, muted_topics, UserTopic.VisibilityPolicy.MUTED)
         set_topic_visibility_policy(cordelia, muted_topics, UserTopic.VisibilityPolicy.MUTED)
 
-        with self.assert_database_query_count(32):
+        with self.assert_database_query_count(30):
             check_update_message(
                 user_profile=desdemona,
                 message_id=message_id,
@@ -599,28 +758,84 @@ class MessageMoveTopicTest(ZulipTestCase):
         assert_is_topic_muted(cordelia, new_public_stream.id, "changed topic name", muted=True)
         assert_is_topic_muted(aaron, new_public_stream.id, "changed topic name", muted=False)
 
-        # Moving only half the messages doesn't move UserTopic records.
-        second_message_id = self.send_stream_message(
-            hamlet, stream_name, topic_name="changed topic name", content="Second message"
+    def test_move_topic_to_private_stream_migrates_policy_by_content_access(self) -> None:
+        # When a topic is moved to a channel, its visibility policies are
+        # migrated for exactly the users who have content access to the
+        # target channel.
+        hamlet = self.example_user("hamlet")
+        desdemona = self.example_user("desdemona")
+        othello = self.example_user("othello")
+        cordelia = self.example_user("cordelia")
+        iago = self.example_user("iago")
+
+        stream_name = "public source"
+        stream = self.make_stream(stream_name)
+        self.subscribe(hamlet, stream_name)
+        self.login_user(hamlet)
+        message_id = self.send_stream_message(
+            hamlet, stream_name, topic_name="topic", content="Hello World"
         )
-        with self.assert_database_query_count(26):
-            check_update_message(
-                user_profile=desdemona,
-                message_id=second_message_id,
-                stream_id=new_public_stream.id,
-                topic_name="final topic name",
-                propagate_mode="change_later",
-                send_notification_to_old_thread=False,
-                send_notification_to_new_thread=False,
-                content=None,
+
+        # A private channel with protected history.
+        private_stream = self.make_stream(
+            "private target", invite_only=True, history_public_to_subscribers=False
+        )
+        self.subscribe(desdemona, private_stream.name)
+        # Othello has content access to the target via subscription.
+        self.subscribe(othello, private_stream.name)
+        # Cordelia has content access via a content-access group,
+        # without being subscribed to the target.
+        content_access_group = check_add_user_group(
+            hamlet.realm, "target-content-access", [cordelia], acting_user=hamlet
+        )
+        do_change_stream_group_based_setting(
+            private_stream,
+            "can_add_subscribers_group",
+            content_access_group,
+            acting_user=desdemona,
+        )
+
+        # None of Othello, Cordelia, or Iago is subscribed to the source
+        # channel.
+        muted_topics = [[stream_name, "topic"]]
+        for user in [othello, cordelia, iago]:
+            set_topic_visibility_policy(user, muted_topics, UserTopic.VisibilityPolicy.MUTED)
+
+        check_update_message(
+            user_profile=desdemona,
+            message_id=message_id,
+            stream_id=private_stream.id,
+            propagate_mode="change_all",
+            send_notification_to_old_thread=False,
+            send_notification_to_new_thread=False,
+            content=None,
+        )
+
+        # Othello and Cordelia keep the UserTopic row, migrated to
+        # the private channel.
+        for user in [othello, cordelia]:
+            self.assertFalse(
+                UserTopic.objects.filter(
+                    user_profile=user, stream=stream.id, topic_name="topic"
+                ).exists()
+            )
+            self.assertTrue(
+                topic_has_visibility_policy(
+                    user, private_stream.id, "topic", UserTopic.VisibilityPolicy.MUTED
+                )
             )
 
-        assert_is_topic_muted(desdemona, new_public_stream.id, "changed topic name", muted=True)
-        assert_is_topic_muted(cordelia, new_public_stream.id, "changed topic name", muted=True)
-        assert_is_topic_muted(aaron, new_public_stream.id, "changed topic name", muted=False)
-        assert_is_topic_muted(desdemona, new_public_stream.id, "final topic name", muted=False)
-        assert_is_topic_muted(cordelia, new_public_stream.id, "final topic name", muted=False)
-        assert_is_topic_muted(aaron, new_public_stream.id, "final topic name", muted=False)
+        # Iago has no content access, so the UserTopic row is removed.
+        self.assertFalse(
+            UserTopic.objects.filter(
+                user_profile=iago, stream=stream.id, topic_name="topic"
+            ).exists()
+        )
+        self.assertFalse(
+            UserTopic.objects.filter(
+                user_profile=iago, stream=private_stream.id, topic_name="topic"
+            ).exists()
+        )
 
     @mock.patch("zerver.actions.user_topics.send_event_on_commit")
     def test_edit_unmuted_topic(self, mock_send_event_on_commit: mock.MagicMock) -> None:
@@ -682,7 +897,7 @@ class MessageMoveTopicTest(ZulipTestCase):
             users_to_be_notified_via_muted_topics_event.append(user_topic.user_profile_id)
 
         change_all_topic_name = "Topic 1 edited"
-        with self.assert_database_query_count(33):
+        with self.assert_database_query_count(31):
             check_update_message(
                 user_profile=hamlet,
                 message_id=message_id,
@@ -700,9 +915,9 @@ class MessageMoveTopicTest(ZulipTestCase):
         users_notified_via_user_topic_event: list[int] = []
         for call_args in mock_send_event_on_commit.call_args_list:
             (_arg_realm, arg_event, arg_notified_users) = call_args[0]
-            if arg_event["type"] == "user_topic":
+            if arg_event.type == "user_topic":
                 users_notified_via_user_topic_event.append(*arg_notified_users)
-            elif arg_event["type"] == "muted_topics":
+            elif arg_event.type == "muted_topics":
                 users_notified_via_muted_topics_event.append(*arg_notified_users)
         self.assertEqual(
             sorted(users_notified_via_muted_topics_event),
@@ -756,6 +971,109 @@ class MessageMoveTopicTest(ZulipTestCase):
         self.assert_has_visibility_policy(
             aaron, change_all_topic_name, stream, UserTopic.VisibilityPolicy.MUTED, expected=False
         )
+
+    def test_visibility_policy_partial_topic_move(self) -> None:
+        # We don't need to test each stream type variation (public, private,
+        # cross-stream, etc.) since those are already covered by the full
+        # topic move tests above. This single test verifies the two key
+        # behaviors unique to partial moves:
+        # 1. Policies on the original topic are NOT removed (remain unchanged).
+        # 2. Only moved message participant policies are updated on the target topic.
+        # This includes senders, mentioned users, reaction senders, and
+        # submessage senders in the moved messages.
+        stream_name = "Stream 123"
+        stream = self.make_stream(stream_name)
+
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        aaron = self.example_user("aaron")
+        othello = self.example_user("othello")
+        desdemona = self.example_user("desdemona")
+        iago = self.example_user("iago")
+
+        for user in [hamlet, cordelia, aaron, othello, desdemona, iago]:
+            self.subscribe(user, stream_name)
+
+        self.send_stream_message(
+            cordelia, stream_name, topic_name="partial move topic", content="First message"
+        )
+        second_message_id = self.send_stream_message(
+            hamlet,
+            stream_name,
+            topic_name="partial move topic",
+            content=f"Second message @**{aaron.full_name}**",
+        )
+
+        check_add_reaction(
+            user_profile=desdemona,
+            message_id=second_message_id,
+            emoji_name="smile",
+            emoji_code=None,
+            reaction_type=None,
+        )
+        do_add_submessage(
+            realm=iago.realm,
+            sender_id=iago.id,
+            message_id=second_message_id,
+            msg_type="whatever",
+            content='"stuff"',
+        )
+
+        # Distribute all four visibility policies among the participants of the moved message:
+        # hamlet (sender) -- UNMUTED, aaron (mentioned) -- MUTED, iago (submessage) -- FOLLOWED,
+        # desdemona (reaction) -- INHERIT (by default).
+        for user, policy in [
+            (hamlet, UserTopic.VisibilityPolicy.UNMUTED),
+            (aaron, UserTopic.VisibilityPolicy.MUTED),
+            (iago, UserTopic.VisibilityPolicy.FOLLOWED),
+        ]:
+            set_topic_visibility_policy(user, [[stream_name, "partial move topic"]], policy)
+
+        # Non-participants cordelia (only on first message) and othello (no stake in moved message)
+        # have MUTED on the original topic.
+        for user in [cordelia, othello]:
+            set_topic_visibility_policy(
+                user, [[stream_name, "partial move topic"]], UserTopic.VisibilityPolicy.MUTED
+            )
+
+        with self.assert_database_query_count(33):
+            check_update_message(
+                user_profile=hamlet,
+                message_id=second_message_id,
+                stream_id=None,
+                topic_name="final topic name",
+                propagate_mode="change_later",
+                send_notification_to_old_thread=False,
+                send_notification_to_new_thread=False,
+                content=None,
+            )
+
+        # Visibility policy for all users on the original topic should remain unchanged.
+        for user, policy in [
+            (hamlet, UserTopic.VisibilityPolicy.UNMUTED),
+            (aaron, UserTopic.VisibilityPolicy.MUTED),
+            (iago, UserTopic.VisibilityPolicy.FOLLOWED),
+            (desdemona, UserTopic.VisibilityPolicy.INHERIT),
+            (cordelia, UserTopic.VisibilityPolicy.MUTED),
+            (othello, UserTopic.VisibilityPolicy.MUTED),
+        ]:
+            self.assert_has_visibility_policy(user, "partial move topic", stream, policy)
+
+        # Moved message participants should have their policy on the target topic.
+        for user, policy in [
+            (hamlet, UserTopic.VisibilityPolicy.UNMUTED),
+            (aaron, UserTopic.VisibilityPolicy.MUTED),
+            (iago, UserTopic.VisibilityPolicy.FOLLOWED),
+            (desdemona, UserTopic.VisibilityPolicy.INHERIT),
+        ]:
+            self.assert_has_visibility_policy(user, "final topic name", stream, policy)
+
+        # cordelia (only on first message) and othello (no stake in moved message)
+        # should NOT have policies on the target topic.
+        for user in [cordelia, othello]:
+            self.assert_has_visibility_policy(
+                user, "final topic name", stream, UserTopic.VisibilityPolicy.INHERIT
+            )
 
     def test_merge_user_topic_states_on_move_messages(self) -> None:
         stream_name = "Stream 123"
@@ -1426,6 +1744,22 @@ class MessageMoveTopicTest(ZulipTestCase):
             "You only have permission to move the 2/5 most recent messages in this topic.",
         )
 
+        # Using an older message (id3) for the request still reports
+        # how many recent messages can be moved, rather than rejecting
+        # outright.
+        result = self.client_patch(
+            f"/json/messages/{id3}",
+            {
+                "topic": "edited",
+                "propagate_mode": "change_all",
+                "send_notification_to_new_thread": "false",
+            },
+        )
+        self.assert_json_error(
+            result,
+            "You only have permission to move the 2/5 most recent messages in this topic.",
+        )
+
     def test_notify_new_topic(self) -> None:
         user_profile = self.example_user("iago")
         self.login("iago")
@@ -1850,35 +2184,6 @@ class MessageMoveTopicTest(ZulipTestCase):
             f"@_**Iago|{admin_user.id}** has marked this topic as resolved.",
         )
 
-        # Now move to a weird state and confirm we get the normal topic moved message.
-        weird_topic_name = "✔ ✔✔" + original_topic_name
-        result = self.client_patch(
-            "/json/messages/" + str(id1),
-            {
-                "topic": weird_topic_name,
-                "propagate_mode": "change_all",
-            },
-        )
-
-        self.assert_json_success(result)
-        for msg_id in [id1, id2]:
-            msg = Message.objects.get(id=msg_id)
-            self.assertEqual(
-                weird_topic_name,
-                msg.topic_name(),
-            )
-
-        messages = get_topic_messages(admin_user, stream, weird_topic_name)
-        self.assert_length(messages, 4)
-        self.assertEqual(
-            messages[2].content,
-            f"@_**Iago|{admin_user.id}** has marked this topic as resolved.",
-        )
-        self.assertEqual(
-            messages[3].content,
-            f"This topic was moved here from #**new>✔ topic 1** by @_**Iago|{admin_user.id}**.",
-        )
-
         unresolved_topic_name = original_topic_name
         result = self.client_patch(
             "/json/messages/" + str(id1),
@@ -1897,14 +2202,136 @@ class MessageMoveTopicTest(ZulipTestCase):
             )
 
         messages = get_topic_messages(admin_user, stream, unresolved_topic_name)
-        self.assert_length(messages, 5)
+        self.assert_length(messages, 4)
         self.assertEqual(
             messages[2].content, f"@_**Iago|{admin_user.id}** has marked this topic as resolved."
         )
         self.assertEqual(
-            messages[4].content,
+            messages[3].content,
             f"@_**Iago|{admin_user.id}** has marked this topic as unresolved.",
         )
+
+    def test_topic_resolve_detection(self) -> None:
+        hamlet = self.example_user("hamlet")
+        iago = self.example_user("iago")
+        self.login("iago")
+        realm = hamlet.realm
+        stream = get_stream("Denmark", realm)
+
+        def check_topic_resolved(
+            original_topic_name: str, new_topic_name: str, topic_resolved: bool
+        ) -> None:
+            msg_id = self.send_stream_message(hamlet, "Denmark", topic_name=original_topic_name)
+            result = self.client_patch(
+                "/json/messages/" + str(msg_id),
+                {
+                    "topic": new_topic_name,
+                    "propagate_mode": "change_all",
+                },
+            )
+            self.assert_json_success(result)
+
+            messages = get_topic_messages(hamlet, stream, new_topic_name)
+            self.assert_length(messages, 2)
+
+            if topic_resolved:
+                self.assertEqual(
+                    messages[1].content,
+                    f"@_**Iago|{iago.id}** has marked this topic as resolved.",
+                )
+            else:
+                self.assertEqual(
+                    messages[1].content,
+                    f"This topic was moved here from #**Denmark>{original_topic_name}** by @_**Iago|{iago.id}**.",
+                )
+
+            # Delete messages in the topic so that we can test
+            # next case with a clear state.
+            do_delete_messages(realm, messages, acting_user=None)
+
+        # Adding only "✔ " at the beginning without any
+        # other change is considered as resolving the topic.
+        check_topic_resolved("test", "✔ test", True)
+        check_topic_resolved("test", "✔test", False)
+        check_topic_resolved("test", "✔ test 1", False)
+        check_topic_resolved("test", "test ✔", False)
+        check_topic_resolved("test", "test ✔ topic", False)
+        check_topic_resolved("test", "✔ ✔ test", False)
+        check_topic_resolved("test", "✔ ✔test", False)
+
+        # If the original topic already begins with "✔ " then
+        # the renaming is not considered as resolving the
+        # topic as the topic was already resolved.
+        check_topic_resolved("✔ test", "✔ ✔ test", False)
+
+    def test_topic_unresolve_detection(self) -> None:
+        hamlet = self.example_user("hamlet")
+        iago = self.example_user("iago")
+        self.login("iago")
+        realm = hamlet.realm
+        stream = get_stream("Denmark", realm)
+
+        def check_topic_unresolved(
+            original_topic_name: str, new_topic_name: str, topic_unresolved: bool
+        ) -> None:
+            msg_id = self.send_stream_message(hamlet, "Denmark", topic_name=original_topic_name)
+            result = self.client_patch(
+                "/json/messages/" + str(msg_id),
+                {
+                    "topic": new_topic_name,
+                    "propagate_mode": "change_all",
+                },
+            )
+            self.assert_json_success(result)
+
+            messages = get_topic_messages(hamlet, stream, new_topic_name)
+            self.assert_length(messages, 2)
+
+            if topic_unresolved:
+                self.assertEqual(
+                    messages[1].content,
+                    f"@_**Iago|{iago.id}** has marked this topic as unresolved.",
+                )
+            else:
+                self.assertEqual(
+                    messages[1].content,
+                    f"This topic was moved here from #**Denmark>{original_topic_name}** by @_**Iago|{iago.id}**.",
+                )
+
+            # Delete messages in the topic so that we can test
+            # next case with a clear state.
+            do_delete_messages(realm, messages, acting_user=None)
+
+        # Stripping the leading "✔ " is considered as
+        # unresolving the topic.
+        check_topic_unresolved("✔ test", "test", True)
+        check_topic_unresolved("✔ test ✔", "test ✔", True)
+        check_topic_unresolved("test ✔ topic", "test topic", False)
+
+        # Stripping the leading "✔ ", and any number of
+        # "✔" and space characters after, is considered
+        # as unresolving the topic.
+        check_topic_unresolved("✔ ✔ test", "test", True)
+        check_topic_unresolved("✔ ✔✔✔test", "test", True)
+        check_topic_unresolved("✔  test", "test", True)
+
+        # The original topic should start with "✔ " to be
+        # considered as unresolving the topic.
+        check_topic_unresolved("✔✔ test", "test", False)
+
+        # The new topic should not start with "✔ " to be
+        # considered as unresolving the topic.
+        check_topic_unresolved("✔ ✔ test", "✔ test", False)
+
+        # All leading "✔" and space characters need to
+        # be stripped to consider this renaming as
+        # unresolving the topic.
+        check_topic_unresolved("✔ ✔ test", "✔test", False)
+
+        # There is a change other than just stripping the
+        # leading "✔" and space characters.
+        check_topic_unresolved("✔ test", "test 1", False)
+        check_topic_unresolved("✔ ✔ test", "test 1", False)
 
     def test_resolved_topic_notice_auto_read_policy(self) -> None:
         # Test that resolved and unresolved-topic notices are marked as
@@ -2142,6 +2569,34 @@ class MessageMoveTopicTest(ZulipTestCase):
 
         self.assertEqual(read_user_ids, {hamlet.id})
         self.assertEqual(unread_user_ids, {cordelia.id, admin_user.id})
+
+    def test_case_only_topic_rename_does_not_is_nontrivial_move(self) -> None:
+        admin_user = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
+        stream = self.make_stream("stream", hamlet.realm)
+
+        self.subscribe(admin_user, stream.name)
+        self.subscribe(hamlet, stream.name)
+
+        old_topic_name = "old topic"
+        new_topic_name = "Old Topic"
+        message_id = self.send_stream_message(hamlet, stream.name, topic_name=old_topic_name)
+
+        result = self.api_patch(
+            hamlet,
+            "/api/v1/messages/" + str(message_id),
+            {
+                "topic": new_topic_name,
+                "send_notification_to_old_thread": "true",
+                "send_notification_to_new_thread": "true",
+            },
+        )
+        self.assert_json_success(result)
+
+        messages_in_topic = get_topic_messages(admin_user, stream, new_topic_name)
+        self.assert_length(messages_in_topic, 1)
+        self.assertEqual(messages_in_topic[0].id, message_id)
+        self.assertEqual(messages_in_topic[0].content, "test content")
 
     @override_settings(RESOLVE_TOPIC_UNDO_GRACE_PERIOD_SECONDS=60)
     def test_mark_topic_as_resolved_within_grace_period(self) -> None:
@@ -2475,9 +2930,7 @@ class MessageMoveTopicTest(ZulipTestCase):
                 "propagate_mode": "change_all",
             },
         )
-        self.assert_json_error(
-            result, "The time limit for editing this message's topic has passed."
-        )
+        self.assert_json_error(result, "The time limit for moving this topic has passed.")
 
         result = self.resolve_topic_containing_message(
             cordelia,
@@ -2690,9 +3143,7 @@ class MessageMoveTopicTest(ZulipTestCase):
                 "propagate_mode": "change_all",
             },
         )
-        self.assert_json_error(
-            result, "The time limit for editing this message's topic has passed."
-        )
+        self.assert_json_error(result, "The time limit for moving this topic has passed.")
 
         result = self.resolve_topic_containing_message(
             hamlet,

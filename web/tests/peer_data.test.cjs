@@ -10,15 +10,18 @@ const assert = require("node:assert/strict");
 
 const {make_user_group} = require("./lib/example_group.cjs");
 const {make_realm} = require("./lib/example_realm.cjs");
-const example_settings = require("./lib/example_settings.cjs");
+const {server_supported_permission_settings} = require("./lib/example_settings.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
+const {make_bot, make_cross_realm_bot, make_user, Role} = require("./lib/example_user.cjs");
 const {mock_channel_get} = require("./lib/mock_channel.cjs");
 const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
-const {run_test} = require("./lib/test.cjs");
+const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
 const {page_params} = require("./lib/zpage_params.cjs");
 
 const channel = mock_esm("../src/channel");
 
+const {GENERIC_BOT_TYPE_INT, INCOMING_WEBHOOK_BOT_TYPE_INT} = zrequire("bot_type_values");
 const peer_data = zrequire("peer_data");
 const people = zrequire("people");
 const {set_current_user, set_realm} = zrequire("state_data");
@@ -30,34 +33,33 @@ const realm = make_realm();
 set_realm(realm);
 
 page_params.realm_users = [];
-const me = {
+const me = make_user({
     email: "me@zulip.com",
     full_name: "Current User",
     user_id: 100,
-};
+});
 // set up user data
-const fred = {
+const fred = make_user({
     email: "fred@zulip.com",
     full_name: "Fred",
     user_id: 101,
-};
-const gail = {
+});
+const gail = make_user({
     email: "gail@zulip.com",
     full_name: "Gail",
     user_id: 102,
-};
-const george = {
+});
+const george = make_user({
     email: "george@zulip.com",
     full_name: "George",
     user_id: 103,
-};
-const bot_botson = {
+});
+const bot_botson = make_bot({
     email: "botson-bot@example.com",
     user_id: 35,
     full_name: "Bot Botson",
-    is_bot: true,
-    role: 300,
-};
+    role: Role.MODERATOR,
+});
 
 const nobody_group = make_user_group({
     name: "Nobody",
@@ -71,7 +73,7 @@ function contains_sub(subs, sub) {
     return subs.some((s) => s.name === sub.name);
 }
 function test(label, f) {
-    run_test(label, ({override}) => {
+    run_test(label, ({override, override_rewire}) => {
         peer_data.clear_for_testing();
         stream_data.clear_subscriptions();
         people.init();
@@ -84,16 +86,21 @@ function test(label, f) {
         override(
             realm,
             "server_supported_permission_settings",
-            example_settings.server_supported_permission_settings,
+            server_supported_permission_settings,
         );
         override(realm, "realm_can_access_all_users_group", nobody_group.id);
 
-        return f({override});
+        return f({override, override_rewire});
     });
 }
 
-test("unsubscribe", () => {
-    const devel = {name: "devel", subscribed: false, stream_id: 1};
+test("unsubscribe", ({override_rewire}) => {
+    const devel = make_stream({
+        name: "devel",
+        subscribed: false,
+        stream_id: 1,
+    });
+
     stream_data.add_sub_for_tests(devel);
 
     // verify clean slate
@@ -106,6 +113,7 @@ test("unsubscribe", () => {
     // ensure our setup is accurate
     assert.ok(stream_data.is_subscribed(devel.stream_id));
 
+    override_rewire(stream_data, "set_max_channel_width_css_variable", noop);
     // DO THE UNSUBSCRIBE HERE
     stream_data.unsubscribe_myself(devel);
     assert.ok(!devel.subscribed);
@@ -119,14 +127,14 @@ test("unsubscribe", () => {
 });
 
 test("subscribers", async () => {
-    const sub = {
+    const sub = make_stream({
         name: "Rome",
         subscribed: true,
         stream_id: 1001,
         can_add_subscribers_group: nobody_group.id,
         can_administer_channel_group: nobody_group.id,
         can_subscribe_group: nobody_group.id,
-    };
+    });
     stream_data.add_sub_for_tests(sub);
 
     people.add_active_user(fred);
@@ -176,11 +184,11 @@ test("subscribers", async () => {
 
     peer_data.set_subscribers(stream_id, []);
 
-    const brutus = {
+    const brutus = make_user({
         email: "brutus@zulip.com",
         full_name: "Brutus",
         user_id: 104,
-    };
+    });
     people.add_active_user(brutus);
     assert.ok(!stream_data.is_user_loaded_and_subscribed(stream_id, brutus.user_id));
 
@@ -276,11 +284,11 @@ test("subscribers", async () => {
 });
 
 test("maybe_fetch_stream_subscribers", async () => {
-    const india = {
+    const india = make_stream({
         stream_id: 102,
         name: "India",
         subscribed: true,
-    };
+    });
     stream_data.add_sub_for_tests(india);
     let channel_get_calls = 0;
     mock_channel_get(channel, (opts) => {
@@ -316,7 +324,7 @@ test("maybe_fetch_stream_subscribers", async () => {
     blueslip.reset();
     assert.deepEqual(subscribers_before_fetch_completes, [7, 9]);
     const subscribers_after_fetch = await pending_promise;
-    assert.deepEqual([...subscribers_after_fetch.keys()], [1, 2, 4, 7, 9]);
+    assert.deepEqual(subscribers_after_fetch.keys().toArray(), [1, 2, 4, 7, 9]);
 
     peer_data.clear_for_testing();
     assert.equal(await peer_data.maybe_fetch_is_user_subscribed(india.stream_id, 2, false), true);
@@ -347,6 +355,24 @@ test("maybe_fetch_stream_subscribers", async () => {
         null,
     );
     blueslip.reset();
+
+    // A bad request is not retried, so we get null even with retry.
+    blueslip.expect("error", "Bad request to fetch channel subscribers.");
+    assert.deepEqual(
+        await peer_data.get_subscribers_with_possible_fetch(india.stream_id, true),
+        null,
+    );
+    blueslip.reset();
+
+    peer_data.clear_for_testing();
+    mock_channel_get(channel, (opts) => {
+        opts.error({readyState: 0});
+    });
+    // null because there was an error, but no blueslip error for readystate 0
+    assert.deepEqual(
+        await peer_data.get_subscribers_with_possible_fetch(india.stream_id, false),
+        null,
+    );
 
     peer_data.clear_for_testing();
     mock_channel_get(channel, (opts) => {
@@ -396,7 +422,7 @@ test("maybe_fetch_stream_subscribers", async () => {
     blueslip.expect("error", "Failure fetching channel subscribers");
     const subscribers = await peer_data.fetch_stream_subscribers_with_retry(india.stream_id);
     assert.equal(num_attempts, 2);
-    assert.deepEqual([...subscribers.keys()], [1, 2, 3, 4]);
+    assert.deepEqual(subscribers.keys().toArray(), [1, 2, 3, 4]);
     blueslip.reset();
 
     peer_data.clear_for_testing();
@@ -423,20 +449,19 @@ test("get_subscriber_count", async () => {
     people.add_active_user(fred);
     people.add_active_user(gail);
     people.add_active_user(george);
-    const welcome_bot = {
+    const welcome_bot = make_cross_realm_bot({
         email: "welcome-bot@example.com",
         user_id: 40,
         full_name: "Welcome Bot",
-        is_bot: true,
-    };
+    });
     people.add_active_user(welcome_bot);
 
-    const india = {
+    const india = make_stream({
         stream_id: 102,
         name: "India",
         subscribed: true,
         subscriber_count: 0,
-    };
+    });
     stream_data.clear_subscriptions();
 
     blueslip.expect("warn", "We called get_subscriber_count for an untracked stream: 102");
@@ -481,10 +506,10 @@ test("get_subscriber_count", async () => {
 
 test("is_subscriber_subset", async () => {
     function make_sub(stream_id, user_ids) {
-        const sub = {
+        const sub = make_stream({
             stream_id,
             name: `stream ${stream_id}`,
-        };
+        });
         stream_data.add_sub_for_tests(sub);
         peer_data.set_subscribers(sub.stream_id, user_ids);
         return sub;
@@ -512,6 +537,46 @@ test("is_subscriber_subset", async () => {
             row[2],
         );
     }
+
+    // Create a mock Incoming Webhook bot
+    const webhook_bot = make_bot({
+        email: "webhook@zulip.com",
+        full_name: "Webhook Bot",
+        user_id: 105,
+        bot_type: INCOMING_WEBHOOK_BOT_TYPE_INT,
+    });
+    people.add_active_user(webhook_bot);
+
+    // Create a mock Generic Bot
+    const generic_bot = make_bot({
+        email: "generic@zulip.com",
+        full_name: "Generic Bot",
+        user_id: 106,
+        bot_type: GENERIC_BOT_TYPE_INT,
+    });
+    people.add_active_user(generic_bot);
+
+    const sub_with_webhook = make_sub(304, [1, 2, webhook_bot.user_id]);
+    const sub_with_generic = make_sub(305, [1, 2, generic_bot.user_id]);
+    const sub_with_unknown_user = make_sub(306, [1, 2, 9999]);
+
+    // Webhooks should be ignored.
+    assert.equal(
+        await peer_data.is_subscriber_subset(sub_with_webhook.stream_id, sub_a.stream_id),
+        true,
+    );
+
+    // Generic bots can read, so they are NOT ignored.
+    assert.equal(
+        await peer_data.is_subscriber_subset(sub_with_generic.stream_id, sub_a.stream_id),
+        false,
+    );
+
+    // Unknown users are treated conservatively (not ignored).
+    assert.equal(
+        await peer_data.is_subscriber_subset(sub_with_unknown_user.stream_id, sub_a.stream_id),
+        false,
+    );
 
     // Two untracked streams should never be passed into us.
     blueslip.expect(
@@ -544,7 +609,11 @@ test("is_subscriber_subset", async () => {
 });
 
 test("get_unique_subscriber_count_for_streams", async () => {
-    const sub = {name: "Rome", subscribed: true, stream_id: 1001};
+    const sub = make_stream({
+        name: "Rome",
+        subscribed: true,
+        stream_id: 1001,
+    });
     stream_data.add_sub_for_tests(sub);
 
     people.add_active_user(fred);
@@ -558,18 +627,32 @@ test("get_unique_subscriber_count_for_streams", async () => {
     const count = await peer_data.get_unique_subscriber_count_for_streams([stream_id]);
 
     assert.equal(count, 2);
+
+    // If we only have partial data and the fetch fails, count what we have.
+    peer_data.clear_for_testing();
+    peer_data.set_subscribers(stream_id, [me.user_id, fred.user_id, bot_botson.user_id], false);
+    mock_channel_get(channel, (opts) => {
+        opts.error({status: 400, responseJSON: ""});
+    });
+    blueslip.expect("error", "Bad request to fetch channel subscribers.");
+    assert.equal(await peer_data.get_unique_subscriber_count_for_streams([stream_id]), 2);
+    blueslip.reset();
 });
 
 test("fetch_subscriptions_for_user", async () => {
     people.add_active_user(fred);
 
-    const india = {
+    const india = make_stream({
         stream_id: 102,
         name: "India",
         subscribed: true,
-    };
+    });
     stream_data.add_sub_for_tests(india);
-    const rome = {name: "Rome", subscribed: true, stream_id: 1001};
+    const rome = make_stream({
+        name: "Rome",
+        subscribed: true,
+        stream_id: 1001,
+    });
     stream_data.add_sub_for_tests(rome);
 
     let channel_get_calls = 0;
@@ -597,6 +680,19 @@ test("fetch_subscriptions_for_user", async () => {
     blueslip.expect("error", "Failure fetching user's subscribed channels. Giving up.");
     await peer_data.fetch_subscriptions_for_user(fred.user_id);
     blueslip.reset();
+
+    // After giving up, a later call should start a new fetch instead
+    // of returning the finished request's promise.
+    channel_get_calls = 0;
+    mock_channel_get(channel, (opts) => {
+        channel_get_calls += 1;
+        opts.success({
+            subscribed_channel_ids: [india.stream_id],
+        });
+    });
+    await peer_data.fetch_subscriptions_for_user(fred.user_id);
+    assert.equal(channel_get_calls, 1);
+    assert.ok(stream_data.is_user_loaded_and_subscribed(india.stream_id, fred.user_id));
 
     peer_data.clear_for_testing();
     mock_channel_get(channel, (opts) => {
@@ -642,4 +738,104 @@ test("fetch_subscriptions_for_user", async () => {
     channel_get_calls = 0;
     await peer_data.fetch_subscriptions_for_user(fred.user_id);
     assert.equal(channel_get_calls, 0);
+});
+
+test("fetch_subscriptions_for_user stale response", async () => {
+    people.add_active_user(fred);
+
+    const social = make_stream({
+        stream_id: 2,
+        name: "social",
+        subscribed: true,
+    });
+    stream_data.add_sub_for_tests(social);
+    const rome = make_stream({
+        name: "Rome",
+        subscribed: true,
+        stream_id: 1001,
+    });
+    stream_data.add_sub_for_tests(rome);
+    const devel = make_stream({
+        name: "devel",
+        subscribed: true,
+        stream_id: 1,
+    });
+    stream_data.add_sub_for_tests(devel);
+    const paris = make_stream({
+        name: "Paris",
+        subscribed: true,
+        stream_id: 1002,
+    });
+    stream_data.add_sub_for_tests(paris);
+
+    peer_data.set_subscribers(social.stream_id, [fred.user_id], false);
+    peer_data.set_subscribers(rome.stream_id, [fred.user_id], false);
+    peer_data.set_subscribers(devel.stream_id, [fred.user_id], false);
+    peer_data.set_subscribers(paris.stream_id, [fred.user_id], false);
+
+    // The server computed this response before the removals below.
+    mock_channel_get(channel, (opts) => {
+        opts.success({
+            subscribed_channel_ids: [
+                social.stream_id,
+                rome.stream_id,
+                devel.stream_id,
+                paris.stream_id,
+            ],
+        });
+    });
+
+    // The mocked response is only delivered once we await the promise,
+    // so the removals below arrive while the request is in flight.
+    const promise = peer_data.fetch_subscriptions_for_user(fred.user_id);
+    peer_data.bulk_remove_subscribers({
+        stream_ids: [social.stream_id],
+        user_ids: [fred.user_id],
+    });
+    peer_data.remove_subscriber(devel.stream_id, fred.user_id);
+    // While the request is in flight, we get the exact subscriber set
+    // for Paris, which no longer includes fred.
+    peer_data.set_subscribers(paris.stream_id, [me.user_id]);
+    assert.ok(!peer_data.subscriber_data_loaded_for_user(fred.user_id));
+    await promise;
+
+    // The stale response must not re-add fred to social, devel, or Paris.
+    assert.ok(!stream_data.is_user_loaded_and_subscribed(social.stream_id, fred.user_id));
+    assert.ok(!stream_data.is_user_loaded_and_subscribed(devel.stream_id, fred.user_id));
+    assert.ok(!stream_data.is_user_loaded_and_subscribed(paris.stream_id, fred.user_id));
+    assert.ok(stream_data.is_user_loaded_and_subscribed(rome.stream_id, fred.user_id));
+    assert.ok(peer_data.subscriber_data_loaded_for_user(fred.user_id));
+});
+
+test("fetch_subscriptions_for_user removal before retry", async () => {
+    people.add_active_user(fred);
+
+    const social = make_stream({
+        stream_id: 2,
+        name: "social",
+        subscribed: true,
+    });
+    stream_data.add_sub_for_tests(social);
+    peer_data.set_subscribers(social.stream_id, [fred.user_id], false);
+
+    let num_attempts = 0;
+    mock_channel_get(channel, (opts) => {
+        num_attempts += 1;
+        if (num_attempts === 1) {
+            // fred leaves social while the first attempt is in flight,
+            // and then that attempt fails.
+            peer_data.remove_subscriber(social.stream_id, fred.user_id);
+            opts.error({status: 500});
+            return;
+        }
+        // fred rejoined social before the retry, so the retry's
+        // response lists social and must be applied.
+        opts.success({
+            subscribed_channel_ids: [social.stream_id],
+        });
+    });
+    blueslip.expect("warn", "Failure fetching user's subscribed channels. Retrying.");
+    await peer_data.fetch_subscriptions_for_user(fred.user_id);
+    assert.equal(num_attempts, 2);
+    assert.ok(stream_data.is_user_loaded_and_subscribed(social.stream_id, fred.user_id));
 });

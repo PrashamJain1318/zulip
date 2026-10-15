@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 
 const _ = require("lodash");
 
+const {make_stream} = require("./lib/example_stream.cjs");
+const {make_user} = require("./lib/example_user.cjs");
 const {set_global, with_overrides, zrequire} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
 
@@ -12,6 +14,7 @@ const {FoldDict} = zrequire("fold_dict");
 const message_store = zrequire("message_store");
 const user_topics = zrequire("user_topics");
 const people = zrequire("people");
+const recent_view_util = zrequire("recent_view_util");
 const stream_data = zrequire("stream_data");
 const sub_store = zrequire("sub_store");
 const unread = zrequire("unread");
@@ -20,27 +23,27 @@ const {initialize_user_settings} = zrequire("user_settings");
 const user_settings = {};
 initialize_user_settings({user_settings});
 
-const me = {
+const me = make_user({
     email: "me@example.com",
     user_id: 30,
     full_name: "Me Myself",
-};
+});
 
-const anybody = {
+const anybody = make_user({
     email: "anybody@example.com",
     user_id: 999,
     full_name: "Any Body",
-};
+});
 people.add_active_user(me);
 people.add_active_user(anybody);
 people.initialize_current_user(me.user_id);
 
-const social = {
+const social = make_stream({
     stream_id: 200,
     name: "social",
     subscribed: true,
     is_muted: false,
-};
+});
 stream_data.add_sub_for_tests(social);
 
 function assert_zero_counts(counts) {
@@ -94,12 +97,13 @@ test("changing_topics", () => {
     let count = unread.num_unread_for_topic(social.stream_id, "lunch");
     assert.equal(count, 0);
 
-    const stream_id = 100;
+    const stream_id = social.stream_id;
     const wrong_stream_id = 110;
 
     const message = {
         id: 15,
         type: "stream",
+        content: "",
         stream_id,
         topic: "luNch",
         unread: true,
@@ -108,6 +112,7 @@ test("changing_topics", () => {
     const other_message = {
         id: 16,
         type: "stream",
+        content: "",
         stream_id,
         topic: "lunCH",
         unread: true,
@@ -146,6 +151,8 @@ test("changing_topics", () => {
     assert.ok(unread.topic_has_any_unread(stream_id, "lunch"));
     assert.ok(!unread.topic_has_any_unread(wrong_stream_id, "lunch"));
     assert.ok(!unread.topic_has_any_unread(stream_id, "NOT lunch"));
+    assert.deepEqual(unread.get_topics_with_unreads(stream_id), ["luNch"]);
+    assert.deepEqual(unread.get_topics_with_unreads(wrong_stream_id), []);
 
     count = unread.num_unread_for_topic(stream_id, "NOT lunch");
     assert.equal(count, 0);
@@ -180,6 +187,13 @@ test("changing_topics", () => {
     assert.equal(count, 1);
     assert.ok(unread.topic_has_any_unread(stream_id, "snack"));
     assert.ok(!unread.topic_has_any_unread(wrong_stream_id, "snack"));
+    // The topic that no longer has unread messages is left out.
+    assert.deepEqual(unread.get_topics_with_unreads(stream_id), ["dinner", "snack"]);
+
+    unread.update_unread_topic_name_case(stream_id, "snack", "SnaCK");
+    const topic_counts = unread.get_unread_topics().topic_counts.get(stream_id);
+    assert.ok(topic_counts.has("SnaCK"));
+    assert.ok(!topic_counts.has("snack"));
 
     // Test defensive code.  Trying to update a message we don't know
     // about should be a no-op.
@@ -192,6 +206,7 @@ test("changing_topics", () => {
     const sticky_message = {
         id: 17,
         type: "stream",
+        content: "",
         stream_id,
         topic: "sticky",
         unread: true,
@@ -296,6 +311,7 @@ test("num_unread_for_topic", () => {
 
     const message = {
         type: "stream",
+        content: "",
         stream_id,
         topic: "LuncH",
         unread: true,
@@ -448,6 +464,7 @@ test("phantom_messages", () => {
     const message = {
         id: 999,
         type: "stream",
+        content: "",
         stream_id: 555,
         topic: "phantom",
     };
@@ -485,19 +502,98 @@ test("private_messages", () => {
     test_notifiable_count(counts.home_unread_messages, 0);
 });
 
+test("get_unread_message_conversation_key", () => {
+    const stream_message = {
+        id: 21,
+        type: "stream",
+        stream_id: social.stream_id,
+        topic: "Lunch",
+        unread: true,
+    };
+    const dm_message = {
+        id: 22,
+        type: "private",
+        display_recipient: [{id: anybody.user_id}, {id: me.user_id}],
+        unread: true,
+    };
+    unread.process_loaded_messages([stream_message, dm_message]);
+
+    // The keys match recent view's conversation keys, and come from the
+    // unread data rather than message_store, so they are available for
+    // messages this client never fetched.
+    assert.equal(
+        unread.get_unread_message_conversation_key(stream_message.id),
+        recent_view_util.get_topic_key(stream_message.stream_id, stream_message.topic),
+    );
+    assert.equal(
+        unread.get_unread_message_conversation_key(dm_message.id),
+        anybody.user_id.toString(),
+    );
+
+    // The server's unread data names a group DM by all its participants,
+    // and recent view's key leaves out the current user.
+    const other_user_id = 101;
+    unread.initialize({
+        unread_msgs: {
+            pms: [],
+            huddles: [
+                {
+                    user_ids_string: `${me.user_id},${other_user_id},${anybody.user_id}`,
+                    unread_message_ids: [24],
+                },
+            ],
+            streams: [],
+            mentions: [],
+            old_unreads_missing: false,
+        },
+    });
+    assert.equal(
+        unread.get_unread_message_conversation_key(24),
+        `${other_user_id},${anybody.user_id}`,
+    );
+    assert.equal(unread.get_unread_message_conversation_key(23), undefined);
+
+    unread.mark_as_read(stream_message.id);
+    assert.equal(unread.get_unread_message_conversation_key(stream_message.id), undefined);
+});
+
+test("process_loaded_messages returns newly tracked unreads", () => {
+    const unread_message = {
+        id: 31,
+        type: "stream",
+        stream_id: social.stream_id,
+        topic: "lunch",
+        unread: true,
+    };
+    const read_message = {
+        id: 32,
+        type: "stream",
+        stream_id: social.stream_id,
+        topic: "lunch",
+        unread: false,
+    };
+    assert.deepEqual(unread.process_loaded_messages([unread_message, read_message]), [
+        unread_message,
+    ]);
+    assert.equal(unread.num_unread_for_topic(social.stream_id, "lunch"), 1);
+
+    // Messages already tracked as unread are not reported again.
+    assert.deepEqual(unread.process_loaded_messages([unread_message, read_message]), []);
+});
+
 test("private_messages", () => {
-    const alice = {
+    const alice = make_user({
         email: "alice@example.com",
         user_id: 101,
         full_name: "Alice",
-    };
+    });
     people.add_active_user(alice);
 
-    const bob = {
+    const bob = make_user({
         email: "bob@example.com",
         user_id: 102,
         full_name: "Bob",
-    };
+    });
     people.add_active_user(bob);
 
     assert.equal(unread.num_unread_for_user_ids_string(alice.user_id.toString()), 0);

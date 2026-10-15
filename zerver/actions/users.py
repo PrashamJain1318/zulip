@@ -2,7 +2,6 @@ from collections import defaultdict
 from email.headerregistry import Address
 from typing import Any
 
-from django.conf import settings
 from django.contrib.auth.tokens import PasswordResetTokenGenerator, default_token_generator
 from django.db import transaction
 from django.db.models import Q
@@ -13,26 +12,24 @@ from django.utils.http import urlsafe_base64_encode
 from django.utils.timezone import now as timezone_now
 from django.utils.translation import get_language
 
-from zerver.actions.message_delete import do_delete_messages_by_sender
+from zerver.actions.message_delete import (
+    DeactivateUserActions,
+    delete_deactivated_user_messages,
+    do_delete_messages_by_sender,
+)
 from zerver.actions.message_send import send_user_profile_update_notification
 from zerver.actions.streams import bulk_remove_subscriptions, send_peer_remove_events
 from zerver.actions.user_groups import (
     do_send_user_group_members_update_event,
     update_users_in_full_members_system_group,
 )
-from zerver.lib.avatar import get_avatar_field
+from zerver.actions.user_settings import do_change_avatar_fields, do_change_full_name
 from zerver.lib.bot_config import ConfigError, get_bot_config, get_bot_configs, set_bot_config
 from zerver.lib.cache import bot_dict_fields, flush_user_profile
 from zerver.lib.create_user import create_user_profile
 from zerver.lib.event_types import BotServicesOutgoing
 from zerver.lib.invites import revoke_invites_generated_by_user
-from zerver.lib.remote_server import maybe_enqueue_audit_log_upload
-from zerver.lib.send_email import (
-    FromAddress,
-    clear_scheduled_emails,
-    maybe_remove_from_suppression_list,
-    send_email,
-)
+from zerver.lib.send_email import FromAddress, clear_scheduled_emails, send_email
 from zerver.lib.sessions import delete_user_sessions
 from zerver.lib.soft_deactivation import queue_soft_reactivation
 from zerver.lib.stream_subscription import (
@@ -48,7 +45,7 @@ from zerver.lib.streams import (
 )
 from zerver.lib.subscription_info import bulk_get_subscriber_peer_info
 from zerver.lib.types import UserGroupMembersData, UserProfileChangeDict
-from zerver.lib.user_counts import realm_user_count_by_role
+from zerver.lib.user_counts import realm_user_count_by_role, update_billing_records_if_needed
 from zerver.lib.user_groups import (
     convert_to_user_group_members_dict,
     get_system_user_group_for_user,
@@ -56,9 +53,9 @@ from zerver.lib.user_groups import (
 from zerver.lib.users import (
     get_active_bots_owned_by_user,
     get_user_ids_who_can_access_user,
-    get_users_involved_in_dms_with_target_users,
     user_access_restricted_in_realm,
 )
+from zerver.lib.workplace_users import check_any_group_used_for_workplace_users_group
 from zerver.models import (
     Draft,
     GroupGroupMembership,
@@ -144,6 +141,7 @@ def do_delete_user_core(
             full_name=f"Deleted User {user_id}",
             bot_owner=user_profile.bot_owner,
             is_mirror_dummy=True,
+            is_deleted=True,
             tos_version=user_profile.tos_version,
             # These required arguments should get default values configured on the UserProfile model,
             # to overwrite the values of user_profile.
@@ -384,9 +382,8 @@ def send_events_for_user_deactivation(user_profile: UserProfile) -> None:
         return
 
     non_guest_user_ids = active_non_guest_user_ids(realm.id)
-    users_involved_in_dms_dict = get_users_involved_in_dms_with_target_users([user_profile], realm)
 
-    # This code path is parallel to
+    # This code path is similar to
     # get_subscribers_of_target_user_subscriptions, but can't reuse it
     # because we need to process stream and direct_message_group
     # subscriptions separately.
@@ -411,9 +408,7 @@ def send_events_for_user_deactivation(user_profile: UserProfile) -> None:
             peer_stream_subscribers.add(user_id)
 
     users_with_access_to_deactivated_user = (
-        set(non_guest_user_ids)
-        | users_involved_in_dms_dict[user_profile.id]
-        | peer_direct_message_group_subscribers
+        set(non_guest_user_ids) | peer_direct_message_group_subscribers
     )
     if users_with_access_to_deactivated_user:
         send_event_on_commit(
@@ -473,26 +468,56 @@ def send_events_for_user_deactivation(user_profile: UserProfile) -> None:
 
 
 def do_deactivate_user(
-    user_profile: UserProfile, _cascade: bool = True, *, acting_user: UserProfile | None
+    user_profile: UserProfile,
+    _cascade: bool = True,
+    *,
+    acting_user: UserProfile | None,
+    deactivate_user_actions: DeactivateUserActions | None = None,
 ) -> None:
     if not user_profile.is_active:
         return
-
-    if settings.BILLING_ENABLED:
-        from corporate.lib.stripe import RealmBillingSession
 
     if _cascade:
         # We need to deactivate bots before the target user, to ensure
         # that a failure partway through this function cannot result
         # in only the user being deactivated.
         bot_profiles = get_active_bots_owned_by_user(user_profile)
+        # Same policies should be applied to the bots as to the user who created
+        # them. If the user is marked as spammer or their content is being
+        # deleted, the same should happen with the bots created by that user.
         for profile in bot_profiles:
-            do_deactivate_user(profile, _cascade=False, acting_user=acting_user)
-
+            do_deactivate_user(
+                profile,
+                _cascade=False,
+                acting_user=acting_user,
+                deactivate_user_actions=deactivate_user_actions,
+            )
     with transaction.atomic(savepoint=False):
         change_user_is_active(user_profile, False)
 
         clear_scheduled_emails([user_profile.id])
+        if deactivate_user_actions is not None:
+            if deactivate_user_actions.delete_profile:
+                # The full name of spam user is changed to Deleted user.
+                if user_profile.full_name != "Deleted user" and not user_profile.is_bot:
+                    do_change_full_name(
+                        user_profile, "Deleted user", acting_user=acting_user, notify=False
+                    )
+                elif user_profile.full_name != "Deactivated bot" and user_profile.is_bot:
+                    do_change_full_name(
+                        user_profile, "Deactivated bot", acting_user=acting_user, notify=False
+                    )
+
+                # TODO: Change avatar image to that of an inaccessible user.
+                if user_profile.avatar_source != UserProfile.AVATAR_FROM_GRAVATAR:
+                    do_change_avatar_fields(
+                        user_profile, UserProfile.AVATAR_FROM_GRAVATAR, acting_user=acting_user
+                    )
+
+            delete_deactivated_user_messages(
+                user_profile.realm, user_profile, deactivate_user_actions, acting_user
+            )
+
         revoke_invites_generated_by_user(user_profile)
 
         event_time = timezone_now()
@@ -506,24 +531,13 @@ def do_deactivate_user(
                 RealmAuditLog.ROLE_COUNT: realm_user_count_by_role(user_profile.realm),
             },
         )
-        maybe_enqueue_audit_log_upload(user_profile.realm)
-        if settings.BILLING_ENABLED:
-            billing_session = RealmBillingSession(user=user_profile, realm=user_profile.realm)
-            billing_session.update_license_ledger_if_needed(event_time)
+        update_billing_records_if_needed(
+            user_profile.realm, user=user_profile, event_time=event_time
+        )
 
         transaction.on_commit(lambda: delete_user_sessions(user_profile))
 
         send_events_for_user_deactivation(user_profile)
-
-        if user_profile.is_bot:
-            event_deactivate_bot = dict(
-                type="realm_bot",
-                op="update",
-                bot=dict(user_id=user_profile.id, is_active=False),
-            )
-            send_event_on_commit(
-                user_profile.realm, event_deactivate_bot, bot_owner_user_ids(user_profile)
-            )
 
 
 def send_stream_events_for_role_update(
@@ -588,14 +602,8 @@ def do_change_user_role(
 ) -> None:
     # We want to both (a) take a lock on the UserProfile row, and (b)
     # modify the passed-in UserProfile object, so that callers see the
-    # changes in the object they hold.  Unfortunately,
-    # `select_for_update` cannot be combined with `refresh_from_db`
-    # (https://code.djangoproject.com/ticket/28344).  Call
-    # `select_for_update` and throw away the result, so that we know
-    # we have the lock on the row, then re-fill the `user_profile`
-    # object with the values now that the lock exists.
-    UserProfile.objects.select_for_update().get(id=user_profile.id)
-    user_profile.refresh_from_db()
+    # changes in the object they hold.
+    user_profile.refresh_from_db(from_queryset=UserProfile.objects.select_for_update(no_key=True))
 
     old_value = user_profile.role
     if old_value == value:
@@ -612,7 +620,11 @@ def do_change_user_role(
 
     user_profile.role = value
     user_profile.save(update_fields=["role"])
-    RealmAuditLog.objects.create(
+    # ROLE_COUNT is filled in at the end of this function, once the system
+    # group memberships below have been updated; see the comment there. The
+    # entry itself is created here so that it precedes the audit log entries
+    # for those membership updates.
+    role_changed_audit_log = RealmAuditLog.objects.create(
         realm=user_profile.realm,
         modified_user=user_profile,
         acting_user=acting_user,
@@ -621,15 +633,8 @@ def do_change_user_role(
         extra_data={
             RealmAuditLog.OLD_VALUE: old_value,
             RealmAuditLog.NEW_VALUE: value,
-            RealmAuditLog.ROLE_COUNT: realm_user_count_by_role(user_profile.realm),
         },
     )
-    maybe_enqueue_audit_log_upload(user_profile.realm)
-    if settings.BILLING_ENABLED and UserProfile.ROLE_GUEST in [old_value, value]:
-        from corporate.lib.stripe import RealmBillingSession
-
-        billing_session = RealmBillingSession(user=user_profile, realm=user_profile.realm)
-        billing_session.update_license_ledger_if_needed(timezone_now())
 
     event = dict(
         type="realm_user", op="update", person=dict(user_id=user_profile.id, role=user_profile.role)
@@ -681,9 +686,40 @@ def do_change_user_role(
     do_send_user_group_members_update_event("add_members", system_group, [user_profile.id])
 
     if UserProfile.ROLE_MEMBER in [old_value, value]:
+        # The USER_ROLE_CHANGED entry above records the workplace users
+        # count once all the membership updates for this role change are
+        # done, so a WORKPLACE_USERS_COUNT_CHANGED entry recording the
+        # same count would be redundant.
         update_users_in_full_members_system_group(
-            user_profile.realm, [user_profile.id], acting_user=acting_user
+            user_profile.realm,
+            [user_profile.id],
+            acting_user=acting_user,
+            skip_workplace_audit_log_and_ledger_entry=True,
         )
+
+    # realm_user_count_by_role counts the workplace users from
+    # memberships of realm.workplace_users_group, for cases where
+    # we cannot compute it directly from role counts. So the count
+    # is only correct once every membership update above has run.
+    role_changed_audit_log.extra_data[RealmAuditLog.ROLE_COUNT] = realm_user_count_by_role(
+        user_profile.realm
+    )
+    role_changed_audit_log.save(update_fields=["extra_data"])
+
+    # A guest becoming a non-guest or vice versa changes the number of licenses
+    # regardless of any group, since guests are counted at a discount. Any other
+    # role change only matters if it moved the user in or out of
+    # realm.workplace_users_group, which the swap between the role based system
+    # groups above does when either of them is that group or inside it.
+    update_billing_records_if_needed(
+        user_profile.realm,
+        user=user_profile,
+        event_time=timezone_now(),
+        user_count_may_have_changed=UserProfile.ROLE_GUEST in [old_value, value]
+        or check_any_group_used_for_workplace_users_group(
+            user_profile.realm, [old_system_group, system_group]
+        ),
+    )
 
     send_stream_events_for_role_update(user_profile, previously_accessible_streams)
 
@@ -904,25 +940,10 @@ def get_owned_bot_dicts(
     services_by_ids = get_service_dicts_for_bots(result, user_profile.realm)
     return [
         {
-            "email": botdict["email"],
             "user_id": botdict["id"],
-            "full_name": botdict["full_name"],
-            "bot_type": botdict["bot_type"],
-            "is_active": botdict["is_active"],
-            "api_key": botdict["api_key"],
             "default_sending_stream": botdict["default_sending_stream__name"],
             "default_events_register_stream": botdict["default_events_register_stream__name"],
             "default_all_public_streams": botdict["default_all_public_streams"],
-            "owner_id": botdict["bot_owner_id"],
-            "avatar_url": get_avatar_field(
-                user_id=botdict["id"],
-                realm_id=botdict["realm_id"],
-                email=botdict["email"],
-                avatar_source=botdict["avatar_source"],
-                avatar_version=botdict["avatar_version"],
-                medium=False,
-                client_gravatar=False,
-            ),
             "services": services_by_ids[botdict["id"]],
         }
         for botdict in result
@@ -957,7 +978,6 @@ def do_send_password_reset_email(
 
     if user_profile is not None:
         queue_soft_reactivation(user_profile.id)
-        maybe_remove_from_suppression_list(user_profile.delivery_email)
         context["active_account_in_realm"] = True
         context["reset_url"] = generate_password_reset_url(user_profile, token_generator)
         send_email(
@@ -968,6 +988,7 @@ def do_send_password_reset_email(
             context=context,
             realm=realm,
             request=request,
+            remove_suppressed_destination=True,
         )
     else:
         context["active_account_in_realm"] = False

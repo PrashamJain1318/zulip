@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -6,6 +6,7 @@ import render_subscription_invites_warning_modal from "../templates/confirm_dial
 import render_channel_name_conflict_error from "../templates/stream_settings/channel_name_conflict_error.hbs";
 
 import * as channel from "./channel.ts";
+import * as channel_folders_ui from "./channel_folders_ui.ts";
 import * as confirm_dialog from "./confirm_dialog.ts";
 import type {DropdownWidget} from "./dropdown_widget.ts";
 import {$t, $t_html} from "./i18n.ts";
@@ -19,6 +20,7 @@ import {current_user, realm} from "./state_data.ts";
 import * as stream_create_subscribers from "./stream_create_subscribers.ts";
 import * as stream_data from "./stream_data.ts";
 import * as stream_edit from "./stream_edit.ts";
+import * as stream_pill from "./stream_pill.ts";
 import * as stream_settings_components from "./stream_settings_components.ts";
 import * as stream_settings_data from "./stream_settings_data.ts";
 import {stream_permission_group_settings_schema} from "./stream_types.ts";
@@ -76,6 +78,13 @@ class StreamSubscriptionError {
     report_no_subs_to_stream(): void {
         $("#stream_subscription_error").text(
             $t({defaultMessage: "You cannot create a channel with no subscribers."}),
+        );
+        $("#stream_subscription_error").show();
+    }
+
+    report_subscriber_fetch_failed(failed_stream_id: number): void {
+        $("#stream_subscription_error").text(
+            stream_pill.get_subscriber_fetch_failure_message(failed_stream_id),
         );
         $("#stream_subscription_error").show();
     }
@@ -295,6 +304,7 @@ function create_stream(): void {
             $t_html({defaultMessage: "The channel description cannot contain newline characters."}),
             $(".stream_create_info"),
         );
+        set_create_form_disabled(false);
         return;
     }
     const subscriptions = JSON.stringify([{name: stream_name, description}]);
@@ -387,6 +397,14 @@ function create_stream(): void {
         ...group_setting_values,
     };
 
+    // Only present for admins, so guard against it being absent.
+    const $default_push_notifications = $<HTMLInputElement>("#id_new_default_push_notifications");
+    if ($default_push_notifications.length > 0) {
+        data["default_push_notifications"] = JSON.stringify(
+            $default_push_notifications.prop("checked"),
+        );
+    }
+
     assert(folder_widget !== undefined);
     const folder_id = folder_widget.value();
     if (folder_id !== settings_config.no_folder_selected) {
@@ -403,6 +421,9 @@ function create_stream(): void {
             $("#create_stream_name").val("");
             $("#create_stream_description").val("");
             loading.destroy_indicator($("#stream_creating_indicator"));
+            // The form is cleared, so this cannot create the channel twice.
+            // Needed in case the event that closes the form never arrives.
+            set_create_form_disabled(false);
             // The rest of the work is done via the subscribe event we will get
         },
         error(xhr): void {
@@ -436,6 +457,7 @@ function create_stream(): void {
                 );
             }
             loading.destroy_indicator($("#stream_creating_indicator"));
+            set_create_form_disabled(false);
         },
     });
 }
@@ -465,11 +487,28 @@ function clear_error_display(): void {
     stream_subscription_error.clear_errors();
 }
 
+function set_create_form_disabled(disabled: boolean): void {
+    $(
+        "#stream-creation .finalize_create_stream, #stream-creation #stream_creation_go_to_configure_channel_settings",
+    ).prop("disabled", disabled);
+    // Pills added or removed after the subscribers are read would
+    // show in the preview but not end up in the channel.
+    const $add_subscribers_container = $("#people_to_add .add_subscribers_container");
+    $add_subscribers_container.toggleClass("add_subscribers_disabled", disabled);
+    $add_subscribers_container.find(".input").prop("contenteditable", !disabled);
+}
+
 export function show_new_stream_modal(): void {
     $("#stream-creation").removeClass("hide");
     $(".right .settings").hide();
 
     stream_create_subscribers.build_widgets();
+
+    // A previous create click may have left these buttons disabled,
+    // either because the channel was created or because the form was
+    // closed while waiting for subscriber data. The sticky footer is
+    // not re-rendered when the form reopens, so reset the buttons here.
+    set_create_form_disabled(false);
 
     // Make the options default to the same each time
 
@@ -505,7 +544,7 @@ export function show_new_stream_modal(): void {
     }
 
     const $add_subscribers_container = $(
-        "#stream_creation_form .subscriber_list_settings",
+        "#stream_creation_form .add_subscribers_container",
     ).expectOne();
 
     stream_ui_updates.enable_or_disable_add_subscribers_elements(
@@ -599,12 +638,6 @@ export function set_up_handlers(): void {
             return;
         }
 
-        const principals = stream_create_subscribers.get_principals();
-        if (principals.length === 0) {
-            stream_subscription_error.report_no_subs_to_stream();
-            return;
-        }
-
         assert(stream_create_subscribers.pill_widget !== undefined);
         assert(stream_create_subscribers.pill_widget !== null);
         if (stream_create_subscribers.pill_widget.is_pending()) {
@@ -617,29 +650,85 @@ export function set_up_handlers(): void {
             return;
         }
 
-        if (principals.length >= 50) {
-            const html_body = render_subscription_invites_warning_modal({
-                channel_name: stream_name,
-                count: principals.length,
-            });
+        void (async () => {
+            // Disable the create button until the channel is created,
+            // so that clicking it again (or pressing Enter) while we
+            // wait for subscriber data or for the server cannot create
+            // the channel twice, the back button so that the settings
+            // we validated cannot be changed underneath us, and the
+            // pill input so that the preview matches what is created.
+            // They are re-enabled if creating fails, or when the form
+            // is reopened.
+            set_create_form_disabled(true);
+            const result = await stream_create_subscribers.add_subscribers_from_pills();
+            // The creation form was closed while we were fetching
+            // subscriber data, so don't create the channel. Leave the
+            // buttons alone, since a newly opened form may have
+            // disabled them for its own fetch.
+            if (result.status === "form_closed") {
+                return;
+            }
+            if (result.status === "failed") {
+                set_create_form_disabled(false);
+                stream_subscription_error.report_subscriber_fetch_failed(result.failed_stream_id);
+                return;
+            }
 
-            confirm_dialog.launch({
-                html_heading: $t_html({defaultMessage: "Large number of subscribers"}),
-                html_body,
-                on_click() {
-                    create_stream();
-                },
-            });
-        } else {
-            create_stream();
-        }
+            const principals = stream_create_subscribers.get_principals();
+            if (principals.length === 0) {
+                set_create_form_disabled(false);
+                stream_subscription_error.report_no_subs_to_stream();
+                return;
+            }
+
+            if (principals.length >= 50) {
+                const modal_content_html = render_subscription_invites_warning_modal({
+                    channel_name: stream_name,
+                    count: principals.length,
+                });
+
+                let confirmed = false;
+                confirm_dialog.launch({
+                    modal_title_html: $t_html({defaultMessage: "Large number of subscribers"}),
+                    modal_content_html,
+                    is_compact: true,
+                    on_click() {
+                        confirmed = true;
+                        create_stream();
+                    },
+                    on_hidden() {
+                        if (!confirmed) {
+                            set_create_form_disabled(false);
+                        }
+                    },
+                });
+            } else {
+                create_stream();
+            }
+        })();
     });
 
+    function handle_channel_name_length_limit(): void {
+        const $channel_input = $<HTMLInputElement>("input#create_stream_name");
+        let channel_name = $channel_input.val()!.trim();
+        if (channel_name.length > realm.max_stream_name_length) {
+            channel_name = channel_name.slice(0, realm.max_stream_name_length);
+            $channel_input.val(channel_name);
+            $channel_input.addClass("input-validation-shake");
+        }
+        stream_name_error.pre_validate(channel_name);
+    }
+    $("input#create_stream_name").on("animationend", function () {
+        $(this).removeClass("input-validation-shake");
+    });
     $container.on("input", "#create_stream_name", () => {
-        const stream_name = $<HTMLInputElement>("input#create_stream_name").val()!.trim();
-
-        // This is an inexpensive check.
-        stream_name_error.pre_validate(stream_name);
+        handle_channel_name_length_limit();
+    });
+    $container.on("paste", "#create_stream_name", () => {
+        /* setTimeout is needed to allow the pasted content to be
+           added to the input before checking the channel name length limit,
+           since the paste event fires before the input value is updated. */
+        setTimeout(handle_channel_name_length_limit, 0);
     });
 
     // Do not allow the user to enter newline characters while typing out the
@@ -654,6 +743,11 @@ export function set_up_handlers(): void {
         stream_ui_updates.update_can_create_topic_group_setting_state($("#stream-creation"));
     });
 
+    $container.on("click", ".create-channel-folder-button", (e) => {
+        e.preventDefault();
+        channel_folders_ui.add_channel_folder(set_channel_folder_dropdown_value);
+    });
+
     set_up_group_setting_widgets();
     settings_components.enable_opening_typeahead_on_clicking_label($container);
     folder_widget = stream_settings_components.set_up_folder_dropdown_widget();
@@ -661,13 +755,17 @@ export function set_up_handlers(): void {
 }
 
 export function initialize(): void {
-    $("#channels_overlay_container").on("click", "#archived_stream_rename", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const stream_id = Number.parseInt($(e.currentTarget).attr("data-stream-id")!, 10);
+    $("#channels_overlay_container").on(
+        "click",
+        "#archived_stream_rename",
+        function (this: HTMLElement, e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const stream_id = Number.parseInt($(e.currentTarget).attr("data-stream-id")!, 10);
 
-        stream_edit.open_stream_edit_modal(stream_id);
-    });
+            stream_edit.open_stream_edit_modal(stream_id, $(this).attr("id")!);
+        },
+    );
 }
 
 export function set_channel_folder_dropdown_value(folder_id: number): void {

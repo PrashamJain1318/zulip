@@ -19,6 +19,11 @@ step is described in detail below, with links to additional resources:
 1. Carefully [review your own work](#review-your-own-work).
 1. [Submit your pull request](#submit-your-pull-request-for-review) for review.
 
+To learn more about putting together pull requests maintainers will love to
+review, check out [this FOSDEM
+talk](https://fosdem.org/2026/schedule/event/L7ERNP-prs-maintainers-will-love/)
+by a Zulip maintainer.
+
 See the [pull request review process](../contributing/review-process.md) guide
 for a detailed overview of what happens once your pull request is submitted.
 
@@ -83,7 +88,8 @@ description for your pull request, you will:
   The review process will go a lot more smoothly if points of uncertainty are
   explicitly laid out.
 - Include screenshots for all visual changes, so that they can be reviewed
-  without running your code. Be sure to follow our [guide on presenting visual changes](../contributing/presenting-visual-changes).
+  without running your code. Be sure to follow our
+  [guide on presenting visual changes](../contributing/presenting-visual-changes.md).
 
 If you have a question about a specific part of your code that you expect to be
 resolved during the review process, put it in a PR comment attached to a
@@ -110,6 +116,10 @@ topic of the conversation is renamed, moved or resolved.
 Once you've created a pull request on GitHub, you can use one of the [custom
 linkifiers][dev-community-linkifiers] in the development community to easily
 link to your pull request from the relevant conversation.
+
+[zulip-dev-community]: https://chat.zulip.org
+[link-to-message]: https://zulip.com/help/link-to-a-message-or-conversation#get-a-link-to-a-specific-message
+[dev-community-linkifiers]: https://zulip.com/development-community/#linking-to-github-issues-and-pull-requests
 
 ## Review your own work
 

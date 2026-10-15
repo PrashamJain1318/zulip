@@ -1,10 +1,10 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import render_subscription_banner from "../templates/components/subscription_banner.hbs";
 import render_unsubscribe_private_stream_modal from "../templates/confirm_dialog/confirm_unsubscribe_private_stream.hbs";
-import render_inline_decorated_channel_name from "../templates/inline_decorated_channel_name.hbs";
+import render_decorated_channel_name from "../templates/decorated_channel_name.hbs";
 import render_stream_member_list_entry from "../templates/stream_settings/stream_member_list_entry.hbs";
 import render_stream_members_table from "../templates/stream_settings/stream_members_table.hbs";
 
@@ -129,9 +129,16 @@ function update_notification_choice_checkbox(added_user_count: number): void {
     }
 }
 
-async function stream_edit_update_notification_choice(): Promise<void> {
-    const pill_count = (await add_subscribers_pill.get_pill_user_ids(pill_widget)).length;
-    update_notification_choice_checkbox(pill_count);
+async function stream_edit_update_notification_choice($loading_spinner: JQuery): Promise<void> {
+    loading.make_indicator($loading_spinner, {
+        height: 28, // 2em at 14px / 1em
+    });
+    const result = await add_subscribers_pill.get_pill_user_ids(pill_widget);
+    loading.destroy_indicator($loading_spinner);
+    if (result.status === "failed") {
+        return;
+    }
+    update_notification_choice_checkbox(result.user_ids.length);
 }
 
 export function enable_subscriber_management({
@@ -152,15 +159,17 @@ export function enable_subscriber_management({
         return peer_data.potential_subscribers(stream_id);
     }
 
-    const update_notification_choice = function (): void {
-        void stream_edit_update_notification_choice();
+    const $loading_spinner = $parent_container.find(".add-subscriber-loading-spinner");
+    const pill_update_callback = function (): void {
+        void stream_edit_update_notification_choice($loading_spinner);
     };
     pill_widget = add_subscribers_pill.create({
+        $parent_container,
         $pill_container,
         get_potential_subscribers,
-        onPillCreateAction: update_notification_choice,
-        onPillRemoveAction: update_notification_choice,
-        add_button_pill_update_callback: update_notification_choice,
+        onPillCreateAction: pill_update_callback,
+        onPillRemoveAction: pill_update_callback,
+        add_button_pill_update_callback: pill_update_callback,
         get_user_groups: user_groups.get_all_realm_user_groups,
         with_add_button: true,
     });
@@ -183,10 +192,12 @@ async function render_subscriber_list_widget(
         text: $t({defaultMessage: "Loading…"}),
     });
 
-    // Because we're using `retry_on_failure=true`, this will only return once it
-    // succeeds, so we can't get `null`.
     const user_ids = await peer_data.get_subscribers_with_possible_fetch(sub.stream_id, true);
-    assert(user_ids !== null);
+    // The channel was deleted or we lost access to it while waiting.
+    if (user_ids === null) {
+        loading.destroy_indicator($(".subscriber-list-settings-loading"));
+        return;
+    }
 
     // Make sure we're still editing this stream after waiting for subscriber data.
     if (!hash_parser.is_editing_stream(sub.stream_id)) {
@@ -397,6 +408,7 @@ function remove_subscriber({
     }
 
     function remove_user_from_private_stream(): void {
+        buttons.show_button_loading_indicator($remove_button);
         assert(sub !== undefined);
         subscriber_api.remove_user_id_from_stream(
             target_user_id,
@@ -429,11 +441,12 @@ function remove_subscriber({
             return;
         }
 
-        const stream_name_with_privacy_symbol_html = render_inline_decorated_channel_name({
+        const stream_name_with_privacy_symbol_html = render_decorated_channel_name({
+            inline_with_text: true,
             stream: sub,
         });
 
-        const html_body = render_unsubscribe_private_stream_modal({
+        const modal_content_html = render_unsubscribe_private_stream_modal({
             unsubscribing_other_user,
             organization_will_lose_content_access:
                 sub_count === 1 &&
@@ -441,9 +454,9 @@ function remove_subscriber({
                 user_groups.is_setting_group_set_to_nobody_group(sub.can_add_subscribers_group),
         });
 
-        let html_heading;
+        let modal_title_html;
         if (unsubscribing_other_user) {
-            html_heading = $t_html(
+            modal_title_html = $t_html(
                 {defaultMessage: "Unsubscribe {full_name} from <z-link></z-link>?"},
                 {
                     full_name: people.get_full_name(target_user_id),
@@ -451,20 +464,21 @@ function remove_subscriber({
                 },
             );
         } else {
-            html_heading = $t_html(
+            modal_title_html = $t_html(
                 {defaultMessage: "Unsubscribe from <z-link></z-link>?"},
                 {"z-link": () => stream_name_with_privacy_symbol_html},
             );
         }
 
         confirm_dialog.launch({
-            html_heading,
-            html_body,
+            modal_title_html,
+            modal_content_html,
             on_click: remove_user_from_private_stream,
         });
         return;
     }
 
+    buttons.show_button_loading_indicator($remove_button);
     subscriber_api.remove_user_id_from_stream(
         target_user_id,
         sub,
@@ -549,6 +563,7 @@ export function initialize(): void {
         $parent_container: $("#channels_overlay_container"),
         pill_selector: ".edit_subscribers_for_stream .pill-container",
         button_selector: ".edit_subscribers_for_stream .add-subscriber-button",
+        spinner_selector: ".edit_subscribers_for_stream .add-subscriber-loading-spinner",
         action: subscribe_new_users,
     });
 
@@ -562,7 +577,6 @@ export function initialize(): void {
             const target_user_id = Number.parseInt($list_entry.attr("data-subscriber-id")!, 10);
             const stream_id = current_stream_id;
             const $remove_button = $(this).closest(".remove-subscriber-button");
-            buttons.show_button_loading_indicator($remove_button);
             remove_subscriber({stream_id, target_user_id, $list_entry, $remove_button});
         },
     );

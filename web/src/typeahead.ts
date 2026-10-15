@@ -1,5 +1,7 @@
 import _ from "lodash";
 
+import * as util from "./util.ts";
+
 /*
     We hand selected the following emojis a few years
     ago to be given extra precedence in our typeahead
@@ -40,14 +42,14 @@ export function get_popular_emojis(): EmojiItem[] {
 export let frequently_used_emojis: EmojiItem[] = [...get_popular_emojis()];
 
 export type Emoji =
+    | UnicodeEmoji
     | {
           emoji_name: string;
           reaction_type: "realm_emoji" | "zulip_extra_emoji";
           is_realm_emoji: true;
           emoji_url?: string | undefined;
           emoji_code?: undefined;
-      }
-    | UnicodeEmoji;
+      };
 
 // emoji_code is only available for unicode emojis.
 type UnicodeEmoji = {
@@ -62,13 +64,16 @@ export type EmojiSuggestion = Emoji & {
 };
 
 export type BaseEmoji = {emoji_name: string} & (
-    | {is_realm_emoji: false; emoji_code: string}
-    | {is_realm_emoji: true; emoji_code?: undefined}
+    {is_realm_emoji: false; emoji_code: string} | {is_realm_emoji: true; emoji_code?: undefined}
 );
 
 export function remove_diacritics(s: string): string {
     const unicode_marks = /\p{M}/gu;
     return s.normalize("NFKD").replaceAll(unicode_marks, "");
+}
+
+export function contains_diacritics(s: string): boolean {
+    return remove_diacritics(s) !== s;
 }
 
 export function last_prefix_match(prefix: string, words: string[]): number | null {
@@ -104,11 +109,11 @@ export function query_matches_string_in_order(
     query: string,
     source_str: string,
     split_char: string,
+    should_remove_diacritics: boolean,
 ): boolean {
     query = query.toLowerCase();
     source_str = source_str.toLowerCase();
 
-    const should_remove_diacritics = /^[a-z]+$/.test(query);
     if (should_remove_diacritics) {
         source_str = remove_diacritics(source_str);
     }
@@ -203,13 +208,12 @@ export function query_matches_string_in_any_order(
 }
 
 function clean_query(query: string): string {
-    query = remove_diacritics(query);
     // When `abc ` with a space at the end is typed in
     // a content-editable widget such as the composebox
     // direct message section, the space at the end was
     // a `no break-space (U+00A0)` instead of `space (U+0020)`,
     // which lead to no matches in those cases.
-    query = query.replaceAll("\u00A0", " ");
+    query = query.replaceAll("\u{A0}", " ");
 
     return query;
 }
@@ -220,22 +224,20 @@ export function clean_query_lowercase(query: string): string {
     return query;
 }
 
-export const parse_unicode_emoji_code = (code: string): string =>
-    code
-        .split("-")
-        .map((hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
-        .join("");
-
 export function get_emoji_matcher(query: string): (emoji: EmojiSuggestion) => boolean {
     // replace spaces with underscores for emoji matching
     query = query.replaceAll(" ", "_");
     query = clean_query_lowercase(query);
+    const should_remove_diacritics = !contains_diacritics(query);
 
     return function (emoji) {
         const matches_emoji_literal =
             emoji.reaction_type === "unicode_emoji" &&
-            parse_unicode_emoji_code(emoji.emoji_code) === query;
-        return matches_emoji_literal || query_matches_string_in_order(query, emoji.emoji_name, "_");
+            util.convert_emoji_code_to_unicode(emoji.emoji_code) === query;
+        return (
+            matches_emoji_literal ||
+            query_matches_string_in_order(query, emoji.emoji_name, "_", should_remove_diacritics)
+        );
     };
 }
 
@@ -244,26 +246,52 @@ export function get_emoji_matcher(query: string): (emoji: EmojiSuggestion) => bo
 // from BEFORE_MENTION_ALLOWED_REGEX in zerver/lib/mention.py later.
 export const word_boundary_chars = " _/-";
 
-export function triage_raw_with_multiple_items<T>(
+export function triage_raw<T>(
     query: string,
     objs: T[],
     get_items: (x: T) => string[],
 ): {
     exact_matches: T[];
+    // Only populated when the query itself contains diacritics; holds items
+    // whose lowercased form starts with the lowercased query (diacritics intact).
+    begins_with_case_insensitive_diacritic_matches: T[];
     begins_with_case_sensitive_matches: T[];
     begins_with_case_insensitive_matches: T[];
     word_boundary_matches: T[];
     no_matches: T[];
 } {
+    /*
+        We split objs into six groups:
+
+            - entire string exact match
+            - case-insensitive prefix match preserving diacritics in the query
+            - prefix match with `query` exactly (case-sensitive)
+            - prefix match case-insensitively
+            - word-boundary prefix match case-insensitively
+            - other
+
+        and return an object of these.
+
+        A query with diacritics also matches after stripping diacritics from
+        both sides, so "gaë" matches "Gael" but ranks below "Gaël". A query
+        without diacritics gets no such fallback, so "a" doesn't prefix-match
+        "Ądam".
+    */
     const exact_matches = [];
+    const begins_with_case_insensitive_diacritic_matches = [];
     const begins_with_case_sensitive_matches = [];
     const begins_with_case_insensitive_matches = [];
     const word_boundary_matches = [];
     const no_matches = [];
     const lower_query = query ? query.toLowerCase() : "";
+    const diacritic_stripped_query = remove_diacritics(lower_query);
+    const query_has_diacritics = lower_query !== diacritic_stripped_query;
 
-    const word_boundary_match_regex = new RegExp(
+    const lower_word_boundary_regex = new RegExp(
         `[${word_boundary_chars}]${_.escapeRegExp(lower_query)}`,
+    );
+    const diacritic_stripped_word_boundary_regex = new RegExp(
+        `[${word_boundary_chars}]${_.escapeRegExp(diacritic_stripped_query)}`,
     );
 
     for (const obj of objs) {
@@ -273,67 +301,27 @@ export function triage_raw_with_multiple_items<T>(
 
         if (lower_items.includes(lower_query)) {
             exact_matches.push(obj);
+        } else if (
+            query_has_diacritics &&
+            lower_items.some((item) => item.startsWith(lower_query))
+        ) {
+            begins_with_case_insensitive_diacritic_matches.push(obj);
         } else if (items.some((item) => item.startsWith(query))) {
             begins_with_case_sensitive_matches.push(obj);
         } else if (lower_items.some((item) => item.startsWith(lower_query))) {
             begins_with_case_insensitive_matches.push(obj);
-        } else if (lower_items.some((item) => word_boundary_match_regex.test(item))) {
-            word_boundary_matches.push(obj);
-        } else {
-            no_matches.push(obj);
-        }
-    }
-
-    return {
-        exact_matches,
-        begins_with_case_sensitive_matches,
-        begins_with_case_insensitive_matches,
-        word_boundary_matches,
-        no_matches,
-    };
-}
-
-export function triage_raw<T>(
-    query: string,
-    objs: T[],
-    get_item: (x: T) => string,
-): {
-    exact_matches: T[];
-    begins_with_case_sensitive_matches: T[];
-    begins_with_case_insensitive_matches: T[];
-    word_boundary_matches: T[];
-    no_matches: T[];
-} {
-    /*
-        We split objs into five groups:
-
-            - entire string exact match
-            - match prefix exactly with `query`
-            - match prefix case-insensitively
-            - match word boundary prefix case-insensitively
-            - other
-
-        and return an object of these.
-    */
-    const exact_matches = [];
-    const begins_with_case_sensitive_matches = [];
-    const begins_with_case_insensitive_matches = [];
-    const word_boundary_matches = [];
-    const no_matches = [];
-    const lower_query = query ? query.toLowerCase() : "";
-
-    for (const obj of objs) {
-        const item = get_item(obj);
-        const lower_item = item.toLowerCase();
-
-        if (lower_item === lower_query) {
-            exact_matches.push(obj);
-        } else if (item.startsWith(query)) {
-            begins_with_case_sensitive_matches.push(obj);
-        } else if (lower_item.startsWith(lower_query)) {
-            begins_with_case_insensitive_matches.push(obj);
         } else if (
-            new RegExp(`[${word_boundary_chars}]${_.escapeRegExp(lower_query)}`).test(lower_item)
+            query_has_diacritics &&
+            lower_items.some((item) => remove_diacritics(item).startsWith(diacritic_stripped_query))
+        ) {
+            begins_with_case_insensitive_matches.push(obj);
+        } else if (lower_items.some((item) => lower_word_boundary_regex.test(item))) {
+            word_boundary_matches.push(obj);
+        } else if (
+            query_has_diacritics &&
+            lower_items.some((item) =>
+                diacritic_stripped_word_boundary_regex.test(remove_diacritics(item)),
+            )
         ) {
             word_boundary_matches.push(obj);
         } else {
@@ -343,6 +331,7 @@ export function triage_raw<T>(
 
     return {
         exact_matches,
+        begins_with_case_insensitive_diacritic_matches,
         begins_with_case_sensitive_matches,
         begins_with_case_insensitive_matches,
         word_boundary_matches,
@@ -358,11 +347,12 @@ export function triage<T>(
 ): {matches: T[]; rest: T[]} {
     const {
         exact_matches,
+        begins_with_case_insensitive_diacritic_matches,
         begins_with_case_sensitive_matches,
         begins_with_case_insensitive_matches,
         word_boundary_matches,
         no_matches,
-    } = triage_raw(query, objs, get_item);
+    } = triage_raw(query, objs, (x) => [get_item(x)]);
 
     if (sorting_comparator) {
         const beginning_matches_sorted = [
@@ -372,6 +362,7 @@ export function triage<T>(
         return {
             matches: [
                 ...exact_matches.toSorted(sorting_comparator),
+                ...begins_with_case_insensitive_diacritic_matches.toSorted(sorting_comparator),
                 ...beginning_matches_sorted,
                 ...word_boundary_matches.toSorted(sorting_comparator),
             ],
@@ -382,6 +373,7 @@ export function triage<T>(
     return {
         matches: [
             ...exact_matches,
+            ...begins_with_case_insensitive_diacritic_matches,
             ...begins_with_case_sensitive_matches,
             ...begins_with_case_insensitive_matches,
             ...word_boundary_matches,

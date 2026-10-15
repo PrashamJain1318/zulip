@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
@@ -10,19 +10,21 @@ import * as compose from "./compose.ts";
 import * as compose_actions from "./compose_actions.ts";
 import * as compose_banner from "./compose_banner.ts";
 import * as compose_call from "./compose_call.ts";
+import {compose_call_session_manager} from "./compose_call_session.ts";
 import * as compose_call_ui from "./compose_call_ui.ts";
 import * as compose_fade from "./compose_fade.ts";
 import * as compose_notifications from "./compose_notifications.ts";
 import * as compose_recipient from "./compose_recipient.ts";
 import * as compose_send_menu_popover from "./compose_send_menu_popover.ts";
 import * as compose_state from "./compose_state.ts";
+import * as compose_tooltips from "./compose_tooltips.ts";
 import * as compose_ui from "./compose_ui.ts";
 import * as compose_validate from "./compose_validate.ts";
 import * as composebox_typeahead from "./composebox_typeahead.ts";
 import * as dialog_widget from "./dialog_widget.ts";
 import * as drafts from "./drafts.ts";
 import * as flatpickr from "./flatpickr.ts";
-import {$t_html} from "./i18n.ts";
+import {$t, $t_html} from "./i18n.ts";
 import * as message_edit from "./message_edit.ts";
 import * as message_view from "./message_view.ts";
 import * as message_viewport from "./message_viewport.ts";
@@ -34,6 +36,8 @@ import * as resize from "./resize.ts";
 import {unresolve_name} from "./resolved_topic.ts";
 import * as rows from "./rows.ts";
 import * as scheduled_messages from "./scheduled_messages.ts";
+import * as scroll_to_bottom_button from "./scroll_to_bottom_button.ts";
+import {realm} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
 import * as stream_settings_components from "./stream_settings_components.ts";
 import * as sub_store from "./sub_store.ts";
@@ -45,6 +49,8 @@ import * as user_topics from "./user_topics.ts";
 import * as util from "./util.ts";
 import * as widget_modal from "./widget_modal.ts";
 
+const AUTOSAVE_DRAFT_THROTTLE_IN_MILLISECONDS = 60 * 1000;
+
 export function abort_xhr(): void {
     upload.compose_upload_cancel();
 }
@@ -55,8 +61,34 @@ function setup_compose_actions_hooks(): void {
     compose_actions.register_compose_box_clear_hook(compose.clear_preview_area);
 
     compose_actions.register_compose_cancel_hook(abort_xhr);
-    compose_actions.register_compose_cancel_hook(compose_call.abort_video_callbacks);
+    compose_actions.register_compose_cancel_hook(() => {
+        compose_call_session_manager.abandon_session("");
+    });
 }
+
+// This autosave callback does not track the compose_draft_id that was
+// active when scheduled; it simply calls update_draft() on whatever
+// compose state is current when it fires, as long as compose is still
+// open.
+//
+// This is safe because compose context transitions (send, close,
+// switching/restoring drafts) already perform explicit draft saves, and
+// compose_draft_id is only changed through those controlled flows.
+//
+// At worst, a delayed call results in an extra save of the current draft,
+// which is harmless. Adding draft_id tracking here would introduce
+// significant complexity without meaningful benefit.
+export function update_draft_if_composing(): void {
+    if (compose_state.composing()) {
+        drafts.update_draft({no_notify: true});
+    }
+}
+
+const throttled_update_draft = _.throttle(
+    update_draft_if_composing,
+    AUTOSAVE_DRAFT_THROTTLE_IN_MILLISECONDS,
+    {leading: false, trailing: true},
+);
 
 export function initialize(): void {
     // Register hooks for compose_actions.
@@ -82,35 +114,49 @@ export function initialize(): void {
         );
     });
 
-    $("textarea#compose-textarea").on("input", () => {
-        if ($("#compose").hasClass("preview_mode")) {
-            compose.render_preview_area();
-        }
-        const recipient_widget_hidden =
-            $(".compose_select_recipient-dropdown-list-container").length === 0;
-        if (recipient_widget_hidden) {
-            compose_validate.warn_if_topic_resolved(false);
-        }
-        const compose_text_length = compose_validate.check_overflow_text($("#send_message_form"));
-
-        // Change compose close button tooltip as per condition.
-        // We save compose text in draft only if its length is > 2.
-        if (compose_text_length > 2) {
-            $("#compose_close").attr(
-                "data-tooltip-template-id",
-                "compose_close_and_save_tooltip_template",
+    $("textarea#compose-textarea").on(
+        "input",
+        _.throttle(() => {
+            if ($("#compose").hasClass("preview_mode")) {
+                compose.render_preview_area();
+            }
+            const recipient_widget_hidden =
+                $(".compose_select_recipient-dropdown-list-container").length === 0;
+            if (recipient_widget_hidden) {
+                compose_validate.warn_if_topic_resolved(false);
+            }
+            compose_validate.maybe_clear_stale_recipient_not_subscribed_warnings(
+                $<HTMLTextAreaElement>("textarea#compose-textarea").expectOne(),
             );
-        } else {
-            $("#compose_close").attr("data-tooltip-template-id", "compose_close_tooltip_template");
-        }
+            const compose_text_length = compose_validate.check_overflow_text(
+                $("#send_message_form"),
+            );
 
-        // The poll widget requires an empty compose box.
-        $(".needs-empty-compose").toggleClass("disabled-on-hover", compose_text_length > 0);
+            // Change compose close button tooltip as per condition.
+            // We save compose text in draft only if its length is > 2.
+            if (compose_text_length > 2) {
+                $("#compose_close").attr(
+                    "data-tooltip-template-id",
+                    "compose_close_and_save_tooltip_template",
+                );
+            } else {
+                $("#compose_close").attr(
+                    "data-tooltip-template-id",
+                    "compose_close_tooltip_template",
+                );
+            }
 
-        if (compose_state.get_is_content_unedited_restored_draft()) {
-            compose_state.set_is_content_unedited_restored_draft(false);
-        }
-    });
+            // The poll widget requires an empty compose box.
+            $(".needs-empty-compose").toggleClass("disabled-on-hover", compose_text_length > 0);
+
+            if (compose_state.get_is_content_unedited_restored_draft()) {
+                compose_state.set_is_content_unedited_restored_draft(false);
+            }
+
+            // We occasionally update the saved draft while the user is typing to minimize data loss risk.
+            throttled_update_draft();
+        }, 25),
+    );
 
     $("#compose form").on("submit", (e) => {
         e.preventDefault();
@@ -120,11 +166,12 @@ export function initialize(): void {
     resize.watch_manual_resize("#compose-textarea");
     message_viewport.register_resize_handler(message_edit.maybe_autosize_message_edit_box);
 
-    // Updates compose max-height and scroll to bottom button position when
+    // Updates compose max-height and the scroll to bottom button when
     // there is a change in compose height like when a compose banner is displayed.
     const update_compose_max_height = new ResizeObserver((_entries) => {
         requestAnimationFrame(() => {
             resize.reset_compose_message_max_height();
+            scroll_to_bottom_button.update();
         });
     });
     update_compose_max_height.observe(document.querySelector("#compose")!);
@@ -215,8 +262,7 @@ export function initialize(): void {
                     const stream_id_string = stream_id.toString();
                     if (
                         current_filter &&
-                        (current_filter.is_conversation_view() ||
-                            current_filter.is_conversation_view_with_near()) &&
+                        current_filter.is_conversation_view() &&
                         current_filter.has_topic(stream_id_string, topic_name)
                     ) {
                         message_view.show(
@@ -268,7 +314,7 @@ export function initialize(): void {
                 onboarding_steps.post_onboarding_step_as_read("visibility_policy_banner");
                 return;
             }
-            window.location.href = "/#settings/notifications";
+            window.location.assign("/#settings/notifications");
         },
     );
 
@@ -378,6 +424,34 @@ export function initialize(): void {
         });
     }
 
+    // Trap Tab/Shift+Tab focus within #compose-container so keyboard navigation
+    // doesn't leave the compose box when it is open.
+    $("#compose-container").on("keydown", (e) => {
+        if (e.key !== "Tab" || !compose_state.composing()) {
+            return;
+        }
+
+        const $compose_container = $("#compose-container");
+        const visible_focusable_elements = [
+            ...$compose_container.find("input, textarea, button, .input, a[href], a[tabindex='0']"),
+        ].filter(
+            (element) =>
+                element.getClientRects().length > 0 &&
+                $(element).css("visibility") !== "hidden" &&
+                !$(element).is(":disabled"),
+        );
+
+        if (e.shiftKey) {
+            if (document.activeElement === visible_focusable_elements[0]) {
+                e.preventDefault();
+            }
+        } else {
+            if (document.activeElement === visible_focusable_elements.at(-1)) {
+                e.preventDefault();
+            }
+        }
+    });
+
     // Click event binding for "Attach files" button
     // Triggers a click on a hidden file input field
 
@@ -473,9 +547,9 @@ export function initialize(): void {
         }
 
         dialog_widget.launch({
-            html_heading: $t_html({defaultMessage: "Create a poll"}),
-            html_body: render_add_poll_modal(),
-            html_submit_button: $t_html({defaultMessage: "Add poll"}),
+            modal_title_html: $t_html({defaultMessage: "Create a poll"}),
+            modal_content_html: render_add_poll_modal(),
+            modal_submit_button_text: $t({defaultMessage: "Add poll"}),
             close_on_submit: true,
             on_click(e) {
                 // frame a message using data input in modal, then populate the compose textarea with it
@@ -535,9 +609,9 @@ export function initialize(): void {
             }
 
             dialog_widget.launch({
-                html_heading: $t_html({defaultMessage: "Create a collaborative to-do list"}),
-                html_body: render_add_todo_list_modal(),
-                html_submit_button: $t_html({defaultMessage: "Create to-do list"}),
+                modal_title_html: $t_html({defaultMessage: "Create a collaborative to-do list"}),
+                modal_content_html: render_add_todo_list_modal(),
+                modal_submit_button_text: $t({defaultMessage: "Create to-do list"}),
                 close_on_submit: true,
                 on_click(e) {
                     // frame a message using data input in modal, then populate the compose textarea with it
@@ -590,6 +664,7 @@ export function initialize(): void {
 
     $("#compose").on("click", ".narrow_to_compose_recipients", (e) => {
         e.preventDefault();
+        compose_tooltips.dismiss_intro_go_to_conversation_tooltip();
         message_view.to_compose_target();
     });
 
@@ -674,11 +749,31 @@ export function initialize(): void {
         $compose_recipient.addClass("recently-focused");
     });
 
+    function handle_topic_length_limit(): void {
+        let topic = compose_state.topic();
+        if (topic.length > realm.max_topic_length) {
+            topic = topic.slice(0, realm.max_topic_length);
+            compose_state.topic(topic);
+            $("input#stream_message_recipient_topic").addClass("input-validation-shake");
+        }
+    }
+
+    $("input#stream_message_recipient_topic").on("animationend", function () {
+        $(this).removeClass("input-validation-shake");
+    });
+
     $("input#stream_message_recipient_topic").on("input", () => {
+        handle_topic_length_limit();
         compose_recipient.update_placeholder_visibility();
         compose_recipient.update_compose_area_placeholder_text();
     });
 
+    $("input#stream_message_recipient_topic").on("paste", () => {
+        /* setTimeout is needed to allow the pasted content to be
+            added to the input before checking the topic length limit,
+            since the paste event fires before the input value is updated.*/
+        setTimeout(handle_topic_length_limit, 0);
+    });
     $("#private_message_recipient").on("focus", () => {
         // We don't want the `.recently-focused` class removed via
         // setTimeout from the "blur" event, if we're suddenly
@@ -691,6 +786,10 @@ export function initialize(): void {
         // to the recipient row
         compose_recipient.set_high_attention_recipient_row();
         $compose_recipient.addClass("recently-focused");
+        // Validate recipient to show error banners for deactivated
+        // users or insufficient DM permissions, and disable the
+        // compose textarea if the recipient is invalid.
+        compose_validate.validate_private_message(false);
     });
 
     $("input#stream_message_recipient_topic, #private_message_recipient").on("blur", () => {

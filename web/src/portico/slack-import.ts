@@ -1,7 +1,7 @@
 import {Uppy} from "@uppy/core";
 import Dashboard from "@uppy/dashboard";
 import Tus from "@uppy/tus";
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -100,7 +100,16 @@ $(() => {
                 const {status, redirect} = z
                     .object({status: z.string(), redirect: z.optional(z.string())})
                     .parse(response);
-                $("#slack-import-poll-status").text(status);
+                if (status === "unexpected_import_failure") {
+                    $("#slack-import-poll-status").hide();
+                    $("#slack-import-unexpected-failure").removeClass("hidden");
+                    // Stop polling
+                    if (poll_id) {
+                        clearInterval(poll_id);
+                    }
+                } else {
+                    $("#slack-import-poll-status").text(status);
+                }
                 if (poll_id && redirect !== undefined) {
                     clearInterval(poll_id);
                     window.location.assign(redirect);
@@ -114,6 +123,10 @@ $(() => {
 
     $("#cancel-slack-import").on("click", () => {
         $("#cancel-slack-import-form").trigger("submit");
+    });
+
+    $("#slack-import-start-over").on("click", () => {
+        window.location.assign("/new/");
     });
 
     $("#slack-access-token").on("input", () => {

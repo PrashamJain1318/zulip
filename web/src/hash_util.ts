@@ -6,18 +6,20 @@ import * as z from "zod/mini";
 import * as blueslip from "./blueslip.ts";
 import * as channel_folders from "./channel_folders.ts";
 import * as filter_util from "./filter_util.ts";
+import * as hash_parser from "./hash_parser.ts";
 import * as internal_url from "./internal_url.ts";
 import type {Message} from "./message_store.ts";
 import * as people from "./people.ts";
 import {web_channel_default_view_values} from "./settings_config.ts";
 import * as settings_data from "./settings_data.ts";
+import type {SettingsPanelMenu} from "./settings_panel_menu.ts";
 import {
     current_user,
     narrow_canonical_term_schema,
     narrow_operator_schema,
     realm,
 } from "./state_data.ts";
-import type {NarrowCanonicalTerm, NarrowTerm} from "./state_data.ts";
+import type {NarrowCanonicalOperator, NarrowCanonicalTerm, NarrowTerm} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
 import * as sub_store from "./sub_store.ts";
 import type {StreamSubscription} from "./sub_store.ts";
@@ -34,26 +36,19 @@ export function get_reload_hash(): string {
     return hash;
 }
 
-export function encode_operand(operator: string, operand: string): string {
-    if (
-        operator === "group-pm-with" ||
-        operator === "dm-including" ||
-        operator === "dm" ||
-        operator === "sender" ||
-        operator === "pm-with"
-    ) {
-        const slug = people.emails_to_slug(operand);
-        if (slug) {
-            return slug;
-        }
+export function encode_operand(term: NarrowCanonicalTerm): string {
+    switch (term.operator) {
+        case "dm-including":
+        case "dm":
+            return people.user_ids_to_slug(term.operand);
+        case "sender":
+        case "mentions":
+            return people.user_ids_to_slug([term.operand]);
+        case "channel":
+            return encode_stream_id(Number.parseInt(term.operand, 10));
     }
 
-    if (util.canonicalize_channel_synonyms(operator) === "channel") {
-        const stream_id = Number.parseInt(operand, 10);
-        return encode_stream_id(stream_id);
-    }
-
-    return internal_url.encodeHashComponent(operand);
+    return internal_url.encodeHashComponent(term.operand);
 }
 
 export function encode_stream_id(stream_id: number): string {
@@ -61,18 +56,50 @@ export function encode_stream_id(stream_id: number): string {
     // URI encoding piece
     const slug = stream_data.id_to_slug(stream_id);
 
-    return internal_url.encodeHashComponent(slug);
+    return internal_url.encode_slug(stream_id, slug);
+}
+
+function decode_user_ids(slug: string): number[] {
+    // The text from the first hyphen after a digit is only a hint,
+    // as in "15-King-Hamlet". The hyphen of "-1", which is how an
+    // unknown user is written, is not after a digit.
+    const id_list = slug.replace(/(\d)-.*/, "$1");
+    const user_ids = id_list.split(",").map((member) => {
+        const id = Number(member);
+        // A huge number parses to Infinity or an inexact number.
+        const is_user_id = util.is_numeric_string(member) && Number.isSafeInteger(id);
+        return is_user_id ? id : filter_util.UNKNOWN_USER_ID;
+    });
+    return people.sorted_other_user_ids(user_ids);
 }
 
 export function decode_operand(
-    operator: NarrowCanonicalTerm["operator"],
-    operand: NarrowCanonicalTerm["operand"],
-): string {
-    if (operator === "dm-including" || operator === "dm" || operator === "sender") {
-        const emails = people.slug_to_emails(operand);
-        if (emails) {
-            return emails;
+    operator: NarrowCanonicalOperator,
+    operand: string,
+): NarrowTerm["operand"] {
+    if (operand === "me") {
+        switch (operator) {
+            case "sender":
+                return people.my_current_user_id();
+            case "dm":
+            case "dm-including":
+                return [people.my_current_user_id()];
         }
+    } else if (operator === "dm-including" || operator === "dm") {
+        return decode_user_ids(operand);
+    } else if (operator === "sender" || operator === "mentions") {
+        const user_ids = decode_user_ids(operand);
+        if (user_ids.length !== 1) {
+            // User mistyped the URL since we don't support
+            // group operand for `sender` or `mentions` narrow.
+            // Returning UNKNOWN_USER_ID will lead to us showing a proper
+            // user doesn't exist message in the UI.
+            // Other options is to throw an error which will
+            // lead to us showing a "Invalid URL" banner which
+            // is not very nice looking.
+            return filter_util.UNKNOWN_USER_ID;
+        }
+        return util.the(user_ids);
     }
 
     operand = internal_url.decodeHashComponent(operand);
@@ -112,7 +139,7 @@ export function by_stream_topic_url(stream_id: number, topic: string): string {
 // Encodes a term list into the
 // corresponding hash: the # component
 // of the narrow URL
-export function search_terms_to_hash(terms?: NarrowTerm[]): string {
+export function search_terms_to_hash(terms?: NarrowCanonicalTerm[]): string {
     // Note: This does not return the correct hash for combined feed, recent and inbox view.
     // These views can have multiple hashes that lead to them, so this function cannot support them.
     let hash = "#";
@@ -121,25 +148,21 @@ export function search_terms_to_hash(terms?: NarrowTerm[]): string {
         hash = "#narrow";
 
         for (const term of terms) {
-            // Support legacy tuples.
-            const operator = util.canonicalize_channel_synonyms(term.operator);
-            const operand = term.operand;
-
             const sign = term.negated ? "-" : "";
             hash +=
                 "/" +
                 sign +
-                internal_url.encodeHashComponent(operator) +
+                internal_url.encodeHashComponent(term.operator) +
                 "/" +
-                encode_operand(operator, operand);
+                encode_operand(term);
         }
     }
 
     return hash;
 }
 
-export function by_sender_url(reply_to: string): string {
-    return search_terms_to_hash([{operator: "sender", operand: reply_to}]);
+export function by_sender_url(user_id: number): string {
+    return search_terms_to_hash([{operator: "sender", operand: user_id}]);
 }
 
 export function pm_with_url(user_ids_string: string): string {
@@ -161,7 +184,7 @@ export function by_conversation_and_time_url(message: Message): string {
         "//" +
         window.location.host +
         "/" +
-        window.location.pathname.split("/")[1];
+        window.location.pathname.split("/", 2)[1];
 
     const suffix = "/near/" + internal_url.encodeHashComponent(message.id.toString());
 
@@ -177,8 +200,8 @@ export function group_edit_url(group: UserGroup, right_side_tab: string): string
     return hash;
 }
 
-export function search_public_streams_notice_url(terms: NarrowTerm[]): string {
-    const public_operator: NarrowTerm = {operator: "channels", operand: "public"};
+export function search_public_streams_notice_url(terms: NarrowCanonicalTerm[]): string {
+    const public_operator: NarrowCanonicalTerm = {operator: "channels", operand: "public"};
     return search_terms_to_hash([public_operator, ...terms]);
 }
 
@@ -217,10 +240,17 @@ export function parse_narrow(hash: string[]): NarrowCanonicalTerm[] | undefined 
             return undefined;
         }
 
-        const canonical_operator = filter_util.canonicalize_operator(
+        let canonical_operator = filter_util.canonicalize_operator(
             narrow_operator_schema.parse(operator),
         );
-        const operand = decode_operand(canonical_operator, raw_operand);
+        let operand = decode_operand(canonical_operator, raw_operand);
+
+        // mentions:me is equivalent to is:mentioned.
+        if (canonical_operator === "mentions" && raw_operand === "me") {
+            canonical_operator = "is";
+            operand = "mentioned";
+        }
+
         terms.push({
             negated,
             operator: canonical_operator,
@@ -347,12 +377,125 @@ export function validate_group_settings_hash(hash: string): string {
         return group_edit_url(group, right_side_tab);
     }
 
-    const valid_section_values = ["new", "your", "all"];
+    const valid_section_values = ["new", "your", "all", "roles"];
     if (section === undefined || !valid_section_values.includes(section)) {
         blueslip.info("invalid section for groups: " + section);
         return "#groups/your";
     }
     return hash;
+}
+
+function handle_invalid_settings_tab(
+    base: string,
+    section: "bots" | "users",
+    settings_tab: string,
+): string {
+    const valid_tab_values = {
+        users: new Set(["active", "imported", "deactivated", "invitations"]),
+        bots: new Set(["all-bots", "your-bots"]),
+    };
+
+    if (!valid_tab_values[section].has(settings_tab)) {
+        let default_tab = [...valid_tab_values[section]][0]!;
+        if (section === "bots" && base === "settings") {
+            // For bots panel in "Personal" tab we open "Your bots"
+            // tab by default.
+            default_tab = "your-bots";
+        }
+        return default_tab;
+    }
+    return settings_tab;
+}
+
+function get_settings_tab(base: string, section: string): string | undefined {
+    if (section === "users" || section === "bots") {
+        const current_settings_tab = hash_parser.get_current_nth_hash_section(2);
+        return handle_invalid_settings_tab(base, section, current_settings_tab);
+    }
+    return undefined;
+}
+
+export function validate_settings_hash(
+    hash: string,
+    settings_panel_object: SettingsPanelMenu,
+): string {
+    const hash_components = hash.slice(1).split(/\//);
+    const base = hash_components[0]!;
+    let section = hash_components[1];
+
+    if (!section) {
+        const settings_tab = settings_panel_object.get_settings_tab(
+            settings_panel_object.current_tab,
+        );
+        if (settings_tab) {
+            return `#${base}/${settings_panel_object.current_tab}/${settings_tab}`;
+        }
+        return `#${base}/${settings_panel_object.current_tab}`;
+    }
+
+    let settings_tab = get_settings_tab(base, section);
+
+    if (base === "settings" && section === "display-settings") {
+        // Since display-settings was deprecated and replaced with preferences
+        // #settings/display-settings is being redirected to #settings/preferences.
+        section = "preferences";
+    }
+    if (base === "organization" && section === "bot-list-admin") {
+        // #organization/bot-list-admin is being redirected to #organization/bots/all-bots.
+        section = "bots";
+        settings_tab = "all-bots";
+    }
+    if (base === "organization" && section === "user-list-admin") {
+        // #organization/user-list-admin is being redirected to #organization/users/active
+        // after it was renamed.
+        section = "users";
+        settings_tab = "active";
+    }
+    if (base === "settings" && section === "your-bots") {
+        // #settings/your-bots is being redirected to #settings/bots/your-bots.
+        section = "bots";
+        settings_tab = "your-bots";
+    }
+
+    const valid_personal_section_values = new Set([
+        "profile",
+        "account-and-privacy",
+        "preferences",
+        "notifications",
+        "bots",
+        "alert-words",
+        "uploaded-files",
+        "topics",
+        "muted-users",
+    ]);
+    const valid_organization_section_values = new Set([
+        "organization-profile",
+        "organization-settings",
+        "organization-permissions",
+        "emoji-settings",
+        "linkifier-settings",
+        "playground-settings",
+        "users",
+        "bots",
+        "profile-field-settings",
+        "organization-level-user-defaults",
+        "channel-folders",
+        "default-channels-list",
+        "auth-methods",
+        "data-exports-admin",
+    ]);
+
+    if (base === "settings" && !valid_personal_section_values.has(section)) {
+        return "#settings/profile";
+    }
+    if (base === "organization" && !valid_organization_section_values.has(section)) {
+        return "#organization/organization-profile";
+    }
+
+    if (settings_tab) {
+        return `#${base}/${section}/${settings_tab}`;
+    }
+    return `#${base}/${section}`;
 }
 
 export function decode_dm_recipient_user_ids_from_narrow_url(narrow_url: string): number[] | null {
@@ -362,24 +505,26 @@ export function decode_dm_recipient_user_ids_from_narrow_url(narrow_url: string)
             return null;
         }
         const terms = parse_narrow(url.hash.split(/\//));
-        if (!terms?.[0]) {
+        if (!terms?.[0] || terms.length > 2) {
             return null;
         }
-        if (terms.length > 2) {
+        // Help Typescript understand that first_term.operator can only be
+        // of `DM` type.
+        const first_term = terms[0];
+        if (first_term.operator !== "dm") {
             return null;
         }
+
         if (
-            terms[0].operator !== "dm" &&
-            terms[1]?.operator !== "with" &&
-            terms[1]?.operator !== "near"
+            terms[1] !== undefined &&
+            terms[1].operator !== "with" &&
+            terms[1].operator !== "near"
         ) {
             return null;
         }
-        if (people.is_valid_bulk_emails_for_compose(terms[0].operand.split(","))) {
-            const user_ids = people.emails_strings_to_user_ids_array(terms[0].operand);
-            if (!user_ids) {
-                return null;
-            }
+
+        const user_ids = first_term.operand;
+        if (people.is_valid_bulk_user_ids_for_compose(user_ids, true)) {
             return user_ids;
         }
         return null;
@@ -424,7 +569,8 @@ export function decode_stream_topic_from_url(
             return {stream_id, topic_name: terms[1].operand};
         }
         if (terms[2]?.operator === "with") {
-            // For with operators, we currently discard the message ID.
+            // For with operators, we currently discard the message ID unless
+            // otherwise specified.
             return {stream_id, topic_name: terms[1].operand};
         }
         if (terms[2]?.operator !== "near") {

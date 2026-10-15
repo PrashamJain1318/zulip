@@ -5,6 +5,7 @@ from django.db import transaction
 from django.utils.translation import gettext as _
 
 from zerver.lib.default_streams import get_default_stream_ids_for_realm
+from zerver.lib.event_types import DefaultStreamGroupsEvent, DefaultStreamsEvent, StreamGroup
 from zerver.lib.exceptions import JsonableError
 from zerver.models import DefaultStream, DefaultStreamGroup, Realm, Stream
 from zerver.models.streams import get_default_stream_groups
@@ -37,32 +38,37 @@ def check_default_stream_group_name(group_name: str) -> None:
 def lookup_default_stream_groups(
     default_stream_group_names: list[str], realm: Realm
 ) -> list[DefaultStreamGroup]:
+    groups_by_name = {
+        group.name: group
+        for group in DefaultStreamGroup.objects.filter(
+            realm=realm, name__in=default_stream_group_names
+        )
+    }
     default_stream_groups = []
     for group_name in default_stream_group_names:
-        try:
-            default_stream_group = DefaultStreamGroup.objects.get(name=group_name, realm=realm)
-        except DefaultStreamGroup.DoesNotExist:
+        if group_name not in groups_by_name:
             raise JsonableError(
                 _("Invalid default channel group {group_name}").format(group_name=group_name)
             )
-        default_stream_groups.append(default_stream_group)
+        default_stream_groups.append(groups_by_name[group_name])
     return default_stream_groups
 
 
 def notify_default_streams(realm: Realm) -> None:
-    event = dict(
-        type="default_streams",
+    event = DefaultStreamsEvent(
         default_streams=list(get_default_stream_ids_for_realm(realm.id)),
     )
     send_event_on_commit(realm, event, active_non_guest_user_ids(realm.id))
 
 
 def notify_default_stream_groups(realm: Realm) -> None:
-    event = dict(
-        type="default_stream_groups",
-        default_stream_groups=default_stream_groups_to_dicts_sorted(
-            get_default_stream_groups(realm)
-        ),
+    event = DefaultStreamGroupsEvent(
+        default_stream_groups=[
+            StreamGroup(**group_dict)
+            for group_dict in default_stream_groups_to_dicts_sorted(
+                get_default_stream_groups(realm)
+            )
+        ],
     )
     send_event_on_commit(realm, event, active_non_guest_user_ids(realm.id))
 
@@ -169,7 +175,7 @@ def do_change_default_stream_group_name(
         )
 
     group.name = new_group_name
-    group.save()
+    group.save(update_fields=["name"])
     notify_default_stream_groups(realm)
 
 
@@ -177,7 +183,7 @@ def do_change_default_stream_group_description(
     realm: Realm, group: DefaultStreamGroup, new_description: str
 ) -> None:
     group.description = new_description
-    group.save()
+    group.save(update_fields=["description"])
     notify_default_stream_groups(realm)
 
 

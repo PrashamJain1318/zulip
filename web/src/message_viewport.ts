@@ -1,10 +1,12 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import * as blueslip from "./blueslip.ts";
 import * as message_lists from "./message_lists.ts";
 import * as message_scroll_state from "./message_scroll_state.ts";
 import type {Message} from "./message_store.ts";
+import * as modals from "./modals.ts";
+import * as overlays from "./overlays.ts";
 import * as rows from "./rows.ts";
 import * as util from "./util.ts";
 
@@ -15,6 +17,14 @@ export type MessageViewportInfo = {
 };
 
 export const $scroll_container = $(":root");
+
+// When you start Zulip, window_focused should be true, but it might not be the
+// case after a server-initiated reload.
+let window_focused = document.hasFocus();
+
+function is_window_focused(): boolean {
+    return window_focused;
+}
 
 let window_resize_handler: () => void;
 
@@ -68,6 +78,18 @@ export function message_viewport_info(): MessageViewportInfo {
         visible_bottom,
         visible_height,
     };
+}
+
+export function viewport_is_visible_and_focused(): boolean {
+    if (
+        overlays.any_active() ||
+        modals.any_active() ||
+        !is_window_focused() ||
+        $("#message_feed_container").css("display") === "none"
+    ) {
+        return false;
+    }
+    return true;
 }
 
 // Important note: These functions just look at the state of the
@@ -173,6 +195,54 @@ export function set_message_position(
     scrollTop(new_scroll_top);
 }
 
+export function simulated_recenter_scroll_delta(
+    $message: JQuery,
+    viewport_info: MessageViewportInfo,
+): number {
+    // Returns the scroll delta (positive = down, negative = up) that
+    // recenter_view would apply if select_id were called now with
+    // {then_scroll: true, from_scroll: true} and force_center=false.
+    // Returns 0 when recenter_view would short-circuit or when no
+    // scroll is needed. The caller must have already updated
+    // last_movement_direction to match the navigation direction.
+    //
+    // Used by navigate.ts to substitute page_up / page_down when the
+    // simulated select-and-recenter would jump too far in one keypress.
+    const message_top = $message.get_offset_to_window().top;
+    const message_height = $message.outerHeight(true) ?? 0;
+    const message_bottom = message_top + message_height;
+
+    const is_above = message_top < viewport_info.visible_top;
+    const is_below = message_bottom > viewport_info.visible_bottom;
+
+    // Mirror recenter_view's from_scroll short-circuit.
+    if (is_above && last_movement_direction >= 0) {
+        return 0;
+    }
+    if (is_below && last_movement_direction <= 0) {
+        return 0;
+    }
+
+    let how_far_down_in_visible_page;
+    if (is_above) {
+        how_far_down_in_visible_page = viewport_info.visible_height * (1 / 2);
+    } else if (is_below) {
+        how_far_down_in_visible_page = viewport_info.visible_height * (1 / 7);
+    } else {
+        return 0;
+    }
+
+    // Mirror set_message_position's tall-message clamp.
+    if (how_far_down_in_visible_page + message_height > viewport_info.visible_height) {
+        how_far_down_in_visible_page = viewport_info.visible_height - message_height;
+        if (how_far_down_in_visible_page < 0) {
+            how_far_down_in_visible_page = 0;
+        }
+    }
+
+    return message_top - viewport_info.visible_top - how_far_down_in_visible_page;
+}
+
 function in_viewport_or_tall(
     rect: DOMRect,
     top_of_feed: number,
@@ -221,7 +291,7 @@ const top_of_feed = new util.CachedValue({
     },
 });
 
-const bottom_of_feed = new util.CachedValue({
+export const bottom_of_feed = new util.CachedValue({
     compute_value() {
         return util.the($("#compose")).getBoundingClientRect().top;
     },
@@ -366,6 +436,14 @@ export function stop_auto_scrolling(): void {
     if (in_stoppable_autoscroll) {
         $scroll_container.stop();
     }
+}
+
+export function is_animating_scroll(): boolean {
+    return $scroll_container.promise().state() === "pending";
+}
+
+export function after_animated_scroll(callback: () => void): void {
+    void $scroll_container.promise().done(callback);
 }
 
 export function system_initiated_animate_scroll(
@@ -557,6 +635,16 @@ export function can_scroll(): boolean {
 }
 
 export function initialize(): void {
+    // These handlers must be placed before all focus handlers in our
+    // application that check is_window_focused.
+    $(window)
+        .on("focus", () => {
+            window_focused = true;
+        })
+        .on("blur", () => {
+            window_focused = false;
+        });
+
     // This handler must be placed before all resize handlers in our application
     $(window).on("resize", () => {
         cached_width.reset();
@@ -564,10 +652,6 @@ export function initialize(): void {
         top_of_feed.reset();
         bottom_of_feed.reset();
         window_resize_handler?.();
-    });
-
-    $(document).on("compose_started compose_canceled compose_finished", () => {
-        bottom_of_feed.reset();
     });
 
     // We stop autoscrolling when the user is clearly in the middle of

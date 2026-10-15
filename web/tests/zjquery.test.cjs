@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 
 const {run_test} = require("./lib/test.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 /*
 
@@ -48,15 +48,15 @@ run_test("basics", () => {
     const $widget = $("#my-widget");
 
     $widget.attr("data-employee-id", 42);
-    assert.equal($widget.attr("data-employee-id"), 42);
+    assert.equal($widget.attr("data-employee-id"), "42");
     assert.equal($widget.data("employee-id"), 42);
 
     $widget.data("department-id", 77);
-    assert.equal($widget.attr("data-department-id"), 77);
+    assert.equal($widget.attr("data-department-id"), undefined);
     assert.equal($widget.data("department-id"), 77);
 
     $widget.data("department-name", "hr");
-    assert.equal($widget.attr("data-department-name"), "hr");
+    assert.equal($widget.attr("data-department-name"), undefined);
     assert.equal($widget.data("department-name"), "hr");
 
     $widget.html("<b>hello</b>"); // eslint-disable-line no-jquery/no-parse-html-literal
@@ -92,8 +92,8 @@ run_test("finding_related_objects", () => {
     assert.equal($emoji.attr("src"), "foo.png");
 
     // Sometimes you want to deliberately test paths that do not find an
-    // element. You can pass 'false' as the result for those cases.
-    $emoji.set_find_results(".random", false);
+    // element. You can pass [] as the result for those cases.
+    $emoji.set_find_results(".random", []);
     assert.equal($emoji.find(".random").length, 0);
     /*
     An important thing to understand is that zjquery doesn't truly
@@ -109,6 +109,21 @@ run_test("finding_related_objects", () => {
     $elem.set_parents_result(".folder", $my_parents);
     $elem.parents(".folder").addClass("active");
     assert.ok($my_parents.hasClass("active"));
+
+    /*
+    Positions work the same way. eq() picks an element of a result
+    by its position there, and index() gives an element's position
+    among the children of its parent, both of which you set up.
+    */
+    const $list = $("#todo-list");
+    const $first_item = $("#todo-1");
+    const $second_item = $("#todo-2");
+    $list.set_children([...$first_item, ...$second_item]);
+    $second_item.set_parent($list);
+
+    assert.equal($list.children().eq(1)[0], $second_item[0]);
+    assert.equal($list.children().eq(2).length, 0);
+    assert.equal($second_item.index(), 1);
 });
 
 run_test("clicks", () => {

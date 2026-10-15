@@ -6,6 +6,7 @@ import {FetchStatus} from "./fetch_status.ts";
 import type {Filter} from "./filter.ts";
 import type {Message} from "./message_store.ts";
 import * as muted_users from "./muted_users.ts";
+import * as people from "./people.ts";
 import {current_user} from "./state_data.ts";
 import * as user_topics from "./user_topics.ts";
 import * as util from "./util.ts";
@@ -33,7 +34,7 @@ export class MessageListData {
     _hash: Map<number, Message>;
     // Some views exclude muted topics / users.
     //
-    // Also, `all_messages_data` never excludes anything by definition.
+    // Also, `recent_view_messages_data` never excludes anything by definition.
     excludes_muted_topics: boolean;
     excludes_muted_users: boolean;
     // Tracks any locally echoed messages, which we know aren't present on the server.
@@ -91,6 +92,9 @@ export class MessageListData {
         this.add_messages_callback = callback;
     }
 
+    // Mute filtering for MessageListData objects depends on the values
+    // of this.excludes_muted_topics and this.excludes_muted_users. Note
+    // `recent_view_messages_data` never excludes anything by definition.
     all_messages_after_mute_filtering(): Message[] {
         return this._items;
     }
@@ -640,6 +644,14 @@ export class MessageListData {
         return msgs;
     }
 
+    get_messages_involving_user(user_id: number): Message[] {
+        return this._items.filter(
+            (msg) =>
+                msg.sender_id === user_id ||
+                people.pm_with_user_ids(msg)?.includes(user_id) === true,
+        );
+    }
+
     get_last_message_sent_by_me(): Message | undefined {
         const msg_index = this._items.findLastIndex(
             (msg) => msg.sender_id === current_user.user_id,
@@ -649,5 +661,35 @@ export class MessageListData {
         }
         const msg = this._items[msg_index];
         return msg;
+    }
+
+    find_date_anchor_message_id(anchor_date: string): Message | undefined {
+        const anchor_timestamp = Math.floor(Date.parse(anchor_date) / 1000);
+        if (this.visibly_empty()) {
+            return undefined;
+        }
+
+        const first_message = this.first()!;
+        if (anchor_timestamp < first_message.timestamp && this.fetch_status.has_found_oldest()) {
+            return first_message;
+        }
+        const last_message = this.last()!;
+        if (anchor_timestamp > last_message.timestamp && this.fetch_status.has_found_newest()) {
+            return last_message;
+        }
+        // We need to fetch the message from the server if we have not found the oldest
+        // message in the list and if the there is no message older than the timestamp on
+        // the list.
+        if (!this.fetch_status.has_found_oldest() && anchor_timestamp <= first_message.timestamp) {
+            return undefined;
+        }
+
+        return this.all_messages_after_mute_filtering().find(
+            (message) => message.timestamp >= anchor_timestamp,
+        );
+    }
+
+    date_anchor_exists(anchor_date: string): boolean {
+        return Boolean(this.find_date_anchor_message_id(anchor_date));
     }
 }

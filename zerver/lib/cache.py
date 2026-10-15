@@ -251,8 +251,8 @@ def cache_set(
         val = (val,)
     try:
         cache_backend.set(final_key, val, timeout=timeout)
-    except MemcachedException as e:
-        logger.exception(e)
+    except MemcachedException:
+        logger.exception("Error while storing to cache")
     remote_cache_stats_finish()
 
 
@@ -306,8 +306,8 @@ def cache_set_many(
     remote_cache_stats_start()
     try:
         get_cache_backend(cache_name).set_many(items, timeout=timeout)
-    except MemcachedException as e:
-        logger.exception(e)
+    except MemcachedException:
+        logger.exception("Error while storing to cache")
     remote_cache_stats_finish()
 
 
@@ -476,6 +476,22 @@ def preview_url_cache_key(url: str) -> str:
     return f"preview_url:{hashlib.sha1(url.encode()).hexdigest()}"
 
 
+def preview_url_unavailable_cache_key(url: str) -> str:
+    return f"preview_url_unavailable:{hashlib.sha1(url.encode()).hexdigest()}"
+
+
+def preview_draft_content_hash(content: str) -> str:
+    return hashlib.sha1(content.encode()).hexdigest()
+
+
+def pending_preview_draft_cache_key(user_profile_id: int, content_hash: str) -> str:
+    return f"pending_preview_draft:{user_profile_id}:{content_hash}"
+
+
+def latest_preview_draft_cache_key(user_profile_id: int) -> str:
+    return f"latest_preview_draft:{user_profile_id}"
+
+
 def display_recipient_cache_key(recipient_id: int) -> str:
     return f"display_recipient_dict:{recipient_id}"
 
@@ -536,6 +552,7 @@ realm_user_dict_fields: list[str] = [
     "long_term_idle",
     "email_address_visibility",
     "is_imported_stub",
+    "is_deleted",
 ]
 
 
@@ -561,6 +578,10 @@ def active_user_ids_cache_key(realm_id: int) -> str:
 
 def active_non_guest_user_ids_cache_key(realm_id: int) -> str:
     return f"active_non_guest_user_ids:{realm_id}"
+
+
+def active_guest_user_ids_cache_key(realm_id: int) -> str:
+    return f"active_guest_user_ids:{realm_id}"
 
 
 def get_realm_system_groups_cache_key(realm_id: int) -> str:
@@ -644,9 +665,11 @@ def bulk_flush_users(
     if changed(update_fields, ["is_active"]):
         cache_keys_to_delete.add(active_user_ids_cache_key(realm.id))
         cache_keys_to_delete.add(active_non_guest_user_ids_cache_key(realm.id))
+        cache_keys_to_delete.add(active_guest_user_ids_cache_key(realm.id))
 
     if changed(update_fields, ["role"]):
         cache_keys_to_delete.add(active_non_guest_user_ids_cache_key(realm.id))
+        cache_keys_to_delete.add(active_guest_user_ids_cache_key(realm.id))
 
     # Invalidate our bots_in_realm info dict if any bot has
     # changed the fields in the dict or become (in)active
@@ -705,6 +728,7 @@ def flush_realm(
         cache_delete(realm_alert_words_cache_key(realm.id))
         cache_delete(realm_alert_words_automaton_cache_key(realm.id))
         cache_delete(active_non_guest_user_ids_cache_key(realm.id))
+        cache_delete(active_guest_user_ids_cache_key(realm.id))
         cache_delete(realm_rendered_description_cache_key(realm))
         cache_delete(realm_text_description_cache_key(realm))
     elif changed(update_fields, ["description"]):

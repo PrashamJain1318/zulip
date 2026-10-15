@@ -43,6 +43,28 @@ rules:
       exclude:
         - "**/migrations/"
 
+  - id: index-ordering-unusable-nulls-placement
+    patterns:
+      - pattern-either:
+          - pattern-inside: models.Index(...)
+          - pattern-inside: Index(...)
+      - pattern-either:
+          - pattern: $X.desc(..., nulls_last=True, ...)
+          - pattern: $X.asc(..., nulls_first=True, ...)
+    message: |
+      This index column's NULLS placement makes the index unusable for ordering.
+
+      PostgreSQL reads `ORDER BY x ASC` as `ASC NULLS LAST` and `ORDER BY x DESC`
+      as `DESC NULLS FIRST`, and an index scan can only supply the order the index
+      declares or the exact reverse of it.
+      If you're confident the NULLS ordering you specified is the correct one for
+      your situation nonetheless, add an exception to this semgrep rule.
+    languages: [python]
+    severity: ERROR
+    paths:
+      exclude:
+        - "**/migrations/"
+
   - id: dont-use-empty-select_related
     pattern-either:
       - pattern: $X.select_related()
@@ -98,9 +120,11 @@ rules:
         - zerver/migrations/0493_rename_userhotspot_to_onboardingstep.py
         - pgroonga/migrations/0002_html_escape_subject.py
 
-  - id: use-addindexconcurrently
-    pattern: django.db.migrations.AddIndex(...)
-    message: "Import and use AddIndexConcurrently from django.contrib.postgres.operations rather than AddIndex"
+  - id: use-add_index
+    pattern-either:
+      - pattern: django.db.migrations.AddIndex(...)
+      - pattern: django.contrib.postgres.operations.AddIndexConcurrently(...)
+    message: "Import and use add_index from zerver/lib/migrate.py rather than AddIndex/AddIndexConcurrently"
     languages: [python]
     severity: ERROR
     paths:
@@ -130,18 +154,40 @@ rules:
         - zilencer/migrations/0058_remoteinstallationcount_add_mobile_pushes_forwarded_index.py
         - zilencer/migrations/0059_remoterealmauditlog_add_synced_billing_event_type_index.py
 
-  - id: use-removeindexconcurrently
-    pattern: django.db.migrations.RemoveIndex(...)
-    message: "Import and use RemoveIndexConcurrently from django.contrib.postgres.operations rather than RemoveIndex"
+  - id: use-remove_index
+    pattern-either:
+      - pattern: django.db.migrations.RemoveIndex(...)
+      - pattern: django.contrib.postgres.operations.RemoveIndexConcurrently(...)
+    message: "Import and use remove_index from zerver/lib/migrate.py rather than RemoveIndex/RemoveIndexConcurrently"
     languages: [python]
     severity: ERROR
     paths:
       include:
         - "**/migrations"
       exclude:
-        - zerver/migrations/0473_remove_message_non_realm_id_indexes.py
-        - zerver/migrations/0486_clear_old_data_for_unused_usermessage_flags.py
         - zilencer/migrations/0038_unique_server_remote_id.py
+
+  - id: set-atomic-for-add_index-remove_index
+    patterns:
+      - pattern-either:
+          - pattern: zerver.lib.migrate.add_index(...)
+          - pattern: zerver.lib.migrate.remove_index(...)
+      - pattern-not-inside: |
+          class Migration(migrations.Migration):
+              ...
+              atomic = False
+              ...
+      - pattern-not-inside: |
+          class Migration(migrations.Migration):
+              ...
+              atomic = not settings.MIGRATIONS_ADD_REMOVE_INDEXES_CONCURRENTLY
+              ...
+    message: 'A migration using add_index/remove_index must set "atomic = not settings.MIGRATIONS_ADD_REMOVE_INDEXES_CONCURRENTLY" on the Migration class, or "atomic = False" if another operation, such as a RunPython backfill, must not run in a single transaction'
+    languages: [python]
+    severity: ERROR
+    paths:
+      include:
+        - "**/migrations"
 
   - id: html-format
     languages: [python]
@@ -240,7 +286,7 @@ rules:
     languages: [python]
     patterns:
       - pattern-either:
-          - pattern: Confirmation.objects.get(...)
+          - pattern: Confirmation.objects.get(..., confirmation_key=..., ...)
           - pattern: Confirmation.objects.filter(..., confirmation_key=..., ...)
       - pattern-not-inside: |
           def get_object_from_key(...):
@@ -400,5 +446,15 @@ rules:
     fix: |-
       for $VAR in $THING.objects.all().iterator():
           $BODY
+    languages: [python]
+    severity: ERROR
+
+  - id: select-for-update-require-no-key
+    message: |
+      Call select_for_update() with an explicit no_key= (True/False) kwarg. We should be purposeful about which lock we need.
+      See https://zulip.readthedocs.io/en/latest/subsystems/database-concurrency.html#select-for-update for guidance.
+    patterns:
+      - pattern: $Q.select_for_update(...)
+      - pattern-not: $Q.select_for_update(..., no_key=..., ...)
     languages: [python]
     severity: ERROR

@@ -1,13 +1,11 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
-
-import render_delete_message_modal from "../templates/confirm_dialog/confirm_delete_message.hbs";
 
 import * as channel from "./channel.ts";
 import * as confirm_dialog from "./confirm_dialog.ts";
 import * as dialog_widget from "./dialog_widget.ts";
-import {$t_html} from "./i18n.ts";
+import {$t, $t_html} from "./i18n.ts";
 import type {Message} from "./message_store.ts";
 import * as people from "./people.ts";
 import * as settings_data from "./settings_data.ts";
@@ -91,8 +89,6 @@ export function get_deletability(message: Message): boolean {
 }
 
 export function delete_message(msg_id: number): void {
-    const html_body = render_delete_message_modal();
-
     function do_delete_message(): void {
         currently_deleting_messages.push(msg_id);
         void channel.del({
@@ -120,11 +116,16 @@ export function delete_message(msg_id: number): void {
     }
 
     confirm_dialog.launch({
-        html_heading: $t_html({defaultMessage: "Delete message?"}),
-        html_body,
+        modal_title_html: $t_html({defaultMessage: "Delete message?"}),
+        modal_content_html: $t_html({
+            defaultMessage: "Deleting a message permanently removes it for everyone.",
+        }),
+        modal_submit_button_text: $t({defaultMessage: "Delete"}),
+        is_compact: true,
         help_link: "/help/delete-a-message#delete-a-message-completely",
         on_click: do_delete_message,
         loading_spinner: true,
+        dangerous_action: true,
     });
 }
 

@@ -281,7 +281,7 @@ commit should just move the code, not translate it to TypeScript).
 TypeScript provides more accurate information to development tools,
 allowing for better refactoring, auto-completion and static analysis.
 TypeScript also uses the ES6 module system. See our documentation on
-[TypeScript static types](../testing/typescript).
+[TypeScript static types](../testing/typescript.md).
 
 Webpack does not ordinarily allow modules to be accessed directly from
 the browser console, but for debugging convenience, we have a custom
@@ -289,8 +289,8 @@ webpack plugin (`web/debug-require-webpack-plugin.ts`) that exposes
 a version of the `require()` function to the development environment
 browser console for this purpose. For example, you can access our
 `people` module by evaluating
-`people = require("./src/people")`, or the third-party `lodash`
-module with `_ = require("lodash")`. This mechanism is **not** a
+`let people = require("./src/people")`, or the third-party `lodash`
+module with `let _ = require("lodash")`. This mechanism is **not** a
 stable API and should not be used for any purpose other than
 interactive debugging.
 

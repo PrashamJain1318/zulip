@@ -4,12 +4,12 @@ import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from email.headerregistry import Address
-from operator import itemgetter
+from operator import attrgetter
 from typing import Any, TypedDict
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import Q, QuerySet
+from django.db.models import Exists, OuterRef, Q, QuerySet
 from django.db.models.functions import Upper
 from django.utils.translation import gettext as _
 from django_otp.middleware import is_verified
@@ -28,7 +28,6 @@ from zerver.lib.user_groups import user_has_permission_for_group_setting
 from zerver.models import (
     CustomProfileField,
     CustomProfileFieldValue,
-    Message,
     Realm,
     Recipient,
     Service,
@@ -68,7 +67,7 @@ def check_full_name(
     # sloppily-written parsers of our Markdown syntax for mentioning
     # users with ambiguous names, and likely have no real use, so we
     # ban them.
-    if re.search(r"\|\d+$", full_name_raw):
+    if re.search(r"\|\d+$", full_name):
         raise JsonableError(_("Invalid format!"))
 
     if require_unique_names(realm):
@@ -132,57 +131,61 @@ def validate_short_name_and_construct_bot_email(
     return short_name, email
 
 
-def check_valid_bot_config(
-    bot_type: int, service_name: str, config_data: Mapping[str, str]
+def check_valid_incoming_webhook_bot_config(
+    service_name: str, config_data: Mapping[str, str]
 ) -> None:
-    if bot_type == UserProfile.INCOMING_WEBHOOK_BOT:
-        from zerver.lib.integrations import INCOMING_WEBHOOK_INTEGRATIONS
+    from zerver.lib.integrations import INCOMING_WEBHOOK_INTEGRATIONS
 
-        config_options = None
-        for integration in INCOMING_WEBHOOK_INTEGRATIONS:
-            if integration.name == service_name:
-                # key: validator
-                config_options = {
-                    option.name: option.validator for option in integration.config_options
-                }
-                break
-        if config_options is None:
-            raise JsonableError(
-                _("Invalid integration '{integration_name}'.").format(integration_name=service_name)
+    integration = next(
+        (
+            integration
+            for integration in INCOMING_WEBHOOK_INTEGRATIONS
+            if integration.name == service_name
+        ),
+        None,
+    )
+    if integration is None:
+        raise JsonableError(
+            _("Invalid integration '{integration_name}'.").format(integration_name=service_name)
+        )
+
+    missing_keys = {option.name for option in integration.config_options} - config_data.keys()
+    if missing_keys:
+        raise JsonableError(
+            _("Missing configuration parameters: {keys}").format(
+                keys=missing_keys,
             )
+        )
 
-        missing_keys = set(config_options.keys()) - set(config_data.keys())
-        if missing_keys:
+    for option in integration.config_options:
+        value = config_data[option.name]
+        error = option.validator(option.name, value)
+        if error is not None:
             raise JsonableError(
-                _("Missing configuration parameters: {keys}").format(
-                    keys=missing_keys,
+                _("Invalid {key} value {value} ({error})").format(
+                    key=option.name, value=value, error=error
                 )
             )
 
-        for key, validator in config_options.items():
-            value = config_data[key]
-            error = validator(key, value)
-            if error is not None:
-                raise JsonableError(
-                    _("Invalid {key} value {value} ({error})").format(
-                        key=key, value=value, error=error
-                    )
-                )
 
-    elif bot_type == UserProfile.EMBEDDED_BOT:
-        try:
-            from zerver.lib.bot_lib import get_bot_handler
+def check_valid_embedded_bot_config(service_name: str, config_data: Mapping[str, str]) -> None:
+    from zerver.lib.bot_lib import get_bot_handler
 
-            bot_handler = get_bot_handler(service_name)
-            if hasattr(bot_handler, "validate_config"):
-                bot_handler.validate_config(config_data)
-        except ConfigValidationError:
-            # The exception provides a specific error message, but that
-            # message is not tagged translatable, because it is
-            # triggered in the external zulip_bots package.
-            # TODO: Think of some clever way to provide a more specific
-            # error message.
-            raise JsonableError(_("Invalid configuration data!"))
+    bot_handler = get_bot_handler(service_name)
+    if bot_handler is None:
+        raise JsonableError(_("Invalid embedded bot name."))
+    if not hasattr(bot_handler, "validate_config"):
+        return
+
+    try:
+        bot_handler.validate_config(config_data)
+    except ConfigValidationError:
+        # The exception provides a specific error message, but that
+        # message is not tagged translatable, because it is
+        # triggered in the external zulip_bots package.
+        # TODO: Think of some clever way to provide a more specific
+        # error message.
+        raise JsonableError(_("Invalid configuration data!"))
 
 
 # Adds an outgoing webhook or embedded bot service.
@@ -324,7 +327,7 @@ def access_user_by_id(
     target_user_id: int,
     *,
     allow_deactivated: bool = False,
-    allow_bots: bool = False,
+    allow_bots: bool,
     for_admin: bool,
 ) -> UserProfile:
     """Master function for accessing another user by ID in API code;
@@ -345,7 +348,7 @@ def access_user_by_id_including_cross_realm(
     target_user_id: int,
     *,
     allow_deactivated: bool = False,
-    allow_bots: bool = False,
+    allow_bots: bool,
     for_admin: bool,
 ) -> UserProfile:
     """Variant of access_user_by_id allowing cross-realm bots to be accessed."""
@@ -526,12 +529,9 @@ def validate_user_custom_profile_field(
     if field_type in validators:
         validator = validators[field_type]
         return validator(var_name, value)
-    elif field_type == CustomProfileField.SELECT:
-        choice_field_validator = CustomProfileField.SELECT_FIELD_VALIDATORS[field_type]
-        field_data = field.field_data
-        # Put an assertion so that mypy doesn't complain.
-        assert field_data is not None
-        return choice_field_validator(var_name, field_data, value)
+    elif field_type == CustomProfileField.DROPDOWN:
+        choice_field_validator = CustomProfileField.DROPDOWN_FIELD_VALIDATORS[field_type]
+        return choice_field_validator(var_name, field.field_data, value)
     elif field_type == CustomProfileField.USER:
         user_field_validator = CustomProfileField.USER_FIELD_VALIDATORS[field_type]
         return user_field_validator(realm_id, value, False)
@@ -543,12 +543,16 @@ def validate_user_custom_profile_data(
     realm_id: int, profile_data: list[ProfileDataElementUpdateDict], acting_user: UserProfile
 ) -> None:
     # This function validate all custom field values according to their field type.
+    field_ids = [item["id"] for item in profile_data]
+    fields_by_id = {
+        field.id: field
+        for field in CustomProfileField.objects.filter(realm_id=realm_id, id__in=field_ids)
+    }
     for item in profile_data:
         field_id = item["id"]
-        try:
-            field = CustomProfileField.objects.get(realm_id=realm_id, id=field_id)
-        except CustomProfileField.DoesNotExist:
+        if field_id not in fields_by_id:
             raise JsonableError(_("Field id {id} not found.").format(id=field_id))
+        field = fields_by_id[field_id]
 
         if not acting_user.is_realm_admin and not field.editable_by_user:
             raise JsonableError(
@@ -598,6 +602,7 @@ class APIUserDict(TypedDict):
     is_system_bot: NotRequired[bool]
     max_message_id: NotRequired[int]
     is_imported_stub: bool
+    is_deleted: NotRequired[bool]
 
 
 def format_user_row(
@@ -644,6 +649,9 @@ def format_user_row(
         delivery_email=delivery_email,
         is_imported_stub=row["is_imported_stub"],
     )
+
+    if row["is_deleted"]:
+        result["is_deleted"] = True
 
     if acting_user is None:
         # Remove data about other users which are not useful to spectators
@@ -745,15 +753,18 @@ def check_can_access_user(
     # loaded but the caller has realm available from another source.
     realm: Realm | None = None,
 ) -> bool:
+    if user_profile is None:
+        # A spectator can access target_user since they
+        # have very limited access to users already.
+        return True
+
+    if user_profile.id == target_user.id:
+        return True
+
     if not user_access_restricted_in_realm(target_user, realm):
         return True
 
     if check_user_can_access_all_users(user_profile):
-        return True
-
-    assert user_profile is not None
-
-    if target_user.id == user_profile.id:
         return True
 
     # These include Subscription objects for streams as well as group DMs.
@@ -763,30 +774,52 @@ def check_can_access_user(
         recipient__type__in=[Recipient.STREAM, Recipient.DIRECT_MESSAGE_GROUP],
     ).values_list("recipient_id", flat=True)
 
-    if Subscription.objects.filter(
+    # A user retains access to a deactivated user they
+    # share a direct message group with.
+    return Subscription.objects.filter(
+        Q(recipient__type=Recipient.STREAM, is_user_active=True)
+        | Q(recipient__type=Recipient.DIRECT_MESSAGE_GROUP),
         recipient_id__in=subscribed_recipient_ids,
         user_profile=target_user,
         active=True,
-        is_user_active=True,
-    ).exists():
-        return True
+    ).exists()
 
-    if user_profile.recipient_id is None or target_user.recipient_id is None:
-        # If either user does not have a recipient_id, they rely on
-        # direct message groups for 1:1 or self DMs.
+
+def get_inaccessible_users_queryset(
+    target_user_ids: list[int], acting_user: UserProfile
+) -> QuerySet[UserProfile]:
+    """
+    Fetch human users who have no subscription to a recipient
+    the acting_user is also subscribed to.
+    """
+    acting_user_recipient_ids = Subscription.objects.filter(
+        user_profile=acting_user,
+        active=True,
+        recipient__type__in=[Recipient.STREAM, Recipient.DIRECT_MESSAGE_GROUP],
+    ).values("recipient_id")
+
+    # Deactivated users remain accessible through a shared
+    # direct message group.
+    common_subscriptions = Subscription.objects.filter(
+        Q(recipient__type=Recipient.STREAM, is_user_active=True)
+        | Q(recipient__type=Recipient.DIRECT_MESSAGE_GROUP),
+        recipient_id__in=acting_user_recipient_ids,
+        user_profile_id=OuterRef("pk"),
+        active=True,
+    )
+    # All users can access all the bots, so we exclude them.
+    target_human_users = UserProfile.objects.filter(id__in=target_user_ids, is_bot=False)
+    return target_human_users.exclude(Exists(common_subscriptions))
+
+
+def has_inaccessible_users(target_user_ids: list[int], acting_user: UserProfile) -> bool:
+    if len(target_user_ids) == 1 and target_user_ids[0] == acting_user.id:
         return False
 
-    # Querying the "Message" table is expensive so we do this last.
-    direct_message_query = Message.objects.filter(
-        recipient__type=Recipient.PERSONAL, realm=target_user.realm
-    )
-    if direct_message_query.filter(
-        Q(sender_id=target_user.id, recipient_id=user_profile.recipient_id)
-        | Q(recipient_id=target_user.recipient_id, sender_id=user_profile.id)
-    ).exists():
-        return True
+    if check_user_can_access_all_users(acting_user):
+        return False
 
-    return False
+    return get_inaccessible_users_queryset(target_user_ids, acting_user).exists()
 
 
 def get_inaccessible_user_ids(
@@ -797,61 +830,9 @@ def get_inaccessible_user_ids(
 
     assert acting_user is not None
 
-    # All users can access all the bots, so we just exclude them.
-    target_human_user_ids = UserProfile.objects.filter(
-        id__in=target_user_ids, is_bot=False
-    ).values_list("id", flat=True)
-
-    if not target_human_user_ids:
-        return set()
-
-    subscribed_recipient_ids = Subscription.objects.filter(
-        user_profile=acting_user,
-        active=True,
-        recipient__type__in=[Recipient.STREAM, Recipient.DIRECT_MESSAGE_GROUP],
-    ).values_list("recipient_id", flat=True)
-
-    common_subscription_user_ids = (
-        Subscription.objects.filter(
-            recipient_id__in=subscribed_recipient_ids,
-            user_profile_id__in=target_human_user_ids,
-            active=True,
-            is_user_active=True,
-        )
-        .distinct("user_profile_id")
-        .values_list("user_profile_id", flat=True)
+    return set(
+        get_inaccessible_users_queryset(target_user_ids, acting_user).values_list("id", flat=True)
     )
-
-    possible_inaccessible_user_ids = set(target_human_user_ids) - set(common_subscription_user_ids)
-    if not possible_inaccessible_user_ids:
-        return set()
-
-    if not acting_user.recipient_id:
-        # If the acting user does not have a recipient_id, they only rely on
-        # direct message groups for 1:1 or self DMs.
-        return possible_inaccessible_user_ids
-
-    target_user_recipient_ids = UserProfile.objects.filter(
-        id__in=possible_inaccessible_user_ids
-    ).values_list("recipient_id", flat=True)
-
-    direct_message_query = Message.objects.filter(
-        recipient__type=Recipient.PERSONAL, realm=acting_user.realm
-    )
-    direct_messages_users = direct_message_query.filter(
-        Q(sender_id__in=possible_inaccessible_user_ids, recipient_id=acting_user.recipient_id)
-        | Q(recipient_id__in=target_user_recipient_ids, sender_id=acting_user.id)
-    ).values_list("sender_id", "recipient__type_id")
-
-    user_ids_involved_in_dms = set()
-    for sender_id, recipient_user_id in direct_messages_users:
-        if sender_id == acting_user.id:
-            user_ids_involved_in_dms.add(recipient_user_id)
-        else:
-            user_ids_involved_in_dms.add(sender_id)
-
-    inaccessible_user_ids = possible_inaccessible_user_ids - user_ids_involved_in_dms
-    return inaccessible_user_ids
 
 
 def get_user_ids_who_can_access_user(target_user: UserProfile) -> list[int]:
@@ -864,21 +845,22 @@ def get_user_ids_who_can_access_user(target_user: UserProfile) -> list[int]:
 
     active_non_guest_user_ids_in_realm = active_non_guest_user_ids(realm.id)
 
-    users_sharing_any_subscription = get_subscribers_of_target_user_subscriptions([target_user])
-    users_involved_in_dms_dict = get_users_involved_in_dms_with_target_users([target_user], realm)
+    users_sharing_any_subscription = get_subscribers_of_target_user_subscriptions(target_user)
 
     user_ids_who_can_access_target_user = (
-        {target_user.id}
-        | set(active_non_guest_user_ids_in_realm)
-        | users_sharing_any_subscription[target_user.id]
-        | users_involved_in_dms_dict[target_user.id]
+        {target_user.id} | set(active_non_guest_user_ids_in_realm) | users_sharing_any_subscription
     )
     return list(user_ids_who_can_access_target_user)
 
 
-def get_subscribers_of_target_user_subscriptions(
+def bulk_get_subscribers_of_target_user_subscriptions(
     target_users: list[UserProfile], include_deactivated_users_for_dm_groups: bool = False
 ) -> dict[int, set[int]]:
+    """Get all users involved in stream and direct message groups with target_users.
+
+    For a single target_user, use the more efficient
+    get_subscribers_of_target_user_subscriptions.
+    """
     target_user_ids = [user.id for user in target_users]
     target_user_subscriptions = (
         Subscription.objects.filter(
@@ -887,21 +869,69 @@ def get_subscribers_of_target_user_subscriptions(
             recipient__type__in=[Recipient.STREAM, Recipient.DIRECT_MESSAGE_GROUP],
         )
         .order_by("user_profile_id")
-        .values("user_profile_id", "recipient_id")
+        .values_list("user_profile_id", "recipient_id", named=True)
     )
 
     target_users_subbed_recipient_ids = set()
     target_user_subscriptions_dict: dict[int, set[int]] = defaultdict(set)
 
-    for user_profile_id, sub_rows in itertools.groupby(
-        target_user_subscriptions, itemgetter("user_profile_id")
+    for user_profile_id, target_sub_rows in itertools.groupby(
+        target_user_subscriptions,
+        attrgetter("user_profile_id"),
     ):
-        recipient_ids = {row["recipient_id"] for row in sub_rows}
+        recipient_ids = {row.recipient_id for row in target_sub_rows}
         target_user_subscriptions_dict[user_profile_id] = recipient_ids
         target_users_subbed_recipient_ids |= recipient_ids
 
     subs_in_target_user_subscriptions_query = Subscription.objects.filter(
         recipient_id__in=list(target_users_subbed_recipient_ids),
+        active=True,
+    )
+
+    # This flag is currently dead code, but we keep it to be consistent
+    # with its equivalent get_subscribers_of_target_user_subscriptions.
+    if include_deactivated_users_for_dm_groups:
+        subs_in_target_user_subscriptions_query = subs_in_target_user_subscriptions_query.filter(
+            Q(recipient__type=Recipient.STREAM, is_user_active=True)
+            | Q(recipient__type=Recipient.DIRECT_MESSAGE_GROUP)
+        )
+    else:
+        subs_in_target_user_subscriptions_query = subs_in_target_user_subscriptions_query.filter(
+            is_user_active=True,
+        )
+
+    subs_in_target_user_subscriptions = subs_in_target_user_subscriptions_query.order_by(
+        "recipient_id"
+    ).values_list("user_profile_id", "recipient_id", named=True)
+
+    subscribers_dict_by_recipient_ids: dict[int, set[int]] = defaultdict(set)
+    for recipient_id, sub_rows in itertools.groupby(
+        subs_in_target_user_subscriptions, attrgetter("recipient_id")
+    ):
+        user_ids = {row.user_profile_id for row in sub_rows}
+        subscribers_dict_by_recipient_ids[recipient_id] = user_ids
+
+    users_subbed_to_target_user_subscriptions_dict: dict[int, set[int]] = defaultdict(set)
+    for target_user_id, target_user_subbed_recipients in target_user_subscriptions_dict.items():
+        for recipient_id in target_user_subbed_recipients:
+            users_subbed_to_target_user_subscriptions_dict[target_user_id] |= (
+                subscribers_dict_by_recipient_ids[recipient_id]
+            )
+
+    return users_subbed_to_target_user_subscriptions_dict
+
+
+def get_subscribers_of_target_user_subscriptions(
+    target_user: UserProfile, include_deactivated_users_for_dm_groups: bool = False
+) -> set[int]:
+    target_user_subbed_recipient_ids = Subscription.objects.filter(
+        user_profile=target_user,
+        active=True,
+        recipient__type__in=[Recipient.STREAM, Recipient.DIRECT_MESSAGE_GROUP],
+    ).values("recipient_id")
+
+    subs_in_target_user_subscriptions_query = Subscription.objects.filter(
+        recipient_id__in=target_user_subbed_recipient_ids,
         active=True,
     )
 
@@ -912,88 +942,10 @@ def get_subscribers_of_target_user_subscriptions(
         )
     else:
         subs_in_target_user_subscriptions_query = subs_in_target_user_subscriptions_query.filter(
-            recipient__type__in=[Recipient.STREAM, Recipient.DIRECT_MESSAGE_GROUP],
             is_user_active=True,
         )
 
-    subs_in_target_user_subscriptions = subs_in_target_user_subscriptions_query.order_by(
-        "recipient_id"
-    ).values("user_profile_id", "recipient_id")
-
-    subscribers_dict_by_recipient_ids: dict[int, set[int]] = defaultdict(set)
-    for recipient_id, sub_rows in itertools.groupby(
-        subs_in_target_user_subscriptions, itemgetter("recipient_id")
-    ):
-        user_ids = {row["user_profile_id"] for row in sub_rows}
-        subscribers_dict_by_recipient_ids[recipient_id] = user_ids
-
-    users_subbed_to_target_user_subscriptions_dict: dict[int, set[int]] = defaultdict(set)
-    for user_id in target_user_ids:
-        target_user_subbed_recipients = target_user_subscriptions_dict[user_id]
-        for recipient_id in target_user_subbed_recipients:
-            users_subbed_to_target_user_subscriptions_dict[user_id] |= (
-                subscribers_dict_by_recipient_ids[recipient_id]
-            )
-
-    return users_subbed_to_target_user_subscriptions_dict
-
-
-def get_users_involved_in_dms_with_target_users(
-    target_users: list[UserProfile], realm: Realm, include_deactivated_users: bool = False
-) -> dict[int, set[int]]:
-    target_user_ids = [user.id for user in target_users]
-
-    direct_messages_recipient_users = (
-        Message.objects.filter(
-            sender_id__in=target_user_ids, realm=realm, recipient__type=Recipient.PERSONAL
-        )
-        .order_by("sender_id")
-        .distinct("sender_id", "recipient__type_id")
-        .values("sender_id", "recipient__type_id")
-    )
-
-    direct_messages_recipient_users_set = {
-        obj["recipient__type_id"] for obj in direct_messages_recipient_users
-    }
-    active_direct_messages_recipient_user_ids = UserProfile.objects.filter(
-        id__in=list(direct_messages_recipient_users_set), is_active=True
-    ).values_list("id", flat=True)
-
-    direct_message_participants_dict: dict[int, set[int]] = defaultdict(set)
-    for sender_id, message_rows in itertools.groupby(
-        direct_messages_recipient_users, itemgetter("sender_id")
-    ):
-        recipient_user_ids = {row["recipient__type_id"] for row in message_rows}
-        if not include_deactivated_users:
-            recipient_user_ids &= set(active_direct_messages_recipient_user_ids)
-
-        direct_message_participants_dict[sender_id] = recipient_user_ids
-
-    personal_recipient_ids_for_target_users = [
-        user.recipient_id for user in target_users if user.recipient_id is not None
-    ]
-    direct_message_senders_query = Message.objects.filter(
-        realm=realm,
-        recipient_id__in=personal_recipient_ids_for_target_users,
-        recipient__type=Recipient.PERSONAL,
-    )
-
-    if not include_deactivated_users:
-        direct_message_senders_query = direct_message_senders_query.filter(sender__is_active=True)
-
-    direct_messages_senders = (
-        direct_message_senders_query.order_by("recipient__type_id")
-        .distinct("sender_id", "recipient__type_id")
-        .values("sender_id", "recipient__type_id")
-    )
-
-    for recipient_user_id, message_rows in itertools.groupby(
-        direct_messages_senders, itemgetter("recipient__type_id")
-    ):
-        sender_ids = {row["sender_id"] for row in message_rows}
-        direct_message_participants_dict[recipient_user_id] |= sender_ids
-
-    return direct_message_participants_dict
+    return set(subs_in_target_user_subscriptions_query.values_list("user_profile_id", flat=True))
 
 
 def user_profile_to_user_row(user_profile: UserProfile) -> RawUserDict:
@@ -1014,6 +966,7 @@ def user_profile_to_user_row(user_profile: UserProfile) -> RawUserDict:
         long_term_idle=user_profile.long_term_idle,
         email_address_visibility=user_profile.email_address_visibility,
         is_imported_stub=user_profile.is_imported_stub,
+        is_deleted=user_profile.is_deleted,
     )
 
 
@@ -1073,24 +1026,17 @@ def get_data_for_inaccessible_user(realm: Realm, user_id: int) -> APIUserDict:
 
 
 def get_accessible_user_ids(
-    realm: Realm, user_profile: UserProfile, include_deactivated_users: bool = False
-) -> list[int]:
-    subscribers_dict_of_target_user_subscriptions = get_subscribers_of_target_user_subscriptions(
-        [user_profile], include_deactivated_users_for_dm_groups=include_deactivated_users
-    )
-    users_involved_in_dms_dict = get_users_involved_in_dms_with_target_users(
-        [user_profile], realm, include_deactivated_users=include_deactivated_users
+    user_profile: UserProfile, include_deactivated_users: bool = False
+) -> set[int]:
+    users_sharing_any_subscription = get_subscribers_of_target_user_subscriptions(
+        user_profile, include_deactivated_users_for_dm_groups=include_deactivated_users
     )
 
     # This does not include bots, because either the caller
     # wants only human users or it handles bots separately.
-    accessible_user_ids = (
-        {user_profile.id}
-        | subscribers_dict_of_target_user_subscriptions[user_profile.id]
-        | users_involved_in_dms_dict[user_profile.id]
-    )
+    accessible_user_ids = {user_profile.id} | users_sharing_any_subscription
 
-    return list(accessible_user_ids)
+    return accessible_user_ids
 
 
 def get_user_dicts_in_realm(
@@ -1106,9 +1052,7 @@ def get_user_dicts_in_realm(
         return (all_user_dicts, [])
 
     assert user_profile is not None
-    accessible_user_ids = get_accessible_user_ids(
-        realm, user_profile, include_deactivated_users=True
-    )
+    accessible_user_ids = get_accessible_user_ids(user_profile, include_deactivated_users=True)
 
     accessible_user_dicts: list[RawUserDict] = []
     inaccessible_user_dicts: list[APIUserDict] = []
@@ -1168,7 +1112,8 @@ def get_users_for_api(
             realm, acting_user, user_ids
         )
 
-    if include_custom_profile_fields:
+    # Spectators must never receive custom profile field values.
+    if include_custom_profile_fields and acting_user is not None:
         base_query = CustomProfileFieldValue.objects.select_related("field")
         # TODO: Consider optimizing this query away with caching.
         if target_user is not None:

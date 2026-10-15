@@ -23,7 +23,7 @@ from zerver.actions.user_settings import do_change_user_setting, do_start_email_
 from zerver.actions.users import do_deactivate_user
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.models import EmailChangeStatus, UserProfile
-from zerver.models.realms import Realm, get_realm
+from zerver.models.realms import get_realm
 from zerver.models.scheduled_jobs import ScheduledEmail
 from zerver.models.users import get_user, get_user_by_delivery_email, get_user_profile_by_id
 
@@ -50,7 +50,7 @@ class EmailChangeTestCase(ZulipTestCase):
         return activation_url
 
     def use_email_change_confirmation_link(self, url: str, follow: bool = False) -> Any:
-        key = url.split("/")[-1]
+        key = url.rsplit("/", 1)[-1]
         response = self.client_post("/accounts/confirm_new_email/", {"key": key}, follow=follow)
         return response
 
@@ -405,25 +405,12 @@ class EmailChangeTestCase(ZulipTestCase):
         self.assertEqual(get_user_by_delivery_email(new_email, user_profile.realm), user_profile)
 
     def test_configure_demo_organization_owner_email(self) -> None:
-        demo_name = "demo owner email test"
-        result = self.submit_demo_creation_form(demo_name)
-        realm = Realm.objects.filter(name=demo_name).latest("date_created")
-        self.assertEqual(result.status_code, 302)
-        self.assertTrue(
-            result["Location"].startswith(
-                f"http://{realm.string_id}.testserver/accounts/login/subdomain"
-            )
-        )
-        self.assertIsNotNone(realm.demo_organization_scheduled_deletion_date)
+        user_profile = self.create_demo_organization_owner()
+        realm = user_profile.realm
 
-        result = self.client_get(result["Location"], subdomain=realm.string_id)
-        self.assertEqual(result.status_code, 302)
-        self.assertEqual(result["Location"], f"http://{realm.string_id}.testserver")
-
-        user_profile = realm.get_first_human_user()
-        assert user_profile is not None
-        self.assert_logged_in_user_id(user_profile.id)
-        self.assertEqual(user_profile.delivery_email, "")
+        # Because demo organization creators don't have an email
+        # set when the organization is created, this user profile
+        # field is set to false.
         self.assertFalse(user_profile.enable_marketing_emails)
 
         data = {"email": "demo-owner@example.com"}

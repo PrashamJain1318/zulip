@@ -3,7 +3,6 @@ from unittest import mock
 
 import orjson
 from django.db import connection
-from django.test import override_settings
 from typing_extensions import override
 
 from zerver.actions.message_flags import do_update_message_flags
@@ -11,6 +10,7 @@ from zerver.actions.streams import do_change_stream_group_based_setting, do_chan
 from zerver.actions.user_groups import check_add_user_group
 from zerver.actions.user_settings import do_change_user_setting
 from zerver.actions.user_topics import do_set_user_topic_visibility_policy
+from zerver.lib.event_types import MessageDetails
 from zerver.lib.fix_unreads import fix, fix_unsubscribed
 from zerver.lib.message import (
     MessageDetailsDict,
@@ -30,8 +30,8 @@ from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import get_subscription
 from zerver.lib.user_message import DEFAULT_HISTORICAL_FLAGS, create_historical_user_messages
 from zerver.models import (
+    Device,
     Message,
-    PushDevice,
     Recipient,
     Stream,
     Subscription,
@@ -41,7 +41,6 @@ from zerver.models import (
 )
 from zerver.models.groups import NamedUserGroup
 from zerver.models.realms import get_realm
-from zerver.models.recipients import get_or_create_direct_message_group
 from zerver.models.streams import get_stream
 
 if TYPE_CHECKING:
@@ -88,18 +87,19 @@ class FirstUnreadAnchorTests(ZulipTestCase):
         self.assertEqual(messages_response["anchor"], new_message_id)
 
         # Test with the old way of expressing use_first_unread_anchor=True
-        messages_response = self.get_messages_response(
-            anchor=0, num_before=0, num_after=1, use_first_unread_anchor=True
-        )
+        with self.assertWarnsRegex(
+            DeprecationWarning, r"^use_first_unread_anchor parameter is deprecated$"
+        ):
+            messages_response = self.get_messages_response(
+                anchor=0, num_before=0, num_after=1, use_first_unread_anchor=True
+            )
         self.assertEqual(messages_response["messages"][0]["id"], new_message_id)
         self.assertEqual(messages_response["anchor"], new_message_id)
 
         # We want to get the message_id of an arbitrary old message. We can
         # call get_messages with use_first_unread_anchor=False and simply
         # save the first message we're returned.
-        messages = self.get_messages(
-            anchor=0, num_before=0, num_after=2, use_first_unread_anchor=False
-        )
+        messages = self.get_messages(anchor=0, num_before=0, num_after=2)
         old_message_id = messages[0]["id"]
 
         # Verify the message is marked as read
@@ -494,6 +494,55 @@ class UnreadCountTests(ZulipTestCase):
             .values_list("message_id", flat=True),
             message_ids,
         )
+
+    def test_update_flags_for_narrow_with_operator(self) -> None:
+        """Test that the with operator in a narrow is correctly handled
+        by the update_message_flags_for_narrow endpoint."""
+        user = self.example_user("hamlet")
+        self.login_user(user)
+        message_ids = [
+            self.send_stream_message(
+                self.example_user("cordelia"), "Verona", topic_name="test topic"
+            )
+            for i in range(5)
+        ]
+
+        # First mark all messages as read.
+        self.assert_json_success(
+            self.client_post(
+                "/json/messages/flags",
+                {
+                    "messages": orjson.dumps(message_ids).decode(),
+                    "op": "add",
+                    "flag": "read",
+                },
+            )
+        )
+
+        # Mark messages as unread using a narrow that includes a
+        # "with" operator, as the web app sends for topic views
+        # accessed via permalink URLs.
+        response = self.assert_json_success(
+            self.client_post(
+                "/json/messages/flags/narrow",
+                {
+                    "anchor": message_ids[0],
+                    "num_before": 0,
+                    "num_after": 999,
+                    "narrow": orjson.dumps(
+                        [
+                            {"operator": "channel", "operand": get_stream("Verona", user.realm).id},
+                            {"operator": "topic", "operand": "test topic"},
+                            {"operator": "with", "operand": str(message_ids[2])},
+                        ]
+                    ).decode(),
+                    "op": "remove",
+                    "flag": "read",
+                },
+            )
+        )
+        self.assertEqual(response["processed_count"], 5)
+        self.assertEqual(response["updated_count"], 5)
 
     def test_update_flags_for_narrow_misuse(self) -> None:
         self.login("hamlet")
@@ -982,7 +1031,7 @@ class PushNotificationMarkReadFlowsTest(ZulipTestCase):
         # Device unregistered. Verify that no event to revoke notifications gets
         # enqueued to `missedmessage_mobile_notifications` and `active_mobile_push_notification`
         # flag is unset.
-        PushDevice.objects.all().delete()
+        Device.objects.filter(push_token_id__isnull=False).delete()
         with (
             mock.patch(
                 "zerver.actions.message_flags.queue_event_on_commit"
@@ -1203,38 +1252,6 @@ class GetUnreadMsgsTest(ZulipTestCase):
             dict(other_user_id=cordelia.id),
         )
 
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_raw_unread_personal_using_direct_message_group(self) -> None:
-        cordelia = self.example_user("cordelia")
-        othello = self.example_user("othello")
-        hamlet = self.example_user("hamlet")
-
-        # creating direct message group for 1:1 messages
-        get_or_create_direct_message_group(id_list=[cordelia.id, hamlet.id])
-        get_or_create_direct_message_group(id_list=[othello.id, hamlet.id])
-
-        cordelia_pm_message_ids = [self.send_personal_message(cordelia, hamlet) for i in range(3)]
-        othello_pm_message_ids = [self.send_personal_message(othello, hamlet) for i in range(3)]
-
-        raw_unread_data = get_raw_unread_data(
-            user_profile=hamlet,
-        )
-        pm_dict = raw_unread_data["pm_dict"]
-
-        self.assertEqual(
-            set(pm_dict.keys()),
-            set(cordelia_pm_message_ids) | set(othello_pm_message_ids),
-        )
-
-        self.assertEqual(
-            pm_dict[cordelia_pm_message_ids[0]],
-            dict(other_user_id=cordelia.id),
-        )
-        self.assertEqual(
-            pm_dict[othello_pm_message_ids[0]],
-            dict(other_user_id=othello.id),
-        )
-
     def test_raw_unread_personal_from_self(self) -> None:
         hamlet = self.example_user("hamlet")
 
@@ -1326,40 +1343,6 @@ class GetUnreadMsgsTest(ZulipTestCase):
 
         self.assertEqual(
             pm_dict[hamlet_msg.id],
-            dict(other_user_id=hamlet.id),
-        )
-
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_raw_unread_personal_from_self_using_direct_message_group(self) -> None:
-        hamlet = self.example_user("hamlet")
-
-        # creating direct message group for self messages
-        get_or_create_direct_message_group(id_list=[hamlet.id])
-
-        # Send a message to ourself.
-        message_id = self.send_personal_message(
-            from_user=hamlet,
-            to_user=hamlet,
-            read_by_sender=False,
-        )
-
-        um = UserMessage.objects.get(
-            user_profile_id=hamlet.id,
-            message_id=message_id,
-        )
-        self.assertFalse(um.flags.read)
-
-        raw_unread_data = get_raw_unread_data(
-            user_profile=hamlet,
-        )
-        pm_dict = raw_unread_data["pm_dict"]
-
-        self.assertEqual(
-            set(pm_dict.keys()),
-            {message_id},
-        )
-        self.assertEqual(
-            pm_dict[message_id],
             dict(other_user_id=hamlet.id),
         )
 
@@ -1691,6 +1674,48 @@ class MessageAccessTests(ZulipTestCase):
 
         um = UserMessage.objects.get(user_profile_id=cordelia.id, message_id=message_id)
         self.assertEqual(um.flags_list(), ["read", "collapsed", "historical"])
+
+    def test_change_hide_link_previews(self) -> None:
+        """
+        You can set/unset hide_link_previews on a message through
+        POST /json/messages/flags, and the flag is per-user.
+        """
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        self.login_user(hamlet)
+        message_id = self.send_personal_message(hamlet, cordelia, "https://example.com")
+
+        # Add the flag.
+        result = self.client_post(
+            "/json/messages/flags",
+            dict(
+                messages=orjson.dumps([message_id]).decode(),
+                op="add",
+                flag="hide_link_previews",
+            ),
+        )
+        self.assert_json_success(result)
+
+        um = UserMessage.objects.get(user_profile_id=hamlet.id, message_id=message_id)
+        self.assertIn("hide_link_previews", um.flags_list())
+
+        # Verify the flag is per-user: cordelia's row is unaffected.
+        um_cordelia = UserMessage.objects.get(user_profile_id=cordelia.id, message_id=message_id)
+        self.assertNotIn("hide_link_previews", um_cordelia.flags_list())
+
+        # Remove the flag.
+        result = self.client_post(
+            "/json/messages/flags",
+            dict(
+                messages=orjson.dumps([message_id]).decode(),
+                op="remove",
+                flag="hide_link_previews",
+            ),
+        )
+        self.assert_json_success(result)
+
+        um.refresh_from_db()
+        self.assertNotIn("hide_link_previews", um.flags_list())
 
     def test_change_star_public_stream_historical(self) -> None:
         """
@@ -2059,11 +2084,11 @@ class MessageAccessTests(ZulipTestCase):
         )
         self.assert_length(filtered_messages, 4)
 
-        # Test private message access for service bot
-        service_bot = self.example_user("outgoing_webhook_bot")
-        self.subscribe(service_bot, stream_name)
+        # Test private message access for message-triggered bot
+        message_triggered_bot = self.example_user("outgoing_webhook_bot")
+        self.subscribe(message_triggered_bot, stream_name)
         filtered_messages = self.assert_bulk_access(
-            service_bot,
+            message_triggered_bot,
             more_message_ids,
             stream,
             bulk_access_messages_query_count=6,
@@ -2124,11 +2149,11 @@ class MessageAccessTests(ZulipTestCase):
         )
         self.assert_length(filtered_messages, 2)
 
-        # Test public message access for service bot
-        service_bot = self.example_user("outgoing_webhook_bot")
-        self.subscribe(service_bot, stream_name)
+        # Test public message access for message-triggered bot
+        message_triggered_bot = self.example_user("outgoing_webhook_bot")
+        self.subscribe(message_triggered_bot, stream_name)
         filtered_messages = self.assert_bulk_access(
-            service_bot,
+            message_triggered_bot,
             message_ids,
             stream,
             bulk_access_messages_query_count=4,
@@ -2229,7 +2254,7 @@ class MarkUnreadTest(ZulipTestCase):
         self.assertEqual(
             message_details,
             {
-                str(message_id): dict(type="private", user_ids=[]),
+                str(message_id): MessageDetails(type="private", user_ids=[]),
             },
         )
 

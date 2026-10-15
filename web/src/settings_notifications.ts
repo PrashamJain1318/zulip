@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 import * as z from "zod/mini";
@@ -11,6 +11,7 @@ import * as banners from "./banners.ts";
 import * as blueslip from "./blueslip.ts";
 import * as channel from "./channel.ts";
 import * as confirm_dialog from "./confirm_dialog.ts";
+import * as desktop_notifications from "./desktop_notifications.ts";
 import * as dropdown_widget from "./dropdown_widget.ts";
 import {$t, $t_html} from "./i18n.ts";
 import * as message_notifications from "./message_notifications.ts";
@@ -122,13 +123,9 @@ function rerender_ui(): void {
 }
 
 function update_desktop_notification_banner(): void {
-    // As is also noted in `navbar_alerts.ts`, notifications *basically*
-    // don't work on any mobile platforms, so don't event show the banners.
-    // This prevents trying to access things that don't exist, like
-    // `Notification.permission` in a mobile context, in which we'll also
-    // hide the ability to send a test notification before exiting with an
-    // early return.
-    if (util.is_mobile()) {
+    // Don't attempt to show the notification banner on UAs
+    // that don't support the Notification API.
+    if (!desktop_notifications.has_notification_support()) {
         $(".send_test_notification").hide();
         return;
     }
@@ -288,6 +285,7 @@ function render_customize_stream_notifications_widget(): void {
         item_click_callback: change_state_of_customize_stream_notifications_widget,
         $events_container: $("#user-notification-settings .notification-settings-form"),
         unique_id_type: "number",
+        no_items_text: $t({defaultMessage: "No channels to customize"}),
     });
     customize_stream_notifications_widget.setup();
 }
@@ -318,11 +316,12 @@ function reset_stream_notifications(elem: HTMLElement): void {
     const sub = sub_store.get(stream_id);
     assert(sub !== undefined);
 
-    const html_body = render_confirm_reset_stream_notifications({sub});
+    const modal_content_html = render_confirm_reset_stream_notifications({sub});
 
     confirm_dialog.launch({
-        html_heading: $t_html({defaultMessage: "Reset to default notifications?"}),
-        html_body,
+        modal_title_html: $t_html({defaultMessage: "Reset to default notifications?"}),
+        modal_content_html,
+        is_compact: true,
         id: "confirm_reset_stream_notifications_modal",
         on_click() {
             do_reset_stream_notifications(elem, sub);
@@ -351,18 +350,23 @@ export function set_up(settings_panel: SettingsPanel): void {
 
     $notification_sound_dropdown.val(settings_object.notification_sound);
 
-    $container.find(".enable_sounds, .enable_stream_audible_notifications").on("change", () => {
-        if (
-            $container.find(".enable_stream_audible_notifications").prop("checked") ||
-            $container.find(".enable_sounds").prop("checked")
-        ) {
-            $notification_sound_dropdown.prop("disabled", false);
-            $notification_sound_dropdown.parent().removeClass("control-label-disabled");
-        } else {
-            $notification_sound_dropdown.prop("disabled", true);
-            $notification_sound_dropdown.parent().addClass("control-label-disabled");
-        }
-    });
+    $container
+        .find(
+            ".enable_sounds, .enable_stream_audible_notifications, .enable_followed_topic_audible_notifications",
+        )
+        .on("change", () => {
+            if (
+                $container.find(".enable_stream_audible_notifications").prop("checked") ||
+                $container.find(".enable_sounds").prop("checked") ||
+                $container.find(".enable_followed_topic_audible_notifications").prop("checked")
+            ) {
+                $notification_sound_dropdown.prop("disabled", false);
+                $notification_sound_dropdown.parent().removeClass("control-label-disabled");
+            } else {
+                $notification_sound_dropdown.prop("disabled", true);
+                $notification_sound_dropdown.parent().addClass("control-label-disabled");
+            }
+        });
 
     set_notification_batching_ui(
         $container,
@@ -503,12 +507,12 @@ export function set_up(settings_panel: SettingsPanel): void {
                 }
             }
             if (enabled_pm_mention_notifications_count === 1) {
-                const html_body = render_confirm_disable_all_notifications();
+                const modal_content_html = render_confirm_disable_all_notifications();
                 $input_elem.prop("checked", user_settings[setting_name]);
 
                 confirm_dialog.launch({
-                    html_heading: $t_html({defaultMessage: "Disable notifications?"}),
-                    html_body,
+                    modal_title_html: $t_html({defaultMessage: "Disable notifications?"}),
+                    modal_content_html,
                     on_click() {
                         change_notification_setting(
                             setting_name,

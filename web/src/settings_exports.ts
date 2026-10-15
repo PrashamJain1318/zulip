@@ -1,8 +1,7 @@
-import $ from "jquery";
+import {$} from "jquery";
 import type * as tippy from "tippy.js";
 import * as z from "zod/mini";
 
-import render_confirm_delete_data_export from "../templates/confirm_dialog/confirm_delete_data_export.hbs";
 import render_export_modal_warning_notes from "../templates/export_modal_warning_notes.hbs";
 import render_allow_private_data_export_banner from "../templates/modal_banner/allow_private_data_export_banner.hbs";
 import render_admin_export_consent_list from "../templates/settings/admin_export_consent_list.hbs";
@@ -50,6 +49,7 @@ export const realm_export_schema = z.object({
     deleted_timestamp: z.nullable(z.number()),
     failed_timestamp: z.nullable(z.number()),
     pending: z.boolean(),
+    export_from_prior_server: z.boolean(),
     export_type: realm_export_type_schema,
 });
 type RealmExport = z.output<typeof realm_export_schema>;
@@ -84,7 +84,8 @@ function sort_user(a: RealmExport, b: RealmExport): number {
     const b_name = people.get_full_name(b.acting_user_id).toLowerCase();
     if (a_name > b_name) {
         return 1;
-    } else if (a_name === b_name) {
+    }
+    if (a_name === b_name) {
         return 0;
     }
     return -1;
@@ -127,6 +128,7 @@ export function populate_exports_table(exports: RealmExport[]): void {
                     time_failed: failed_timestamp,
                     pending: data.pending,
                     time_deleted: deleted_timestamp,
+                    export_from_prior_server: data.export_from_prior_server,
                     export_type_description:
                         settings_config.export_type_values[data.export_type].description,
                 },
@@ -165,7 +167,8 @@ function sort_user_by_name(a: ExportConsent, b: ExportConsent): number {
     const b_name = people.get_full_name(b.user_id).toLowerCase();
     if (a_name > b_name) {
         return 1;
-    } else if (a_name === b_name) {
+    }
+    if (a_name === b_name) {
         return 0;
     }
     return -1;
@@ -191,7 +194,7 @@ const filter_by_consent_options: Option[] = [
 
 function get_export_consents_having_consent_value(consent: boolean): ExportConsent[] {
     const export_consent_list: ExportConsent[] = [];
-    for (const [user_id, user_consent_info] of export_consents.entries()) {
+    for (const [user_id, user_consent_info] of export_consents) {
         const consented = user_consent_info.consented;
         const email_address_visibility = user_consent_info.email_address_visibility;
         if (consent === user_consent_info.consented) {
@@ -209,7 +212,7 @@ function get_export_consents_having_email_visibility_value(
     email_address_visibility_code: number,
 ): ExportConsent[] {
     const export_consent_list: ExportConsent[] = [];
-    for (const [user_id, user_consent_info] of export_consents.entries()) {
+    for (const [user_id, user_consent_info] of export_consents) {
         const consented = user_consent_info.consented;
         const email_address_visibility = user_consent_info.email_address_visibility;
         if (email_address_visibility_code === email_address_visibility) {
@@ -336,17 +339,23 @@ function maybe_show_notes_about_unusable_users_if_exported(
     export_type: settings_config.ExportTypeSlug,
 ): void {
     // Show warnings if there are users whose accounts will be inaccessible
-    // once exported. A user account will be inaccessible if they:
-    //  - Don’t consent to their private data being exported and “Standard
-    //    export” is selected.
-    //  - Have set their email visibility to “nobody” and “Public export”
-    //    is selected.
-    let unusable_user_ids: number[] = [];
+    // once exported. A user account will be inaccessible if:
+    //  - In a standard export: they don’t consent to their private data
+    //    being exported AND their email visibility is set to "nobody".
+    //  - In a public export: they have set their email visibility to
+    //    “nobody”.
+    let unusable_user_ids;
     const $warning_container = $("div#unusable-user-accounts-warning");
     $warning_container.empty();
     if (export_type === settings_config.export_type_values.full_with_consent.slug) {
         const non_consenting_users = get_export_consents_having_consent_value(false);
-        unusable_user_ids = non_consenting_users.map((user) => user.user_id);
+        unusable_user_ids = non_consenting_users
+            .filter(
+                (user) =>
+                    user.email_address_visibility ===
+                    settings_config.email_address_visibility_values.nobody.code,
+            )
+            .map((user) => user.user_id);
     } else if (export_type === settings_config.export_type_values.public.slug) {
         const users_with_inaccessible_email = get_export_consents_having_email_visibility_value(
             settings_config.email_address_visibility_values.nobody.code,
@@ -378,9 +387,8 @@ function maybe_show_notes_about_unusable_users_if_exported(
 }
 
 function show_start_export_modal(): void {
-    const html_body = render_start_export_modal({
+    const modal_content_html = render_start_export_modal({
         export_type_values: get_export_type_options_to_render(),
-        realm_owner_full_content_access: realm.realm_owner_full_content_access,
     });
 
     function start_export(): void {
@@ -444,9 +452,9 @@ function show_start_export_modal(): void {
     }
 
     dialog_widget.launch({
-        html_heading: $t_html({defaultMessage: "Start export?"}),
-        html_body,
-        html_submit_button: $t_html({defaultMessage: "Start export"}),
+        modal_title_html: $t_html({defaultMessage: "Start export?"}),
+        modal_content_html,
+        modal_submit_button_text: $t({defaultMessage: "Start export"}),
         id: "start-export-modal",
         loading_spinner: true,
         on_click: start_export,
@@ -530,11 +538,11 @@ export function set_up(): void {
         const url =
             "/json/export/realm/" +
             encodeURIComponent($button.closest("tr").attr("data-export-id")!);
-        const html_body = render_confirm_delete_data_export();
 
         confirm_dialog.launch({
-            html_heading: $t_html({defaultMessage: "Delete data export?"}),
-            html_body,
+            modal_title_html: $t_html({defaultMessage: "Delete data export?"}),
+            modal_content_html: $t({defaultMessage: "This action cannot be undone."}),
+            is_compact: true,
             on_click() {
                 dialog_widget.submit_api_request(channel.del, url, {});
             },
@@ -592,11 +600,7 @@ export function remove_export_consent_data_and_redraw(user_id: number): void {
 }
 
 export function update_export_consent_data_and_redraw(export_consent: ExportConsent): void {
-    if (!meta.loaded) {
-        return;
-    }
-
-    if (maybe_store_export_consent_data_and_return(export_consent)) {
+    if (!meta.loaded || maybe_store_export_consent_data_and_return(export_consent)) {
         return;
     }
 

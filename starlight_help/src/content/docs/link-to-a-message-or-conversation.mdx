@@ -5,6 +5,7 @@ title: Link to a message or conversation
 import {Steps, TabItem, Tabs} from "@astrojs/starlight/components";
 
 import FlattenedSteps from "../../components/FlattenedSteps.astro";
+import KeyboardTip from "../../components/KeyboardTip.astro";
 import ZulipNote from "../../components/ZulipNote.astro";
 import ZulipTip from "../../components/ZulipTip.astro";
 import ChannelActions from "../include/_ChannelActions.mdx";
@@ -147,6 +148,10 @@ When you send your message, the link will appear as
       1. Click **Copy link to message**.
     </FlattenedSteps>
 
+    <KeyboardTip>
+      You can also use <kbd>L</kbd> to copy a link to the selected message.
+    </KeyboardTip>
+
     <ZulipTip>
       If using Zulip in a browser, you can also click on the timestamp
       of a message, and copy the URL from your browser's address bar.
@@ -223,6 +228,34 @@ it is automatically formatted for you. You can use
     </FlattenedSteps>
   </TabItem>
 </Tabs>
+
+## View links to and from a conversation
+
+Zulip can show you how a [conversation](/help/reading-conversations) is connected
+to others through links, making it easy to navigate between related discussions.
+
+* **Links to** shows the conversations that messages in the current conversation
+  link to.
+* **Linked from** shows the conversations whose messages link to the current
+  conversation.
+
+<Tabs>
+  <TabItem label="Desktop/Web">
+    <FlattenedSteps>
+      <TopicActions />
+
+      1. Click **View links**.
+    </FlattenedSteps>
+  </TabItem>
+</Tabs>
+
+The **View links** option appears only when a conversation has links to or from
+it.
+
+<ZulipTip>
+  These lists are built from messages Zulip has loaded in your current session,
+  so they may be incomplete until you have visited the relevant conversations.
+</ZulipTip>
 
 ## Related articles
 

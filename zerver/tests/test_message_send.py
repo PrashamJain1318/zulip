@@ -78,15 +78,9 @@ from zerver.models import (
 from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
 from zerver.models.groups import SystemGroups
 from zerver.models.realms import RealmTopicsPolicyEnum, get_realm
-from zerver.models.recipients import get_direct_message_group, get_or_create_direct_message_group
+from zerver.models.recipients import get_or_create_direct_message_group
 from zerver.models.streams import StreamTopicsPolicyEnum, get_stream
-from zerver.models.users import (
-    get_system_bot,
-    get_user,
-    get_user_by_delivery_email,
-    is_cross_realm_bot_email,
-)
-from zerver.views.message_send import InvalidMirrorInputError
+from zerver.models.users import get_system_bot, get_user_by_delivery_email, is_cross_realm_bot_email
 
 
 class MessagePOSTTest(ZulipTestCase):
@@ -854,6 +848,158 @@ class MessagePOSTTest(ZulipTestCase):
         content = self.assert_json_success(result)
         assert "automatic_new_visibility_policy" not in content
 
+    def test_message_url_in_api_response(self) -> None:
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+
+        # A subscribed sender has metadata access, so the URL includes the
+        # channel name and message_link is the "Copy link to message" Markdown.
+        stream = get_stream("Verona", hamlet.realm)
+        result = self.api_post(
+            hamlet,
+            "/api/v1/messages",
+            {
+                "type": "channel",
+                "to": orjson.dumps(stream.name).decode(),
+                "content": "Test message",
+                "topic": "Test topic",
+            },
+        )
+        response_dict = self.assert_json_success(result)
+        message_id = response_dict["id"]
+        self.assertEqual(
+            response_dict["message_url"],
+            f"http://zulip.testserver/#narrow/channel/{stream.id}-{stream.name}"
+            f"/topic/Test.20topic/near/{message_id}",
+        )
+        # message_link embeds the same absolute URL as message_url, so the
+        # link stays valid when used outside Zulip.
+        self.assertEqual(
+            response_dict["message_link"],
+            f"[#{stream.name} > Test topic @ 💬]({response_dict['message_url']})",
+        )
+
+        # A DM has no channel name to protect and no standard label, so
+        # message_link is just the URL.
+        result = self.api_post(
+            hamlet,
+            "/api/v1/messages",
+            {
+                "type": "direct",
+                "content": "Test message",
+                "to": orjson.dumps([othello.id]).decode(),
+            },
+        )
+        response_dict = self.assert_json_success(result)
+        message_id = response_dict["id"]
+        dm_slug = ",".join(str(user_id) for user_id in sorted([hamlet.id, othello.id]))
+        self.assertEqual(
+            response_dict["message_url"],
+            f"http://zulip.testserver/#narrow/dm/{dm_slug}/near/{message_id}",
+        )
+        self.assertEqual(response_dict["message_link"], response_dict["message_url"])
+
+        # A bot posting to a private channel via its owner's subscription
+        # (without being subscribed itself) can send but lacks metadata
+        # access, so it gets an ID-only URL with the channel name omitted.
+        private_stream = self.make_stream("private channel", invite_only=True)
+        self.subscribe(hamlet, private_stream.name)
+        bot = self.create_test_bot("writeonly", hamlet)
+        # Resolving metadata access for such a bot must not add a query:
+        # it reaches the check without its group memberships loaded, and we
+        # treat those as empty rather than looking them up.
+        flush_per_request_caches()
+        with self.assert_database_query_count(20):
+            result = self.api_post(
+                bot,
+                "/api/v1/messages",
+                {
+                    "type": "channel",
+                    "to": orjson.dumps(private_stream.name).decode(),
+                    "content": "Test message",
+                    "topic": "Test topic",
+                },
+            )
+        response_dict = self.assert_json_success(result)
+        message_id = response_dict["id"]
+        self.assertEqual(
+            response_dict["message_url"],
+            f"http://zulip.testserver/#narrow/channel/{private_stream.id}"
+            f"/topic/Test.20topic/near/{message_id}",
+        )
+        self.assertNotIn("private", response_dict["message_url"])
+        self.assertEqual(response_dict["message_link"], response_dict["message_url"])
+
+        # A sender whose metadata access comes solely from a group (here
+        # can_subscribe_group), without being directly subscribed, still
+        # sees the channel name: the send path resolves metadata access
+        # from the recursive group memberships it already looked up to
+        # authorize the send, so the URL includes the channel name.
+        group_access_stream = self.make_stream(
+            "group access channel", invite_only=True, history_public_to_subscribers=True
+        )
+        othello_group = check_add_user_group(
+            othello.realm, "othello_group", [othello], acting_user=othello
+        )
+        do_change_stream_group_based_setting(
+            group_access_stream,
+            "can_subscribe_group",
+            othello_group,
+            acting_user=othello,
+        )
+        result = self.api_post(
+            othello,
+            "/api/v1/messages",
+            {
+                "type": "channel",
+                "to": orjson.dumps(group_access_stream.name).decode(),
+                "content": "Test message",
+                "topic": "Test topic",
+            },
+        )
+        response_dict = self.assert_json_success(result)
+        message_id = response_dict["id"]
+        self.assertEqual(
+            response_dict["message_url"],
+            f"http://zulip.testserver/#narrow/channel/{group_access_stream.id}-group-access-channel"
+            f"/topic/Test.20topic/near/{message_id}",
+        )
+        self.assertEqual(
+            response_dict["message_link"],
+            f"[#{group_access_stream.name} > Test topic @ 💬]({response_dict['message_url']})",
+        )
+
+        # A long-term-idle subscriber still gets the channel name. Idle
+        # subscribers are omitted from the send-recipient rows, but the send
+        # path confirms the sender's subscription while authorizing the
+        # message, so metadata access is resolved from that rather than the
+        # rows.
+        idle_stream = self.make_stream("idle private channel", invite_only=True)
+        self.subscribe(othello, idle_stream.name)
+        othello.long_term_idle = True
+        othello.save(update_fields=["long_term_idle"])
+        result = self.api_post(
+            othello,
+            "/api/v1/messages",
+            {
+                "type": "channel",
+                "to": orjson.dumps(idle_stream.name).decode(),
+                "content": "Test message",
+                "topic": "Test topic",
+            },
+        )
+        response_dict = self.assert_json_success(result)
+        message_id = response_dict["id"]
+        self.assertEqual(
+            response_dict["message_url"],
+            f"http://zulip.testserver/#narrow/channel/{idle_stream.id}-idle-private-channel"
+            f"/topic/Test.20topic/near/{message_id}",
+        )
+        self.assertEqual(
+            response_dict["message_link"],
+            f"[#{idle_stream.name} > Test topic @ 💬]({response_dict['message_url']})",
+        )
+
     def test_personal_message(self) -> None:
         """
         Sending a personal message to a valid username is successful.
@@ -873,9 +1019,10 @@ class MessagePOSTTest(ZulipTestCase):
         message_id = orjson.loads(result.content)["id"]
 
         recent_conversations = get_recent_private_conversations(user_profile)
-        [(recipient_id, recent_conversation)] = recent_conversations.items()
-        self.assertEqual(set(recent_conversation["user_ids"]), {othello.id})
-        self.assertEqual(recent_conversation["max_message_id"], message_id)
+        self.assert_length(recent_conversations, 1)
+        user_id_set = next(iter(recent_conversations))
+        self.assertEqual(user_id_set, {othello.id})
+        self.assertEqual(recent_conversations[user_id_set], message_id)
 
         # Now send a message to yourself and see how that interacts with the data structure
         result = self.client_post(
@@ -891,21 +1038,19 @@ class MessagePOSTTest(ZulipTestCase):
 
         recent_conversations = get_recent_private_conversations(user_profile)
         self.assert_length(recent_conversations, 2)
-        recent_conversation = recent_conversations[recipient_id]
-        self.assertEqual(set(recent_conversation["user_ids"]), {othello.id})
-        self.assertEqual(recent_conversation["max_message_id"], message_id)
+        self.assertEqual(recent_conversations[frozenset([othello.id])], message_id)
 
         # Now verify we have the appropriate self-pm data structure
-        del recent_conversations[recipient_id]
-        [(recipient_id, recent_conversation)] = recent_conversations.items()
-        self.assertEqual(set(recent_conversation["user_ids"]), set())
-        self.assertEqual(recent_conversation["max_message_id"], self_message_id)
+        self.assertEqual(recent_conversations[frozenset()], self_message_id)
 
     def test_personal_message_by_id(self) -> None:
         """
         Sending a personal message to a valid user ID is successful
         for both valid strings for `type` parameter.
         """
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+
         self.login("hamlet")
         recipient_type_name = ["direct", "private"]
 
@@ -915,14 +1060,14 @@ class MessagePOSTTest(ZulipTestCase):
                 {
                     "type": type,
                     "content": "Test message",
-                    "to": orjson.dumps([self.example_user("othello").id]).decode(),
+                    "to": orjson.dumps([othello.id]).decode(),
                 },
             )
             self.assert_json_success(result)
 
             msg = self.get_last_message()
             self.assertEqual("Test message", msg.content)
-            self.assertEqual(msg.recipient_id, self.example_user("othello").recipient_id)
+            self.assertEqual(msg.recipient_id, self.get_dm_group_recipient(hamlet, othello).id)
 
     def test_group_personal_message_by_id(self) -> None:
         """
@@ -974,8 +1119,8 @@ class MessagePOSTTest(ZulipTestCase):
         )
         self.assert_json_success(result)
         msg = self.get_last_message()
-        # Verify that we're not actually on the "recipient list"
-        self.assertNotIn("Hamlet", str(msg.recipient))
+        # Verify that we're actually on the "recipient list"
+        self.assertEqual(msg.recipient, self.get_dm_group_recipient(hamlet, othello))
 
     def test_personal_message_to_nonexistent_user(self) -> None:
         """
@@ -1198,80 +1343,129 @@ class MessagePOSTTest(ZulipTestCase):
         )
         self.assert_json_error(result, "Message must have recipients")
 
-    def test_mirrored_direct_message_group(self) -> None:
+    def test_forged_direct_message(self) -> None:
         """
-        Sending a mirrored group direct message works
+        A user with can_forge_sender can send a direct message as another
+        user in their organization.
         """
+        cordelia = self.example_user("cordelia")
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+        do_change_can_forge_sender(cordelia, True)
+
         result = self.api_post(
-            self.mit_user("starnine"),
+            cordelia,
             "/api/v1/messages",
             {
                 "type": "direct",
-                "sender": self.mit_email("sipbtest"),
+                "sender": hamlet.email,
                 "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps(
-                    [self.mit_email("starnine"), self.mit_email("espuser")]
-                ).decode(),
+                "to": orjson.dumps([cordelia.id, othello.id]).decode(),
             },
-            subdomain="zephyr",
         )
         self.assert_json_success(result)
 
-    def test_mirrored_personal(self) -> None:
-        """
-        Sending a mirrored personal message works
-        """
+        message = self.get_last_message()
+        self.assertEqual(message.sender_id, hamlet.id)
+        self.assertEqual(message.content, "Test message")
+
+    def test_forged_direct_message_without_permission(self) -> None:
+        cordelia = self.example_user("cordelia")
+        hamlet = self.example_user("hamlet")
+
         result = self.api_post(
-            self.mit_user("starnine"),
+            cordelia,
             "/api/v1/messages",
             {
                 "type": "direct",
-                "sender": self.mit_email("sipbtest"),
+                "sender": hamlet.email,
                 "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([self.mit_email("starnine")]).decode(),
+                "to": orjson.dumps([cordelia.id]).decode(),
             },
-            subdomain="zephyr",
-        )
-        self.assert_json_success(result)
-
-    def test_mirrored_personal_browser(self) -> None:
-        """
-        Sending a mirrored personal message via the browser should not work.
-        """
-        user = self.mit_user("starnine")
-        self.login_user(user)
-        result = self.client_post(
-            "/json/messages",
-            {
-                "type": "direct",
-                "sender": self.mit_email("sipbtest"),
-                "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([self.mit_email("starnine")]).decode(),
-            },
-            subdomain="zephyr",
-        )
-        self.assert_json_error(result, "Invalid mirrored message")
-
-    def test_mirrored_personal_to_someone_else(self) -> None:
-        """
-        Sending a mirrored personal message to someone else is not allowed.
-        """
-        result = self.api_post(
-            self.mit_user("starnine"),
-            "/api/v1/messages",
-            {
-                "type": "direct",
-                "sender": self.mit_email("sipbtest"),
-                "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([self.mit_email("espuser")]).decode(),
-            },
-            subdomain="zephyr",
         )
         self.assert_json_error(result, "User not authorized for this query")
+
+    def test_forged_direct_message_to_conversation_one_is_not_in(self) -> None:
+        """
+        Forging a direct message is limited to conversations that the
+        forging user is part of themselves.
+        """
+        cordelia = self.example_user("cordelia")
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+        do_change_can_forge_sender(cordelia, True)
+
+        result = self.api_post(
+            cordelia,
+            "/api/v1/messages",
+            {
+                "type": "direct",
+                "sender": hamlet.email,
+                "content": "Test message",
+                "to": orjson.dumps([othello.id]).decode(),
+            },
+        )
+        self.assert_json_error(result, "User not authorized for this query")
+
+    def test_forged_direct_message_with_forged_flag(self) -> None:
+        """
+        Setting the `forged` flag lifts the restriction to conversations
+        that the forging user is part of themselves.
+        """
+        cordelia = self.example_user("cordelia")
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+        do_change_can_forge_sender(cordelia, True)
+
+        result = self.api_post(
+            cordelia,
+            "/api/v1/messages",
+            {
+                "type": "direct",
+                "sender": hamlet.email,
+                "forged": "true",
+                "content": "Test message",
+                "to": orjson.dumps([othello.id]).decode(),
+            },
+        )
+        self.assert_json_success(result)
+
+        direct_message_group = get_or_create_direct_message_group([hamlet.id, othello.id])
+        message = self.get_last_message()
+        self.assertEqual(message.sender_id, hamlet.id)
+        self.assertEqual(message.recipient_id, direct_message_group.recipient_id)
+
+    def test_forged_sender_must_be_an_existing_user(self) -> None:
+        cordelia = self.example_user("cordelia")
+        do_change_can_forge_sender(cordelia, True)
+
+        result = self.api_post(
+            cordelia,
+            "/api/v1/messages",
+            {
+                "type": "direct",
+                "sender": "irc-user@irc.zulip.com",
+                "content": "Test message",
+                "to": orjson.dumps([cordelia.id]).decode(),
+            },
+        )
+        self.assert_json_error(result, "No such user")
+
+    def test_forged_sender_cannot_be_in_another_organization(self) -> None:
+        cordelia = self.example_user("cordelia")
+        do_change_can_forge_sender(cordelia, True)
+
+        result = self.api_post(
+            cordelia,
+            "/api/v1/messages",
+            {
+                "type": "direct",
+                "sender": self.mit_email("sipbtest"),
+                "content": "Test message",
+                "to": orjson.dumps([cordelia.id]).decode(),
+            },
+        )
+        self.assert_json_error(result, "No such user")
 
     def test_message_with_null_bytes(self) -> None:
         """
@@ -1373,137 +1567,36 @@ class MessagePOSTTest(ZulipTestCase):
         )
         self.assert_json_error(result, "User not authorized for this query")
 
-    def test_send_message_when_sender_is_not_set(self) -> None:
-        result = self.api_post(
-            self.mit_user("starnine"),
-            "/api/v1/messages",
-            {
-                "type": "direct",
-                "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([self.mit_email("starnine")]).decode(),
-            },
-            subdomain="zephyr",
-        )
-        self.assert_json_error(result, "Missing sender")
+    def test_forged_channel_message(self) -> None:
+        hamlet = self.example_user("hamlet")
+        bot = self.create_test_bot(short_name="forger", user_profile=self.example_user("cordelia"))
+        do_change_can_forge_sender(bot, True)
+        self.subscribe(bot, "Verona")
 
-    def test_send_message_as_not_superuser_when_type_is_not_private(self) -> None:
-        result = self.api_post(
-            self.mit_user("starnine"),
-            "/api/v1/messages",
-            {
-                "type": "channel",
-                "sender": self.mit_email("sipbtest"),
-                "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([self.mit_email("starnine")]).decode(),
-            },
-            subdomain="zephyr",
-        )
-        self.assert_json_error(result, "User not authorized for this query")
+        # A forged message can carry the timestamp of the message that
+        # it was copied from, in both the modern and legacy spellings.
+        for forged_value in ["true", "yes"]:
+            fake_date_sent = timezone_now() - timedelta(minutes=37)
+            fake_timestamp = datetime_to_timestamp(fake_date_sent)
 
-    @mock.patch("zerver.views.message_send.create_mirrored_message_users")
-    def test_send_message_create_mirrored_message_user_returns_invalid_input(
-        self, create_mirrored_message_users_mock: Any
-    ) -> None:
-        create_mirrored_message_users_mock.side_effect = InvalidMirrorInputError()
-        result = self.api_post(
-            self.mit_user("starnine"),
-            "/api/v1/messages",
-            {
-                "type": "direct",
-                "sender": self.mit_email("sipbtest"),
-                "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([self.mit_email("starnine")]).decode(),
-            },
-            subdomain="zephyr",
-        )
-        self.assert_json_error(result, "Invalid mirrored message")
+            result = self.api_post(
+                bot,
+                "/api/v1/messages",
+                {
+                    "type": "channel",
+                    "forged": forged_value,
+                    "time": fake_timestamp,
+                    "sender": hamlet.email,
+                    "content": "Test message",
+                    "topic": "forged",
+                    "to": orjson.dumps("Verona").decode(),
+                },
+            )
+            self.assert_json_success(result)
 
-    @mock.patch("zerver.views.message_send.create_mirrored_message_users")
-    def test_send_message_when_client_is_mirror_but_recipient_is_user_id(
-        self, create_mirrored_message_users_mock: Any
-    ) -> None:
-        create_mirrored_message_users_mock.return_value = mock.Mock()
-        user = self.mit_user("starnine")
-        self.login_user(user)
-        result = self.api_post(
-            user,
-            "/api/v1/messages",
-            {
-                "type": "direct",
-                "sender": self.mit_email("sipbtest"),
-                "content": "Test message",
-                "client": "irc_mirror",
-                "to": orjson.dumps([user.id]).decode(),
-            },
-            subdomain="zephyr",
-        )
-        self.assert_json_error(result, "Mirroring not allowed with recipient user IDs")
-
-    def test_send_message_irc_mirror(self) -> None:
-        reset_email_visibility_to_everyone_in_zulip_realm()
-        self.login("hamlet")
-        bot_info = {
-            "full_name": "IRC bot",
-            "short_name": "irc",
-        }
-        result = self.client_post("/json/bots", bot_info)
-        self.assert_json_success(result)
-
-        email = "irc-bot@zulip.testserver"
-        user = get_user(email, get_realm("zulip"))
-        user.can_forge_sender = True
-        user.save()
-        user = get_user(email, get_realm("zulip"))
-        self.subscribe(user, "IRCland")
-
-        # Simulate a mirrored message with a slightly old timestamp.
-        fake_date_sent = timezone_now() - timedelta(minutes=37)
-        fake_timestamp = datetime_to_timestamp(fake_date_sent)
-
-        result = self.api_post(
-            user,
-            "/api/v1/messages",
-            {
-                "type": "channel",
-                "forged": "true",
-                "time": fake_timestamp,
-                "sender": "irc-user@irc.zulip.com",
-                "content": "Test message",
-                "client": "irc_mirror",
-                "topic": "from irc",
-                "to": orjson.dumps("IRCLand").decode(),
-            },
-        )
-        self.assert_json_success(result)
-
-        msg = self.get_last_message()
-        self.assertEqual(int(datetime_to_timestamp(msg.date_sent)), int(fake_timestamp))
-
-        # Now test again using forged=yes
-        fake_date_sent = timezone_now() - timedelta(minutes=22)
-        fake_timestamp = datetime_to_timestamp(fake_date_sent)
-
-        result = self.api_post(
-            user,
-            "/api/v1/messages",
-            {
-                "type": "channel",
-                "forged": "yes",
-                "time": fake_timestamp,
-                "sender": "irc-user@irc.zulip.com",
-                "content": "Test message",
-                "client": "irc_mirror",
-                "topic": "from irc",
-                "to": orjson.dumps("IRCLand").decode(),
-            },
-        )
-        self.assert_json_success(result)
-
-        msg = self.get_last_message()
-        self.assertEqual(int(datetime_to_timestamp(msg.date_sent)), int(fake_timestamp))
+            message = self.get_last_message()
+            self.assertEqual(message.sender_id, hamlet.id)
+            self.assertEqual(int(datetime_to_timestamp(message.date_sent)), int(fake_timestamp))
 
     def test_send_message_in_archived_stream(self) -> None:
         self.login("hamlet")
@@ -1542,9 +1635,9 @@ class MessagePOSTTest(ZulipTestCase):
 
         self.unsubscribe(cordelia, stream_name)
 
-        # As long as Cordelia cam_forge_sender, she can send messages
-        # to ANY stream, even one she is not unsubscribed to, and
-        # she can do it for herself or on behalf of a mirrored user.
+        # As long as Cordelia can_forge_sender, she can send messages
+        # to ANY stream, even one she is not subscribed to, and she
+        # can do it for herself or on behalf of another user.
 
         def test_with(sender_email: str, client: str, forged: bool) -> None:
             payload = dict(
@@ -1556,7 +1649,7 @@ class MessagePOSTTest(ZulipTestCase):
                 forged=orjson.dumps(forged).decode(),
             )
 
-            # Only pass the 'sender' property when doing mirroring behavior.
+            # Only pass the 'sender' property when forging a sender.
             if forged:
                 payload["sender"] = sender_email
 
@@ -1579,8 +1672,8 @@ class MessagePOSTTest(ZulipTestCase):
         )
 
         test_with(
-            sender_email="irc_person@zulip.com",
-            client="irc_mirror",
+            sender_email=self.example_user("hamlet").email,
+            client="test suite",
             forged=True,
         )
 
@@ -1786,7 +1879,7 @@ class StreamMessagesTest(ZulipTestCase):
             setting_value=UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_NEVER,
             acting_user=None,
         )
-        with self.assert_database_query_count(14):
+        with self.assert_database_query_count(15):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1806,7 +1899,7 @@ class StreamMessagesTest(ZulipTestCase):
         # 5 queries: 1 to check if it is the first message in the topic +
         # 1 to check if the topic is already followed + 3 to follow the topic.
         flush_per_request_caches()
-        with self.assert_database_query_count(19):
+        with self.assert_database_query_count(20):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1826,7 +1919,7 @@ class StreamMessagesTest(ZulipTestCase):
         # a message to a topic with visibility policy other than FOLLOWED.
         # 1 to check if the topic is already followed + 3 queries to follow the topic.
         flush_per_request_caches()
-        with self.assert_database_query_count(18):
+        with self.assert_database_query_count(19):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1837,7 +1930,7 @@ class StreamMessagesTest(ZulipTestCase):
         # If the topic is already FOLLOWED, there will be an increase in the query
         # count of 1 to check if the topic is already followed.
         flush_per_request_caches()
-        with self.assert_database_query_count(15):
+        with self.assert_database_query_count(16):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1862,7 +1955,7 @@ class StreamMessagesTest(ZulipTestCase):
         # 1 to get the user_id of the mentioned user + 1 to check if the topic
         # is already followed + 3 queries to follow the topic.
         flush_per_request_caches()
-        with self.assert_database_query_count(23):
+        with self.assert_database_query_count(24):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1875,7 +1968,7 @@ class StreamMessagesTest(ZulipTestCase):
         # 1 to get the user_id of the mentioned user + 1 to check if the topic is
         # already followed.
         flush_per_request_caches()
-        with self.assert_database_query_count(20):
+        with self.assert_database_query_count(21):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1885,7 +1978,7 @@ class StreamMessagesTest(ZulipTestCase):
             )
 
         flush_per_request_caches()
-        with self.assert_database_query_count(17):
+        with self.assert_database_query_count(18):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1908,7 +2001,7 @@ class StreamMessagesTest(ZulipTestCase):
         )
         flush_per_request_caches()
 
-        with self.assert_database_query_count(18):
+        with self.assert_database_query_count(19):
             check_send_stream_message(
                 sender=sender,
                 client=sending_client,
@@ -1931,7 +2024,6 @@ class StreamMessagesTest(ZulipTestCase):
             client_gravatar=False,
             allow_empty_topic_name=True,
             realm=user_profile.realm,
-            user_recipient_id=None,
         )
         self.assertEqual(dct["display_recipient"], "Denmark")
 
@@ -1991,6 +2083,47 @@ class StreamMessagesTest(ZulipTestCase):
         self.send_personal_message(self.example_user("hamlet"), user_profile, content="test")
         message = most_recent_message(user_profile)
         self.assertFalse(message.is_channel_message)
+
+    def test_realm_guest_user_ids_in_message_event(self) -> None:
+        hamlet = self.example_user("hamlet")
+        polonius = self.example_user("polonius")
+
+        # Events for public channel messages include all active guest
+        # users in the realm, whether or not they are subscribed.
+        stream_name = "Test stream"
+        self.subscribe(hamlet, stream_name)
+        with self.capture_send_event_calls(expected_num_events=1) as events:
+            self.send_stream_message(
+                hamlet,
+                stream_name,
+                content="test",
+                skip_capture_on_commit_callbacks=True,
+            )
+        self.assertEqual(events[0]["event"]["realm_guest_user_ids"], [polonius.id])
+
+        # The field is not attached to events for private channel
+        # messages or direct messages as we do not send events to
+        # clients in realm_clients_all_streams for these messages.
+        private_stream_name = "Private test stream"
+        self.make_stream(private_stream_name, invite_only=True)
+        self.subscribe(hamlet, private_stream_name)
+        with self.capture_send_event_calls(expected_num_events=1) as events:
+            self.send_stream_message(
+                hamlet,
+                private_stream_name,
+                content="test",
+                skip_capture_on_commit_callbacks=True,
+            )
+        self.assertNotIn("realm_guest_user_ids", events[0]["event"])
+
+        with self.capture_send_event_calls(expected_num_events=1) as events:
+            self.send_personal_message(
+                hamlet,
+                polonius,
+                content="test",
+                skip_capture_on_commit_callbacks=True,
+            )
+        self.assertNotIn("realm_guest_user_ids", events[0]["event"])
 
     def _send_stream_message(self, user: UserProfile, stream_name: str, content: str) -> set[int]:
         with self.capture_send_event_calls(expected_num_events=1) as events:
@@ -2579,7 +2712,7 @@ class StreamMessagesTest(ZulipTestCase):
         result = self.api_get(cordelia, "/api/v1/messages/" + str(msg_id))
         self.assert_json_success(result)
 
-    def test_stream_message_mirroring(self) -> None:
+    def test_stream_message_forging(self) -> None:
         user = self.mit_user("starnine")
         self.subscribe(user, "Verona")
 
@@ -2591,7 +2724,6 @@ class StreamMessagesTest(ZulipTestCase):
                 "type": "channel",
                 "to": orjson.dumps("Verona").decode(),
                 "sender": self.mit_email("sipbtest"),
-                "client": "irc_mirror",
                 "topic": "announcement",
                 "content": "Everyone knows Iago rules",
                 "forged": "true",
@@ -2608,7 +2740,6 @@ class StreamMessagesTest(ZulipTestCase):
                 "type": "channel",
                 "to": orjson.dumps("Verona").decode(),
                 "sender": self.mit_email("sipbtest"),
-                "client": "irc_mirror",
                 "topic": "announcement",
                 "content": "Everyone knows Iago rules",
                 "forged": "true",
@@ -2664,17 +2795,12 @@ class StreamMessagesTest(ZulipTestCase):
         self.assert_length(msg_data["huddle_dict"].keys(), 2)
 
         recent_conversations = get_recent_private_conversations(users[1])
-        [recent_conversation] = recent_conversations.values()
-        self.assertEqual(
-            set(recent_conversation["user_ids"]), {user.id for user in users if user != users[1]}
-        )
-        self.assertEqual(recent_conversation["max_message_id"], message2_id)
+        user_set = frozenset(user.id for user in users if user != users[1])
+        self.assertEqual(recent_conversations[user_set], message2_id)
 
     def test_get_raw_unread_data_for_1_to_1_dms_using_group_direct_message(self) -> None:
         sender = self.example_user("hamlet")
         receiver = self.example_user("cordelia")
-        receiver.recipient = None
-        receiver.save()
 
         message1_id = self.send_personal_message(sender, receiver, "test content 1")
         message2_id = self.send_personal_message(sender, receiver, "test content 2")
@@ -2688,9 +2814,7 @@ class StreamMessagesTest(ZulipTestCase):
         self.assertIn(message2_id, msg_data["pm_dict"].keys())
 
         recent_conversations = get_recent_private_conversations(receiver)
-        [recent_conversation] = recent_conversations.values()
-        self.assertEqual(set(recent_conversation["user_ids"]), {sender.id})
-        self.assertEqual(recent_conversation["max_message_id"], message2_id)
+        self.assertEqual(recent_conversations[frozenset([sender.id])], message2_id)
 
     def test_stream_becomes_active_on_message_send(self) -> None:
         # Mark a stream as inactive
@@ -2722,27 +2846,6 @@ class StreamMessagesTest(ZulipTestCase):
 
 class PersonalMessageSendTest(ZulipTestCase):
     def test_personal_to_self(self) -> None:
-        """
-        If you send a personal to yourself, only you see it.
-        """
-        old_user_profiles = list(UserProfile.objects.all())
-        test_email = self.nonreg_email("test1")
-        self.register(test_email, "test1")
-
-        old_messages = list(map(message_stream_count, old_user_profiles))
-
-        user_profile = self.nonreg_user("test1")
-        self.send_personal_message(user_profile, user_profile)
-
-        new_messages = list(map(message_stream_count, old_user_profiles))
-        self.assertEqual(old_messages, new_messages)
-
-        user_profile = self.nonreg_user("test1")
-        recipient = Recipient.objects.get(type_id=user_profile.id, type=Recipient.PERSONAL)
-        self.assertEqual(most_recent_message(user_profile).recipient, recipient)
-
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_personal_to_self_using_direct_message_group(self) -> None:
         """
         If you send a personal to yourself using direct_message_group, only you see it.
         """
@@ -2786,14 +2889,7 @@ class PersonalMessageSendTest(ZulipTestCase):
         self.assertEqual(message_stream_count(sender), sender_messages + 1)
         self.assertEqual(message_stream_count(receiver), receiver_messages + 1)
 
-        direct_message_group = get_direct_message_group([sender.id, receiver.id])
-        has_none_recipient = receiver.recipient is None or sender.recipient is None
-        if has_none_recipient:
-            recipient = get_or_create_direct_message_group([sender.id, receiver.id]).recipient
-        elif settings.PREFER_DIRECT_MESSAGE_GROUP and direct_message_group:
-            recipient = direct_message_group.recipient
-        else:
-            recipient = Recipient.objects.get(type_id=receiver.id, type=Recipient.PERSONAL)
+        recipient = get_or_create_direct_message_group([sender.id, receiver.id]).recipient
 
         self.assertEqual(most_recent_message(sender).recipient, recipient)
         self.assertEqual(most_recent_message(receiver).recipient, recipient)
@@ -2801,17 +2897,6 @@ class PersonalMessageSendTest(ZulipTestCase):
         self.assertEqual(most_recent_message(receiver).topic_name(), Message.DM_TOPIC)
 
     def test_personal(self) -> None:
-        """
-        If you send a personal, only you and the recipient see it.
-        """
-        self.login("hamlet")
-        self.assert_personal(
-            sender=self.example_user("hamlet"),
-            receiver=self.example_user("othello"),
-        )
-
-    @override_settings(PREFER_DIRECT_MESSAGE_GROUP=True)
-    def test_personal_using_direct_message_group(self) -> None:
         """
         If you send a personal using direct_message_group, only you and the recipient see it.
         """
@@ -2826,16 +2911,29 @@ class PersonalMessageSendTest(ZulipTestCase):
             receiver=receiver,
         )
 
-    def test_personal_when_personal_recipient_is_none(self) -> None:
+    def test_personal_ratchets_to_existing_direct_message_group(self) -> None:
         """
-        If you send a personal using direct_message_group, only you and the recipient see it.
+        When a DM group already exists, it is used for the message.
         """
         sender = self.example_user("hamlet")
         receiver = self.example_user("othello")
 
-        # Removing the personal recipient to ensure a new direct message group is created.
-        receiver.recipient = None
-        receiver.save()
+        # Simulate a PREFER=True process having created the DM group
+        direct_message_group = get_or_create_direct_message_group([sender.id, receiver.id])
+
+        self.login("hamlet")
+        self.send_personal_message(sender, receiver)
+
+        message = most_recent_message(sender)
+        self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+        self.assertEqual(message.recipient_id, direct_message_group.recipient_id)
+
+    def test_1_to_1_dm_without_existing_dm_group(self) -> None:
+        """
+        Sending a 1:1 DM creates a DirectMessageGroup if one doesn't exist.
+        """
+        sender = self.example_user("hamlet")
+        receiver = self.example_user("othello")
 
         self.login("hamlet")
         self.assert_personal(
@@ -2845,6 +2943,88 @@ class PersonalMessageSendTest(ZulipTestCase):
 
         message = most_recent_message(sender)
         self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+
+    def test_personal_message(self) -> None:
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        prospero = self.example_user("prospero")
+
+        # A normal user sends a personal message.
+        with self.assert_database_query_count(22):
+            self.send_personal_message(hamlet, cordelia)
+
+        # Give guests limited user access.
+        self.set_up_db_for_testing_user_access()
+        polonius = self.example_user("polonius")
+        # Make prospero a guest user.
+        self.set_user_role(prospero, UserProfile.ROLE_GUEST)
+
+        # A guest with limited user access sends a personal message
+        # to another accessible user.
+        with self.assert_database_query_count(23):
+            self.send_personal_message(polonius, hamlet)
+
+        # A guest with limited user access sends a personal message
+        # to themself.
+        with self.assert_database_query_count(19):
+            self.send_personal_message(polonius, polonius)
+
+        # A guest with limited user access sends a personal message
+        # to another accessible guest.
+        with self.assert_database_query_count(20):
+            self.send_personal_message(polonius, prospero)
+
+    def test_group_direct_message(self) -> None:
+        """
+        When a guest with limited user access sends a group Direct Message
+        to recipients with another guest included, we do extra checks resulting
+        in extra queries as opposed to a normal user.
+        This test tracks query count for these different cases.
+        """
+        # Give guests limited user access.
+        self.set_up_db_for_testing_user_access()
+        polonius = self.example_user("polonius")
+        prospero = self.example_user("prospero")
+
+        cordelia = self.example_user("cordelia")
+        hamlet = self.example_user("hamlet")
+        iago = self.example_user("iago")
+        bot = self.create_test_bot("test2", cordelia, full_name="Test bot")
+
+        # Make prospero a guest user.
+        self.set_user_role(prospero, UserProfile.ROLE_GUEST)
+
+        # Direct message group recipients including a guest (prospero).
+        recipients = [cordelia, hamlet, bot, prospero]
+
+        # A normal user sends the first message
+        # to a new DirectMessageGroup.
+        with self.assert_database_query_count(26):
+            self.send_group_direct_message(iago, recipients)
+
+        # A normal user sends a message
+        # to an existing DirectMessageGroup.
+        with self.assert_database_query_count(19):
+            self.send_group_direct_message(iago, recipients)
+
+        # Subscribe polonius to Verona to make the recipients
+        # below accessible for polonius.
+        self.subscribe(polonius, "Verona")
+
+        # polonius and prospero have already exchanged 1:1 DM
+        # via set_up_db_for_testing_user_access;
+        # it's very common for a message recipients
+        # to have 1:1 DM partners.
+
+        # A guest with limited user access sends the first message
+        # to a new DirectMessageGroup.
+        with self.assert_database_query_count(28):
+            self.send_group_direct_message(polonius, recipients)
+
+        # A guest with limited user access sends a message
+        # to an existing DirectMessageGroup.
+        with self.assert_database_query_count(21):
+            self.send_group_direct_message(polonius, recipients)
 
     def test_direct_message_initiator_group_setting(self) -> None:
         """
@@ -2886,7 +3066,7 @@ class PersonalMessageSendTest(ZulipTestCase):
 
         # Have the administrator send a message, and verify that allows the user to reply.
         self.send_personal_message(admin, user_profile)
-        with self.assert_database_query_count(16):
+        with self.assert_database_query_count(17):
             self.send_personal_message(user_profile, admin)
 
         # Tests that user cannot initiate direct message thread in groups.
@@ -2896,7 +3076,7 @@ class PersonalMessageSendTest(ZulipTestCase):
         # Have the administrator send a message to the direct message group, and verify
         # that allows the user to reply.
         self.send_group_direct_message(admin, direct_message_group_1)
-        with self.assert_database_query_count(20):
+        with self.assert_database_query_count(18):
             self.send_group_direct_message(user_profile, direct_message_group_1)
 
         # We cannot sent to `direct_message_group_2` as no message has been sent to this group yet.
@@ -2922,7 +3102,7 @@ class PersonalMessageSendTest(ZulipTestCase):
             user_group,
             acting_user=None,
         )
-        with self.assert_database_query_count(16):
+        with self.assert_database_query_count(17):
             self.send_personal_message(user_profile, cordelia)
 
         # Test that query count decreases if setting is set to a system group.
@@ -2936,7 +3116,7 @@ class PersonalMessageSendTest(ZulipTestCase):
             acting_user=None,
         )
         othello = self.example_user("othello")
-        with self.assert_database_query_count(15):
+        with self.assert_database_query_count(21):
             self.send_personal_message(user_profile, othello)
 
     def test_direct_message_permission_group_setting(self) -> None:
@@ -2964,7 +3144,7 @@ class PersonalMessageSendTest(ZulipTestCase):
             acting_user=None,
         )
         # Tests if the user is allowed to send to administrators.
-        with self.assert_database_query_count(16):
+        with self.assert_database_query_count(22):
             self.send_personal_message(user_profile, admin)
         self.send_personal_message(admin, user_profile)
         # Tests if we can send messages to self irrespective of the value of the setting.
@@ -2982,7 +3162,7 @@ class PersonalMessageSendTest(ZulipTestCase):
 
         # We can send to this direct message group as it has administrator as one of the
         # recipient.
-        with self.assert_database_query_count(24):
+        with self.assert_database_query_count(22):
             self.send_group_direct_message(user_profile, direct_message_group)
         self.send_group_direct_message(admin, direct_message_group)
 
@@ -3014,7 +3194,7 @@ class PersonalMessageSendTest(ZulipTestCase):
         with self.assertRaises(DirectMessagePermissionError):
             self.send_personal_message(cordelia, polonius)
 
-        with self.assert_database_query_count(16):
+        with self.assert_database_query_count(17):
             self.send_personal_message(user_profile, cordelia)
 
         # Test that query count decreases if setting is set to a system group.
@@ -3027,7 +3207,7 @@ class PersonalMessageSendTest(ZulipTestCase):
             members_group,
             acting_user=None,
         )
-        with self.assert_database_query_count(15):
+        with self.assert_database_query_count(16):
             self.send_personal_message(user_profile, cordelia)
 
         do_change_realm_permission_group_setting(

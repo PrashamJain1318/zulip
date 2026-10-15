@@ -2,19 +2,23 @@ import fnmatch
 import hashlib
 import hmac
 import importlib
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated, Any, TypeAlias
 from urllib.parse import unquote
 
+import requests
 from django.conf import settings
 from django.http import HttpRequest
+from django.utils.crypto import constant_time_compare
 from django.utils.encoding import force_bytes
 from django.utils.translation import gettext as _
 from pydantic import Json
 from typing_extensions import override
 
+from version import ZULIP_VERSION
 from zerver.actions.message_send import (
     check_send_private_message,
     check_send_stream_message,
@@ -27,11 +31,14 @@ from zerver.lib.exceptions import (
     JsonableError,
     StreamDoesNotExistError,
 )
+from zerver.lib.outgoing_http import OutgoingSession
 from zerver.lib.request import RequestNotes
 from zerver.lib.send_email import FromAddress
 from zerver.lib.typed_endpoint import ApiParamConfig, typed_endpoint
-from zerver.lib.validator import check_bool, check_string
-from zerver.models import UserProfile
+from zerver.models import Realm, UserProfile
+from zerver.models.custom_profile_fields import CustomProfileField, CustomProfileFieldValue
+
+logger = logging.getLogger(__name__)
 
 MISSING_EVENT_HEADER_MESSAGE = """\
 Hi there!  Your bot {bot_name} just sent an HTTP request to {request_path} that
@@ -71,7 +78,7 @@ class WebhookConfigOption:
 class WebhookUrlOption:
     name: str
     label: str
-    validator: Callable[[str, str], str | bool | None]
+    input_type: str
 
     @classmethod
     def build_preset_config(cls, config: PresetUrlOption) -> "WebhookUrlOption":
@@ -87,19 +94,19 @@ class WebhookUrlOption:
                 return cls(
                     name=config.value,
                     label="",
-                    validator=check_string,
+                    input_type="text",
                 )
             case PresetUrlOption.IGNORE_PRIVATE_REPOSITORIES:
                 return cls(
                     name=config.value,
                     label="Exclude notifications from private repositories",
-                    validator=check_bool,
+                    input_type="checkbox",
                 )
             case PresetUrlOption.CHANNEL_MAPPING:
                 return cls(
                     name=config.value,
                     label="",
-                    validator=check_string,
+                    input_type="text",
                 )
 
         raise AssertionError(_("Unknown 'PresetUrlOption': {config}").format(config=config))
@@ -210,7 +217,7 @@ def check_send_webhook_message(
             return None
 
 
-def standardize_headers(input_headers: None | dict[str, Any]) -> dict[str, str]:
+def standardize_headers(input_headers: dict[str, Any] | None) -> dict[str, str]:
     """This method can be used to standardize a dictionary of headers with
     the standard format that Django expects. For reference, refer to:
     https://docs.djangoproject.com/en/5.0/ref/request-response/#django.http.HttpRequest.headers
@@ -281,7 +288,7 @@ def default_fixture_to_headers(http_header_key: str) -> Callable[[str], dict[str
 
     def fixture_to_headers(filename: str) -> dict[str, str]:
         if "__" in filename:
-            event_type = filename.split("__")[0]
+            event_type = filename.split("__", 1)[0]
         else:
             event_type = filename
         return {http_header_key: event_type}
@@ -293,7 +300,7 @@ def parse_multipart_string(body: str) -> dict[str, str]:
     """
     Converts multipart/form-data string (fixture) to dict
     """
-    boundary = body.split("\n")[0][2:]
+    boundary = body.split("\n", 1)[0][2:]
     parts = body.split(f"--{boundary}")
 
     data = {}
@@ -340,5 +347,75 @@ def validate_webhook_signature(
         algorithm,
     ).hexdigest()
 
-    if signed_payload != signature:
+    if not constant_time_compare(signed_payload, signature):
         raise JsonableError(_("Webhook signature verification failed."))
+
+
+def guess_zulip_user_from_external_account(
+    realm: Realm,
+    external_username: str,
+    external_account_field_name: str,
+    external_username_case_insensitive: bool,
+) -> UserProfile | None:
+    try:
+        external_account_field = CustomProfileField.objects.get(
+            realm=realm,
+            field_type=CustomProfileField.EXTERNAL_ACCOUNT,
+            name=external_account_field_name,
+        )
+    except CustomProfileField.DoesNotExist:
+        return None
+
+    lookup = "value__iexact" if external_username_case_insensitive else "value__exact"
+
+    try:
+        matching_user = (
+            CustomProfileFieldValue.objects.filter(
+                field=external_account_field,
+                **{lookup: external_username},
+                user_profile__realm=realm,
+                user_profile__is_active=True,
+            )
+            .select_related("user_profile")
+            .only("user_profile__id", "user_profile__full_name")
+            .get()
+        )
+        return matching_user.user_profile
+    except (CustomProfileFieldValue.DoesNotExist, CustomProfileFieldValue.MultipleObjectsReturned):
+        return None
+
+
+def get_service_api_data(
+    url: str,
+    integration_name: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    method: str = "GET",
+    timeout: float = settings.OUTGOING_WEBHOOK_TIMEOUT_SECONDS,
+    max_retries: int = 3,
+) -> requests.Response:
+    session = OutgoingSession(
+        role="webhook_fetch",
+        headers={
+            "User-Agent": f"ZulipWebhookFetch/{ZULIP_VERSION}",
+            **(headers or {}),
+        },
+        timeout=timeout,
+        max_retries=max_retries,
+    )
+    try:
+        response = session.request(
+            method=method.upper(),
+            url=url,
+            json=params if method.upper() == "POST" else None,
+            params=params if method.upper() == "GET" else None,
+        )
+
+        response.raise_for_status()
+        return response
+
+    except requests.RequestException as e:
+        logger.warning(
+            "Failed to fetch data from %s for %s integration: %s", url, integration_name, e
+        )
+        raise

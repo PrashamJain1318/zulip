@@ -1,9 +1,8 @@
-import $ from "jquery";
+import {$} from "jquery";
 
 import * as alert_words from "./alert_words.ts";
 import * as blueslip from "./blueslip.ts";
 import * as desktop_notifications from "./desktop_notifications.ts";
-import type {ElectronBridgeNotification} from "./desktop_notifications.ts";
 import {$t} from "./i18n.ts";
 import * as message_parser from "./message_parser.ts";
 import type {Message} from "./message_store.ts";
@@ -11,6 +10,7 @@ import * as message_view from "./message_view.ts";
 import * as people from "./people.ts";
 import * as spoilers from "./spoilers.ts";
 import * as stream_data from "./stream_data.ts";
+import * as sub_store from "./sub_store.ts";
 import * as ui_util from "./ui_util.ts";
 import {user_settings} from "./user_settings.ts";
 import * as user_topics from "./user_topics.ts";
@@ -112,8 +112,6 @@ function get_notification_title(
 ): string {
     let title_prefix = message.sender_full_name;
     let title_suffix = "";
-    let other_recipients;
-    let other_recipients_translated;
 
     if (msg_count > 1) {
         title_prefix = $t(
@@ -125,9 +123,9 @@ function get_notification_title(
     switch (message.type) {
         case "private":
             if (message.display_recipient.length > 2) {
-                other_recipients = remove_sender_from_list_of_recipients(message);
+                const other_recipients = remove_sender_from_list_of_recipients(message);
                 // Same as compose_ui.compute_placeholder_text.
-                other_recipients_translated = util.format_array_as_list(
+                const other_recipients_translated = util.format_array_as_list(
                     other_recipients.split(", "),
                     "long",
                     "conjunction",
@@ -171,67 +169,57 @@ export function process_notification(notification: {
     const message = notification.message;
     const content = get_notification_content(message);
     const key = get_notification_key(message);
-    let notification_object: ElectronBridgeNotification | Notification;
     let msg_count = 1;
 
     debug_notification_source_value(message);
 
     const notice_memory = desktop_notifications.notice_memory.get(key);
     if (notice_memory) {
-        msg_count = notice_memory.msg_count + 1;
-        notification_object = notice_memory.obj;
-        notification_object.close();
+        msg_count = notice_memory.data.msg_count + 1;
     }
 
     const title = get_notification_title(message, msg_count);
 
-    if (notification.desktop_notify && desktop_notifications.NotificationAPI !== undefined) {
-        const icon_url =
-            message.type === "test-notification"
-                ? small_avatar_url_for_test_notification(message)
-                : people.small_avatar_url(message);
-        notification_object = new desktop_notifications.NotificationAPI(title, {
-            icon: icon_url,
-            body: content,
-            tag: message.id.toString(),
-        });
-        desktop_notifications.notice_memory.set(key, {
-            obj: notification_object,
-            msg_count,
-            message_id: message.id,
-        });
+    const icon_url =
+        message.type === "test-notification"
+            ? small_avatar_url_for_test_notification(message)
+            : people.small_avatar_url(message);
 
-        if (typeof notification_object.addEventListener === "function") {
-            // Sadly, some third-party Electron apps like Franz/Ferdi
-            // misimplement the Notification API not inheriting from
-            // EventTarget.  This results in addEventListener being
-            // unavailable for them.
-            notification_object.addEventListener("click", () => {
-                notification_object.close();
-                if (message.type !== "test-notification") {
-                    // Narrowing to message's near view helps to handle the case
-                    // where a user clicked the notification, but before narrowing
-                    // the message deletion got processed.
-                    message_view.narrow_to_message_near(message, "notification");
-                }
-                window.focus();
-            });
-            notification_object.addEventListener("close", () => {
-                const current_notice_memory = desktop_notifications.notice_memory.get(key);
-                // This check helps avoid race between close event for current notification
-                // object and the previous notification_object close handler.
-                if (current_notice_memory?.obj === notification_object) {
-                    desktop_notifications.notice_memory.delete(key);
-                }
-            });
+    const notification_options = {
+        icon: icon_url,
+        body: content,
+        tag: message.id.toString(),
+    };
+
+    function on_click(): void {
+        if (message.type !== "test-notification") {
+            // Narrowing to message's near view helps to handle the case
+            // where a user clicked the notification, but before narrowing
+            // the message deletion got processed.
+            message_view.narrow_to_message_near(message, "notification");
         }
     }
+
+    desktop_notifications.create_notification({
+        notification_options,
+        key,
+        title,
+        data: {type: "message", message_id: message.id, msg_count},
+        desktop_notify: notification.desktop_notify,
+        on_click,
+    });
 }
 
 export function message_is_notifiable(message: Message | TestNotificationMessage): boolean {
     // Independent of the user's notification settings, are there
     // properties of the message that unconditionally mean we
     // shouldn't notify about it.
+    //
+    // NOTE: The muted channel block below checks
+    // wildcard_mentions_notify setting for maintainability, keeping the
+    // muting override logic in one place rather than duplicating it
+    // across should_send_*_notification. This should not be taken
+    // as precedent for adding other notification settings here.
 
     if (message.sent_by_me) {
         return false;
@@ -244,7 +232,8 @@ export function message_is_notifiable(message: Message | TestNotificationMessage
     }
 
     // @-<username> mentions take precedence over muted-ness. Note
-    // that @all mentions are still suppressed by muting.
+    // that @all mentions are still suppressed by muting unless the
+    // channel-specific wildcard_mentions_notify setting is enabled.
     if (message.mentioned_me_directly) {
         return true;
     }
@@ -257,17 +246,22 @@ export function message_is_notifiable(message: Message | TestNotificationMessage
         return true;
     }
 
+    if (message.type === "stream" && user_topics.is_topic_muted(message.stream_id, message.topic)) {
+        return false;
+    }
+
     // Messages to unmuted topics in muted streams may generate desktop notifications.
     if (
         message.type === "stream" &&
         stream_data.is_muted(message.stream_id) &&
         !user_topics.is_topic_unmuted(message.stream_id, message.topic)
     ) {
-        return false;
-    }
-
-    if (message.type === "stream" && user_topics.is_topic_muted(message.stream_id, message.topic)) {
-        return false;
+        // Now, only way a message can notify is if it's a wildcard mention
+        // with channel-specific wildcard_mentions_notify=true.
+        const sub = sub_store.get(message.stream_id);
+        if (!(message.mentioned && sub?.wildcard_mentions_notify === true)) {
+            return false;
+        }
     }
 
     // Everything else is on the table; next filter based on notification
@@ -314,11 +308,7 @@ export function should_send_desktop_notification(
         return true;
     }
 
-    if (alert_words.notifies(message)) {
-        return true;
-    }
-
-    if (message.mentioned_me_directly) {
+    if (alert_words.notifies(message) || message.mentioned_me_directly) {
         return true;
     }
 
@@ -386,11 +376,7 @@ export function should_send_audible_notification(
         return true;
     }
 
-    if (alert_words.notifies(message)) {
-        return true;
-    }
-
-    if (message.mentioned_me_directly) {
+    if (alert_words.notifies(message) || message.mentioned_me_directly) {
         return true;
     }
 

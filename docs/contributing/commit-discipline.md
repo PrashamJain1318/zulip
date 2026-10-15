@@ -10,6 +10,9 @@ helps a lot in preventing bugs.
 Use `git rebase -i` as much as you need to shape your commit structure. See the
 [Git guide](../git/overview.md) for useful resources on mastering Git.
 
+**Tip**: Check out how to use [`git log -p` to study the commit
+history](../git/reading-history.md) of the project.
+
 ## Each commit must be coherent
 
 - It should pass tests (so test updates needed by a change should be
@@ -38,7 +41,7 @@ rest of the project.
   change the functionality of the product, make those changes into a
   series of preparatory commits that can be merged independently of
   building the feature itself.
-- Moving code from one file to another should be done in a separate
+- Moving code from one file to another should be done in separate
   commits from functional changes or even refactoring within a file.
 - 2 different refactorings should be done in different commits.
 - 2 different features should be done in different commits.

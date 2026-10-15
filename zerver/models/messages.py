@@ -228,7 +228,7 @@ class Message(AbstractMessage):
                 # is done case-insensitively
                 "realm_id",
                 Upper("subject"),
-                F("id").desc(nulls_last=True),
+                F("id").desc(),
                 name="zerver_message_realm_upper_subject",
                 condition=Q(is_channel_message=True),
             ),
@@ -240,7 +240,7 @@ class Message(AbstractMessage):
                 "realm_id",
                 "recipient_id",
                 Upper("subject"),
-                F("id").desc(nulls_last=True),
+                F("id").desc(),
                 name="zerver_message_realm_recipient_upper_subject",
                 condition=Q(is_channel_message=True),
             ),
@@ -250,14 +250,14 @@ class Message(AbstractMessage):
                 "realm_id",
                 "recipient_id",
                 "subject",
-                F("id").desc(nulls_last=True),
+                F("id").desc(),
                 name="zerver_message_realm_recipient_subject",
                 condition=Q(is_channel_message=True),
             ),
             models.Index(
                 # Only used by update_first_visible_message_id
                 "realm_id",
-                F("id").desc(nulls_last=True),
+                F("id").desc(),
                 name="zerver_message_realm_id",
             ),
             models.Index(
@@ -287,18 +287,6 @@ class Message(AbstractMessage):
 
     def save_rendered_content(self) -> None:
         self.save(update_fields=["rendered_content", "rendered_content_version"])
-
-    @staticmethod
-    def need_to_render_content(
-        rendered_content: str | None,
-        rendered_content_version: int | None,
-        markdown_version: int,
-    ) -> bool:
-        return (
-            rendered_content is None
-            or rendered_content_version is None
-            or rendered_content_version < markdown_version
-        )
 
     @staticmethod
     def is_status_message(content: str, rendered_content: str) -> bool:
@@ -468,7 +456,15 @@ class ArchivedReaction(AbstractReaction):
 class AbstractUserMessage(models.Model):
     id = models.BigAutoField(primary_key=True)
 
-    user_profile = models.ForeignKey(UserProfile, on_delete=CASCADE)
+    # We disable the index on this, because we provide a unique index
+    # on (user_profile_id, message_id) whose prefix can always be used
+    # instead of this index, and which is always going to produce
+    # sorted message-id rows.  Sometimes PostgreSQL would choose this
+    # non-sorted index and then have to perform an extra sort and
+    # limit after getting _all_ of the user's rows, which is quite
+    # wasteful.
+    user_profile = models.ForeignKey(UserProfile, on_delete=CASCADE, db_index=False)
+
     # The order here is important!  It's the order of fields in the bitfield.
     ALL_FLAGS = [
         "read",
@@ -496,6 +492,9 @@ class AbstractUserMessage(models.Model):
         # Whether we've sent a push notification to the user's mobile
         # devices for this message that has not been revoked.
         "active_mobile_push_notification",
+        # Whether the user has hidden auto-generated link previews
+        # on this message.
+        "hide_link_previews",
     ]
     # Certain flags are used only for internal accounting within the
     # Zulip backend, and don't make sense to expose to the API.
@@ -668,8 +667,14 @@ class UserMessage(AbstractUserMessage):
         simultaneous duplicate API requests to mark a certain set of
         messages as read).
 
+        Note: Since we don't expect these UserMessage rows to be deleted by the
+        caller, a FOR NO KEY UPDATE lock might be sufficient here. However, we
+        don't expect the stronger FOR UPDATE lock to cause any issues,
+        so for now, we still pass no_key=False, acquiring the stronger lock.
         """
-        return UserMessage.objects.select_for_update(of=("self",)).order_by("message_id")
+        return UserMessage.objects.select_for_update(of=("self",), no_key=False).order_by(
+            "message_id"
+        )
 
     @staticmethod
     def has_any_mentions(user_profile_id: int, message_id: int) -> bool:
@@ -812,13 +817,7 @@ class Attachment(AbstractAttachment):
             "path_id": self.path_id,
             "size": self.size,
             "create_time": int(time.mktime(self.create_time.timetuple())),
-            "messages": [
-                {
-                    "id": m.id,
-                    "date_sent": int(time.mktime(m.date_sent.timetuple())),
-                }
-                for m in self.messages.all()
-            ],
+            "message_ids": [m.id for m in self.messages.all()],
         }
 
 

@@ -232,11 +232,23 @@ def get_curl_include_exclude(endpoint: str, method: str) -> list[dict[str, Any]]
     ]
 
 
+def check_web_app_pending_implementation(endpoint: str, method: str) -> bool:
+    """Fetch if the endpoint has note about web application implementation."""
+    return openapi_spec.openapi()["paths"][endpoint][method.lower()].get(
+        "x-pending-web-implementation", False
+    )
+
+
 def check_requires_administrator(endpoint: str, method: str) -> bool:
     """Fetch if the endpoint requires admin config."""
     return openapi_spec.openapi()["paths"][endpoint][method.lower()].get(
         "x-requires-administrator", False
     )
+
+
+def check_requires_owner(endpoint: str, method: str) -> bool:
+    """Fetch if the endpoint requires owner config."""
+    return openapi_spec.openapi()["paths"][endpoint][method.lower()].get("x-requires-owner", False)
 
 
 def check_additional_imports(endpoint: str, method: str) -> list[str] | None:
@@ -448,7 +460,6 @@ def validate_test_response(request: Request, response: Response) -> bool:
         path = request.path.removeprefix("/api/v1")
     else:
         return False
-    assert request.method is not None
     method = request.method.lower()
     status_code = str(response.status_code)
 
@@ -568,7 +579,6 @@ def validate_test_request(
     status_code: str,
     intentionally_undocumented: bool = False,
 ) -> None:
-    assert request.method is not None
     method = request.method.lower()
     if request.path.startswith("/json/"):
         url = request.path.removeprefix("/json")

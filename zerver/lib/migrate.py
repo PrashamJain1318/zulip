@@ -2,10 +2,14 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from django.conf import settings
+from django.contrib.postgres.operations import AddIndexConcurrently, RemoveIndexConcurrently
 from django.db import connection
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 from django.db.backends.utils import CursorWrapper
+from django.db.migrations import AddIndex, RemoveIndex
 from django.db.migrations.state import StateApps
+from django.db.models import Index
 from psycopg2.sql import SQL, Composable, Identifier
 
 
@@ -69,24 +73,26 @@ def rename_indexes_constraints(
         with connection.cursor() as cursor:
             constraints = connection.introspection.get_constraints(cursor, old_table)
 
-            for old_name, infodict in constraints.items():
-                if infodict["check"]:
+            for old_name, constraint in constraints.items():
+                if constraint["check"]:
                     suffix = "_check"
                     is_index = False
-                elif infodict["foreign_key"] is not None:
+                elif constraint["foreign_key"] is not None:
                     is_index = False
-                    to_table, to_column = infodict["foreign_key"]
+                    to_table, to_column = constraint["foreign_key"]
                     suffix = f"_fk_{to_table}_{to_column}"
-                elif infodict["primary_key"]:
+                elif constraint["primary_key"]:
                     suffix = "_pk"
                     is_index = True
-                elif infodict["unique"]:
+                elif constraint["unique"]:
                     suffix = "_uniq"
                     is_index = True
                 else:
-                    suffix = "_idx" if len(infodict["columns"]) > 1 else ""
+                    suffix = "_idx" if len(constraint["columns"]) > 1 else ""
                     is_index = True
-                new_name = schema_editor._create_index_name(new_table, infodict["columns"], suffix)
+                new_name = schema_editor._create_index_name(
+                    new_table, constraint["columns"], suffix
+                )
                 if new_name in seen_indexes:
                     # This index duplicates one we already renamed,
                     # and attempting to rename it would cause a
@@ -117,9 +123,9 @@ def rename_indexes_constraints(
                     )
                 cursor.execute(raw_query)
 
-            for infodict in connection.introspection.get_sequences(cursor, old_table):
-                old_name = infodict["name"]
-                column = infodict["column"]
+            for sequence in connection.introspection.get_sequences(cursor, old_table):
+                old_name = sequence["name"]
+                column = sequence["column"]
                 new_name = f"{new_table}_{column}_seq"
 
                 raw_query = SQL("ALTER SEQUENCE {old_name} RENAME TO {new_name}").format(
@@ -135,3 +141,25 @@ def rename_indexes_constraints(
             )
 
     return inner_migration
+
+
+def add_index(model_name: str, index: Index) -> AddIndex:
+    """
+    Gracefully handle concurrent index migration setting
+    when adding indexes with ./manage.py migrate
+    """
+    if settings.MIGRATIONS_ADD_REMOVE_INDEXES_CONCURRENTLY:
+        return AddIndexConcurrently(model_name, index)
+    else:
+        return AddIndex(model_name, index)
+
+
+def remove_index(model_name: str, name: str) -> RemoveIndex:
+    """
+    Gracefully handle concurrent index migration setting
+    when removing indexes with ./manage.py migrate
+    """
+    if settings.MIGRATIONS_ADD_REMOVE_INDEXES_CONCURRENTLY:
+        return RemoveIndexConcurrently(model_name, name)
+    else:
+        return RemoveIndex(model_name, name)

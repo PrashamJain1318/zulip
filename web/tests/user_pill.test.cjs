@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 
 const {make_realm} = require("./lib/example_realm.cjs");
+const {make_user} = require("./lib/example_user.cjs");
 const {mock_esm, zrequire} = require("./lib/namespace.cjs");
 const {run_test} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
@@ -16,23 +17,23 @@ const settings_data = mock_esm("../src/settings_data");
 const realm = make_realm();
 set_realm(realm);
 
-const alice = {
+const alice = make_user({
     email: "alice@example.com",
     user_id: 99,
     full_name: "Alice Barson",
-};
+});
 
-const isaac = {
+const isaac = make_user({
     email: "isaac@example.com",
     user_id: 102,
     full_name: "Isaac Newton",
-};
+});
 
-const isaac_duplicate = {
+const isaac_duplicate = make_user({
     email: "isaac_duplicate@example.com",
     user_id: 102102,
     full_name: "Isaac Newton",
-};
+});
 
 const isaac_item = {
     email: "isaac@example.com",
@@ -41,16 +42,16 @@ const isaac_item = {
     user_id: isaac.user_id,
     deactivated: false,
     img_src: `/avatar/${isaac.user_id}`,
-    is_bot: undefined,
+    is_bot: false,
     status_emoji_info: undefined,
     should_add_guest_user_indicator: false,
 };
 
-const deactivated_user = {
+const deactivated_user = make_user({
     email: "deactivated@example.com",
     user_id: 104,
     full_name: "Deactivated User",
-};
+});
 
 const deactivated_user_item = {
     email: "deactivated@example.com",
@@ -210,4 +211,24 @@ test("typeahead", () => {
     // And then bogus_item is just a red herring to test robustness.
     const result = user_pill.typeahead_source(pill_widget);
     assert.deepEqual(result, [{type: "user", user: alice}]);
+});
+
+test("update_pill_full_name", () => {
+    const pill = {item: {...isaac_item}, $element: {0: {}}};
+    let pill_updated = false;
+    pill_widget.getPillByPredicate = (predicate) => (predicate(pill.item) ? pill : undefined);
+    pill_widget.updatePill = (_element, item) => {
+        pill.item = item;
+        pill_updated = true;
+    };
+
+    assert.equal(pill.item.full_name, "Isaac Newton");
+    user_pill.update_pill_full_name(pill_widget, isaac.user_id, "Sir Isaac Newton");
+    assert.equal(pill.item.full_name, "Sir Isaac Newton");
+    assert.ok(pill_updated);
+
+    // No-op when no matching pill.
+    pill_updated = false;
+    user_pill.update_pill_full_name(pill_widget, 999, "Nobody");
+    assert.ok(!pill_updated);
 });

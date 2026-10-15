@@ -18,7 +18,518 @@ clients should check the `zulip_feature_level` field, present in the
 /register`](/api/register-queue) responses, to determine the API
 format used by the Zulip server that they are interacting with.
 
+## Changes in Zulip 13.0
+
+**Feature level 513**
+
+* [`POST /messages/render`](/api/render-message): Added the
+  `populate_url_embed_data` parameter, which requests that the server
+  populate URL embed data for the content's links: data it already has is
+  included in the rendered content, and the rest is fetched asynchronously
+  and delivered via the new `url_embed_data` event.
+* [`GET /events`](/api/get-events): Added a new `url_embed_data` event,
+  sent to a user when the server has fetched URL embed data for content
+  they asked it to render, so that a client displaying the rendered content
+  can live-update it.
+
+**Feature level 512**
+
+* The undocumented `PATCH /users/me/subscriptions` endpoint for
+  updating channel subscriptions has been deprecated and
+  removed. It was a duplicate of the documented bulk-subscribe
+  ([`POST /users/me/subscriptions`](/api/subscribe)) and
+  bulk-unsubscribe ([`DELETE /users/me/subscriptions`](/api/unsubscribe))
+  endpoints, which clients should use to subscribe/unsubscribe
+  users from channels.
+
+**Feature level 511**
+
+* [`POST /messages/{message_id}/report`](/api/report-message): This endpoint
+  now returns an error if the message report fails to be sent to the
+  moderation request channel.
+
+**Feature level 510**
+
+* [`GET /events`](/api/get-events), [`GET /messages`](/api/get-messages),
+  [`GET /messages/{message_id}`](/api/get-message),
+  [`POST /messages/flags`](/api/update-message-flags),
+  [`POST /messages/flags/narrow`](/api/update-message-flags-for-narrow):
+  Added `hide_link_previews` as a supported [message
+  flag](/api/update-message-flags#available-flags) that can be
+  toggled by the user. When set, clients should hide auto-generated
+  link previews on the message for that user. Like other flags, it
+  appears in the message's `flags` array and in `update_message_flags`
+  events. The flag can be set on any message, whether or not it
+  currently has a link preview.
+
+**Feature level 509**
+
+* [`PATCH /messages/{message_id}`](/api/update-message): Fixed a bug where
+  passing the `stream_id` that the message is already in was processed as
+  a channel move.
+
+**Feature level 508**
+
+* [`POST /messages`](/api/send-message): Added `message_url` and
+  `message_link` fields to the response.
+
+**Feature level 507**
+
+* [`POST /users/me/subscriptions`](/api/subscribe),
+  [`POST /channels/create`](/api/create-channel),
+  [`PATCH /streams/{stream_id}`](/api/update-stream): Added
+  `default_push_notifications` boolean parameter that controls whether
+  mobile push notifications are enabled by default when a user first
+  subscribes to the channel, potentially overriding the user's [default
+  mobile notification
+  setting](/help/channel-notifications#configure-default-notifications-for-all-channels)
+  for channel messages. Only organization administrators can set or
+  modify this parameter.
+
+* [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
+  [`GET /streams`](/api/get-streams),
+  [`GET /streams/{stream_id}`](/api/get-stream-by-id): Added
+  `default_push_notifications` boolean field to channel objects, which
+  indicates whether mobile push notifications will be enabled by default
+  when a user first subscribes to the channel, potentially overriding the
+  user's [default mobile notification
+  setting](/help/channel-notifications#configure-default-notifications-for-all-channels)
+  for channel messages.
+
+**Feature level 506**
+
+* [`GET /export/realm`](/api/get-realm-exports),
+  [`GET /events`](/api/get-events): Added an `export_from_prior_server`
+  boolean field to the export objects returned. It is `true`
+  for records that were carried across a realm import; the export
+  happened on a previous server, so its tarball is no longer stored
+  on this server. This change was also backported to the Zulip 12.x
+  series, at feature level 499.
+* [`DELETE /export/realm/{export_id}`](/api/delete-realm-export): Export
+  records with the `export_from_prior_server` field set to `true` cannot
+  be deleted, as the server has no exported data to delete for them. This
+  change was also backported to the Zulip 12.x series, at feature level 499.
+
+**Feature level 505**
+
+* [`PATCH /messages/{message_id}`](/api/update-message): For requests with
+  `"propagate_mode": "change_all"` from users who are not administrators
+  or moderators, the `"code": "MOVE_MESSAGES_TIME_LIMIT_EXCEEDED"` error
+  response is now also returned when the target message itself is past
+  the time limit, as long as at least one message in the topic is within
+  the limit.
+
+**Feature level 504**
+
+* [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events):
+  The `require_e2ee_push_notifications` realm setting, when enabled,
+  now completely disables legacy push notifications rather than sending
+  them with redacted content. This change was also backported to the Zulip
+  12.x series, at feature level 500.
+
+**Feature level 503**
+
+* [Message formatting](/api/message-formatting): The global time
+  syntax only recognizes ISO 8601 formatted timestamps.
+
+**Feature level 502**
+
+No changes; start of Zulip 13.0 development branch.
+
+Feature level 501 reserved for future use in 12.x maintenance
+releases.
+
+## Changes in Zulip 12.1
+
+**Feature level 500**
+
+* [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events):
+  The `require_e2ee_push_notifications` realm setting, when enabled,
+  now completely disables legacy push notifications rather than sending
+  them with redacted content. Backported change from feature level 504.
+
+**Feature level 499**
+
+* [`GET /export/realm`](/api/get-realm-exports),
+  [`GET /events`](/api/get-events): Added an `export_from_prior_server`
+  boolean field to the export objects returned. It is `true`
+  for records that were carried across a realm import; the export
+  happened on a previous server, so its tarball is no longer stored
+  on this server. Backported change from feature level 506.
+* [`DELETE /export/realm/{export_id}`](/api/delete-realm-export): Export
+  records with the `export_from_prior_server` field set to `true` cannot
+  be deleted, as the server has no exported data to delete for them.
+  Backported change from feature level 506.
+
 ## Changes in Zulip 12.0
+
+**Feature level 498**
+
+No changes; API feature level used for the Zulip 12.0 release.
+
+**Feature level 497**
+
+* [`GET /users/{user_id_or_email}/presence`](/api/get-user-presence): The
+  endpoint now additionally returns presence data in the legacy format,
+  with `website` and `aggregated` keys, alongside the modern
+  `active_timestamp` and `idle_timestamp` fields. Clients are recommended
+  to migrate to the modern fields; the legacy fields are retained for
+  backwards compatibility with integrations written against previous
+  versions of the API.
+* [`GET /users/{user_id_or_email}/presence`](/api/get-user-presence): The
+  response now includes a top-level `server_timestamp` field, matching
+  the behavior of other presence endpoints.
+
+**Feature level 496**
+
+* [`GET /user_groups`](/api/get-user-groups),
+  [`POST /user_groups/create`](/api/create-user-group),
+  [`PATCH /user_groups/{user_group_id}`](/api/update-user-group),
+  [`POST /user_groups/{user_group_id}/members`](/api/update-user-group-members),
+  [`GET /user_groups/{user_group_id}/members`](/api/get-user-group-members),
+  [`GET /user_groups/{user_group_id}/members/{user_id}`](/api/get-is-user-group-member),
+  [`POST /user_groups/{user_group_id}/subgroups`](/api/update-user-group-subgroups),
+  [`GET /user_groups/{user_group_id}/subgroups`](/api/get-user-group-subgroups):
+  Bot users are now permitted to call these endpoints. Previously, they
+  were restricted to human users; guest users remain blocked.
+
+**Feature level 495**
+
+* [Message formatting](/api/message-formatting): Uploaded videos with
+  the `video/quicktime` MIME type (i.e., `.mov` files) are now rendered
+  inline using the existing `message_inline_video` format. Clients that
+  cannot play the format should detect a playback error and hide the
+  preview; the download link remains in the surrounding `a` tag.
+
+**Feature level 494**
+
+* [`PUT /bot_storage`](/api/update-bot-storage),
+  [`GET /bot_storage`](/api/get-bot-storage),
+  [`DELETE /bot_storage`](/api/remove-bot-storage): These
+  endpoints now require the caller to be a bot user account.
+  Previously, any authenticated user account could call these
+  endpoints.
+
+**Feature level 493**
+
+* [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
+  `PATCH /realm`: Webex OAuth integration added as an option
+  for the realm setting `video_chat_provider`.
+* [`POST /calls/webex/create`](/api/create-webex-video-call): Added
+  a new endpoint to create a Webex video call URL.
+* [`POST /register`](/api/register-queue): Added `has_webex_token`
+  boolean field to response.
+* [`GET /events`](/api/get-events):  A `has_webex_token` event is sent
+  to clients when the user has completed the OAuth flow for the Webex
+  video call integration.
+
+**Feature level 492**
+
+* [`POST /users/me/api_key/regenerate`](/api/regenerate-api-key): When
+  a user's API key is regenerated, the server now also removes all of
+  the user's E2EE push device registrations, stopping E2EE push
+  notifications to those devices.
+
+**Feature level 491**
+
+* [`GET /events`](/api/get-events): A new `individual_emoji_changes`
+  client capability has been added.  Clients advertising this
+  capability will not receive `realm_emoji/update` events with the
+  state of all emoji whenever there is a change; instead they will
+  receive more granular `realm_emoji/add` and `realm_emoji/update_one`
+  events. The `realm_emoji/add` event sends the full emoji data for
+  the newly added emoji. The `realm_emoji/update_one` event sends only
+  the `emoji_id` and the properties being changed (currently only
+  `deactivated`), rather than the full emoji data.
+
+  Clients that do not set the `individual_emoji_changes` client
+  capability will continue to receive the legacy `realm_emoji/update`
+  event containing all emoji.
+
+**Feature level 490**
+
+* [`GET /users`](/api/get-users), [`GET /users/{user_id}`](/api/get-user),
+  [`GET /users/{email}`](/api/get-user-by-email),
+  [`GET /users/me`](/api/get-own-user): Added `is_deleted` field to
+  returned user objects.
+* [`POST /register`](/api/register-queue): Added `is_deleted` field
+  in the user objects returned in the `realm_users` and
+  `realm_non_active_users` fields.
+* [`GET /events`](/api/get-events): Added `is_deleted` field to
+  user objects sent in `realm_user` events.
+
+**Feature level 489**
+
+* [`GET /messages`](/api/get-messages),
+  [`GET /messages/matches_narrow`](/api/check-messages-match-narrow),
+  [`POST /messages/flags/narrow`](/api/update-message-flags-for-narrow),
+  [`POST /register`](/api/register-queue): Added a new
+  [search/narrow filter](/api/construct-narrow), `channels:archived`,
+  that returns messages the current user received in channels that have
+  been [archived](/help/archive-a-channel).
+
+**Feature level 488**
+
+* [`GET /server_settings`](/api/get-server-settings): Added `discord` boolean
+  as a field in `authentication_methods` which indicates whether the realm has
+  Discord as a valid authentication method.
+
+**Feature level 487**
+
+* [`GET /users/{user_id_or_email}/presence`](/api/get-user-presence): The
+  endpoint now returns presence data in the modern format, with
+  `active_timestamp` and `idle_timestamp` fields. Previously, a legacy
+  format for presence data was returned, with `website` and `aggregated` keys.
+
+**Feature level 486**
+
+* [`POST /register`](/api/register-queue): Added new `klipy_api_key`
+  field, which is required to fetch GIFs using the KLIPY API.
+
+**Feature level 485**
+
+* [`POST /register`](/api/register-queue): Renamed the `validator` field
+  to `input_type` in the `url_options` array of the
+  `realm_incoming_webhook_bots` object array.
+
+**Feature level 484**
+
+* [`GET /events`](/api/get-events): Removed the deprecated `user` object
+  from `reaction` events, as all core clients have migrated to use the
+  `user_id` field, superseding the temporary re-addition in feature level 339
+  and completing the transition started in feature level 328.
+
+**Feature level 483**
+
+* [`POST /mobile_push/register`](/api/register-push-device): On a
+  successful E2EE push device registration, the server now
+  automatically removes any legacy push device registration with
+  a matching token for the user.
+
+**Feature level 482**
+
+* [`GET /messages`](/api/get-messages), [`GET
+  /messages/{message_id}`](/api/get-message), [`GET
+  /events`](/api/get-events): The `recipient_id` in 1:1 direct
+  messages changed to a new value; it still has the semantics of "the
+  1:1 conversation with a specific user," but the raw value changed
+  due to internal changes.
+
+**Feature level 481**
+
+* [`POST /register`](/api/register-queue): Added `idle_queue_timeout`
+  request parameter, allowing clients to configure how long the server
+  keeps the event queue alive when the client is not polling. The
+  string `"mobile"` can be passed to use the server's recommended
+  timeout for mobile clients. The response now includes
+  `idle_queue_timeout_secs` with the effective timeout in seconds.
+
+**Feature level 480**
+
+* [`GET /streams/{stream_id}`](/api/get-stream-by-id): Details of
+  archived channels can now be fetched.
+* [`GET /streams/{stream_id}/members`](/api/get-subscribers):
+  Subscribers of archived channels can now be fetched.
+* [`GET /users/me/{stream_id}/topics`](/api/get-stream-topics):
+  Topics in archived channels can now be fetched.
+
+**Feature level 479**
+
+* [`GET /thumbnail/status/{realm_id_str}/{filename}`](/api/check-thumbnail-status): Added
+  a new endpoint to check whether thumbnails have been generated for an
+  uploaded image.
+
+**Feature level 478**
+
+* [`POST /realm/filters`](/api/add-linkifier),
+  [`PATCH /realm/filters/{filter_id}`](/api/update-linkifier): Added
+  `alternative_url_templates` parameter for specifying additional URL
+  templates used only for reverse linkification (converting pasted URLs
+  to linkifier pattern text). These templates have no effect on forward
+  linkification.
+* [`GET /realm/linkifiers`](/api/get-linkifiers),
+  [`POST /register`](/api/register-queue),
+  [`GET /events`](/api/get-events): Linkifier objects now include the
+  `alternative_url_templates` field.
+
+**Feature level 477**
+
+* `PATCH /realm`, [`POST /register`](/api/register-queue),
+  [`GET /events`](/api/get-events): Added `workplace_users_group`
+  field which is a [group-setting value](/api/group-setting-values)
+  describing the set of users who will be considered as workplace
+  users for billing.
+
+**Feature level 476**
+
+* [`POST /realm/profile_fields`](/api/create-custom-profile-field),
+  [`GET /realm/profile_fields`](/api/get-custom-profile-fields),
+  [`PATCH /realm/profile_fields/{field_id}`](/api/update-custom-profile-field)
+  The `display_in_profile_summary` parameter can now be set to true for
+  the `Paragraph` field type.
+
+**Feature level 475**
+
+* [`GET /events`](/api/get-events): `realm_user` events with `op: "update"`
+  are now sent when the `date_joined` field is updated after an imported
+  stub user or a user created via the API logs in for the first time.
+* [`GET /users`](/api/get-users), [`GET /users/{user_id}`](/api/get-user),
+  [`GET /users/{email}`](/api/get-user-by-email),
+  [`GET /users/me`](/api/get-own-user): The `date_joined` field is initially
+  set to the account creation time and is updated to the time of first login
+  for imported stub users and users created via the API.
+
+**Feature level 474**
+
+* [`GET /events`](/api/get-events), [`POST /register`](/api/register-queue):
+  Removed `api_key` field from bot objects.
+* [`GET /events`](/api/get-events): `realm_bot/update` event is no longer
+  sent when a bot's api key is regenerated.
+* [`GET /events`](/api/get-events), [`POST /register`](/api/register-queue):
+  Removed `avatar_url`, `bot_type`, `email`, `full_name`, `is_active` and
+  `owner_id` fields from bot objects.
+* [`GET /events`](/api/get-events): `realm_bot/update` event is no longer
+  sent when updating a bot's avatar, email, name, or owner and also when
+  deactivating or reactivating a bot.
+
+**Feature level 473**
+
+* [`POST /users/{user_id}/status`](/api/update-status-for-user): Bots
+  with administrator permissions can now use this endpoint.
+
+**Feature level 472**
+
+* [`GET /attachments`](/api/get-attachments), [`GET /events`](/api/get-events):
+  Previously, the `messages` field in `Attachment` was array of
+  objects containing `id` and `date_sent` properties. That has been replaced
+  by a `message_ids` field, which is a flat array of message IDs.
+
+**Feature level 471**
+
+* [`GET /events`](/api/get-events), [`GET /realm/linkifiers`](/api/get-linkifiers),
+  [`POST /realm/filters`](/api/add-linkifier),
+  [`PATCH /realm/filters/{filter_id}`](/api/update-linkifier):
+  Added `example_input` and `reverse_template` to linkifier objects.
+  `example_input` is a sample string matching the url_pattern for the linkifier.
+  `reverse_template` is a string that can process input params and turn a url into
+  it's abbreviated form.
+  `reverse_template` requires `example_input` to be provided.
+  Pass an empty string during PATCH to set either of these fields back to null, given
+  they satisfy the requirements stated above.
+
+**Feature level 470**
+
+* [`POST /remove_client_device`](/api/remove-client-device):
+  Added a new endpoint to remove a registered device.
+
+**Feature level 469**
+
+* `PATCH /realm`, [`POST /register`](/api/register-queue),
+  [`GET /events`](/api/get-events): Added a new
+  `media_preview_size` realm setting that controls the size of
+  image and video thumbnails in messages.
+
+**Feature level 468**
+
+* [`POST /register_client_device`](/api/register-client-device):
+  Added a new endpoint to register a logged-in device.
+* [`POST /register`](/api/register-queue): Added `devices`
+  field to response.
+* [`GET /events`](/api/get-events):  A `device` event is sent
+  to clients to live-update the `devices` dictionary.
+* [`POST /mobile_push/register`](register-push-device): Redesigned
+  the endpoint to support rotation of `push_key` and FCM/APNs provided token.
+* [`POST /remotes/push/e2ee/register`](/api/register-remote-push-device):
+  Replaced `push_account_id` with `token_id` to support rotation
+  of `push_key` and FCM/APNs provided token.
+* [`POST /mobile_push/e2ee/test_notification`](/api/e2ee-test-notify):
+  Replaced `push_account_id` parameter with `device_id`.
+* [`POST /register`](/api/register-queue): Removed `push_devices`
+  field from response.
+* [`GET /events`](/api/get-events): Removed `push_device` event.
+
+**Feature level 467**
+
+* [Message formatting](/api/message-formatting): The new Markdown
+  image syntax now only supports/permits uploaded images, not
+  third-party image URLs.
+
+**Feature level 466**
+
+* [`POST /register`](/api/register-queue): Added `realm_uuid`
+  field to response. Used by clients that prefer to compute
+  Jdenticon avatars locally.
+* [`POST /register`](/api/register-queue), [`GET
+  /events`](/api/get-events): The `avatar_source` fields may now have
+  the value `"J"`, for Jdenticons.
+
+**Feature level 465**
+
+* [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
+  `PATCH /realm`: Nextcloud Talk integration added as an option
+  for the realm setting `video_chat_provider`.
+* [`POST /calls/nextcloud_talk/create`](/api/create-nextcloud-talk-video-call):
+  Added a new endpoint to create a Nextcloud Talk video call URL.
+
+**Feature level 464**
+
+* [`GET /events`](/api/get-events): The server now sends a
+  `realm/update_dict` event instead of `realm/update` event when a
+  Realm's `description` property is changed.
+
+**Feature level 463**
+
+* [`GET /bots/{bot_id}/api_key`](/api/get-bot-api-key): Added
+  new endpoint to get a bot's API key.
+
+**Feature level 462**
+
+* [`GET /events`](/api/get-events): Added `rendered_description` field
+  to the realm update event when the `description` property is
+  changed. Note that this new field was removed and replaced with the
+  standard `update_dict` mechanism in feature level 464.
+
+**Feature level 461**
+
+* [`GET /events`](/api/get-events): `realm_bot` update events are
+  now sent when a bot's Zulip display email address is changed.
+
+**Feature level 460**
+
+* [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
+  `PATCH /realm`: Constructor Groups integration added as an option
+  for the realm setting `video_chat_provider`.
+* [`POST /calls/constructorgroups/create`](/api/create-constructor-groups-video-call):
+  Added a new endpoint to create a Constructor Groups video call URL.
+
+**Feature level 459**
+
+* [`DELETE /users/{user_id}`](/api/deactivate-user): Added new
+  parameter `actions` that asks the server to perform additional
+  actions, such as deleting messages the user sent, while deactivating
+  the user.
+
+**Feature level 458**
+
+* [`GET users/{user_id}/channels`](/api/get-user-channels): Fixed
+  missing support for querying subscriptions of bot users.
+* [`GET /users/{user_id}/subscriptions/{stream_id}`](/api/get-subscription-status):
+  Fixed missing support for querying subscriptions of bot users.
+* [`GET /user_groups/{user_group_id}/members/{user_id}`](/api/get-is-user-group-member):
+  Fixed missing support for querying group membership of bot users.
+
+**Feature level 457**
+
+* [`GET /events`](/api/get-events): `delete_message` events are now
+  sent to the user who deletes the message only if they have content
+  access to the messages' recipient, and the `message_ids` list only
+  includes IDs of the messages that they can access.
+
+**Feature level 456**
+
+* `PATCH /realm`, [`POST /register`](/api/register-queue),
+  [`GET /events`](/api/get-events): Added a new
+  `default_avatar_source` realm setting.
 
 **Feature level 455**
 
@@ -32,7 +543,7 @@ format used by the Zulip server that they are interacting with.
 
 **Feature level 454**
 
-- [`PATCH /realm/user_settings_defaults`](/api/update-realm-user-settings-defaults)
+* [`PATCH /realm/user_settings_defaults`](/api/update-realm-user-settings-defaults)
   [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
   [`PATCH /settings`](/api/update-settings): Changed the `web_home_view`
   value for the recent view to "recent".
@@ -50,10 +561,8 @@ format used by the Zulip server that they are interacting with.
 
 **Feature level 452**
 
-* [`GET /events`](/api/get-events): Prior to Zulip 12.0 (feature level 452)
-  messages deleted via a message retention policy incorrectly failed to generate
-  `delete_message` events. This is now fixed, allowing clients to correctly update
-  their message state, by removing the affected messages from view.
+* [`GET /events`](/api/get-events): Messages deleted via a message
+  retention policy now correctly generate `delete_message` events.
 
 **Feature level 451**
 
@@ -120,6 +629,10 @@ element to plain escaped text.
 * [`PATCH /messages/{message_id}`](/api/update-message): The `create_time` and
   `date_sent` fields in `detached_uploads` object will now return UNIX timestamps
   in seconds. Previously, these values were returned in milliseconds.
+* [`DELETE /users/me/avatar`](/api/delete-avatar): This endpoint is now
+  idempotent. Previously, calling it when the current user had not
+  uploaded a custom profile picture would still increment their avatar
+  version and send a redundant user update event to clients.
 
 **Feature level 442**
 
@@ -154,7 +667,8 @@ element to plain escaped text.
 * [`GET /events`](/api/get-events): The deprecated `update_display_settings`
   and `update_global_notifications` event types are no longer sent to any
   clients. These legacy event types were deprecated in Zulip 5.0 (feature
-  level 89) and replaced by the `user_settings` event type.
+  level 89) and replaced by the [`user_settings` event
+  type](/api/get-events#user_settings-update).
 
 **Feature level 438**
 
@@ -172,6 +686,9 @@ element to plain escaped text.
   backwards-compatibility users in the format intended for clients
   using `POST /register` without the `user_list_incomplete` client
   capability.
+* [Message formatting](/api/message-formatting): Added support for
+  Markdown image syntax, in addition to the previous link-derived
+  image previews; these can be inserted into any block-level element.
 
 **Feature level 436**
 
@@ -183,6 +700,12 @@ element to plain escaped text.
 * [`POST /register`](/api/register-queue): Added `server_report_message_types`
   field which contains a list of supported report types for the [message
   report](/help/report-a-message) feature.
+* [`POST /message/{message_id}/report`](/api/report-message): Clients
+  that support the [message report](/help/report-a-message) feature
+  should use the `key` values in the `server_report_message_types` as the
+  valid values for the `report_type` parameter. Prior to this feature
+  level, the valid values for the `report_type` parameter were limited to:
+  `"harassment"`, `"inappropriate"`, `"norms"`, `"other"`, `"spam"`.
 
 **Feature level 434**
 
@@ -239,9 +762,9 @@ group DM conversations.
 
 **Feature level 427**
 
-* [`POST /register`](/api/register-queue): `stream_creator_or_nobody`
+* [`POST /register`](/api/register-queue): `"stream_creator_or_nobody"`
   value for `default_group_name` field in `server_supported_permission_settings`
-  object is renamed to `channel_creator`.
+  object is renamed to `"channel_creator"`.
 
 **Feature level 426**
 
@@ -336,7 +859,7 @@ No changes; API feature level used for the Zulip 11.0 release.
   `zulip_message_ids`.
 * Mobile push notification payloads for FCM to for new messages no
   longer contain the (unused) `content_truncated` boolean field.
-- E2EE mobile push notification payloads now have a [modernized and
+* E2EE mobile push notification payloads now have a [modernized and
   documented format](/api/mobile-notifications).
 
 **Feature level 412**
@@ -399,7 +922,7 @@ No changes; API feature level used for the Zulip 11.0 release.
   `can_delete_own_message_group` parameter to support setting and
   changing the user group whose members can delete the messages they have sent
   in the channel.
-- [`POST /users/{user_id}/status`](/api/update-status-for-user): Added
+* [`POST /users/{user_id}/status`](/api/update-status-for-user): Added
   new API endpoint for an administrator to update the status for
   another user.
 
@@ -671,8 +1194,9 @@ No changes; API feature level used for the Zulip 11.0 release.
 
 **Feature level 382**
 
-* `POST /message/{message_id}/report`: Added a new endpoint for submitting
-  a moderation request for a message.
+* [`POST /message/{message_id}/report`](/api/report-message): Added a new
+  endpoint for [submitting a moderation request](/help/report-a-message)
+  for a message.
 
 **Feature level 381**
 
@@ -772,7 +1296,7 @@ No changes; feature level used for Zulip 10.0 release.
   the field is not present. Clients should use this field, rather than
   parsing the message object's `edit_history` array, to display an
   indicator that the message has been moved.
- * [`GET /events`](/api/get-events), [`GET /messages`](/api/get-messages),
+* [`GET /events`](/api/get-events), [`GET /messages`](/api/get-messages),
   [`GET /messages/{message_id}`](/api/get-message): The
   `last_edit_timestamp` field on message objects is only present if the
   message's content has been edited. Previously, this field was present
@@ -1058,9 +1582,9 @@ No changes; feature level used for Zulip 10.0 release.
 
 **Feature level 340**
 
-[`PATCH /user_groups/{user_group_id}`](/api/update-user-group): All
-the permission settings and description can now be updated for
-deactivated groups.
+* [`PATCH /user_groups/{user_group_id}`](/api/update-user-group): All
+  the permission settings and description can now be updated for
+  deactivated groups.
 
 **Feature level 339**
 
@@ -1173,9 +1697,9 @@ deactivated groups.
   `server_max_deactivated_realm_deletion_days` fields for the permitted
   number of days before full data deletion of a deactivated organization
   on the server.
-* `POST /realm/deactivate`: Added `deletion_delay_days` parameter to
-  support setting when a full data deletion of the deactivated
-  organization may be done.
+* [`POST /realm/deactivate`](/api/deactivate-realm): Added
+  `deletion_delay_days` parameter to support setting when a full data
+  deletion of the deactivated organization may be done.
 
 **Feature level 331**
 
@@ -1561,9 +2085,11 @@ deactivated groups.
 
 * [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
   [`POST /realm/profile_fields`](/api/create-custom-profile-field),
-  [`GET /realm/profile_fields`](/api/get-custom-profile-fields): Added a new
-  parameter `editable_by_user` to custom profile field objects, which indicates whether
-  regular users can edit the value of the profile field on their own account.
+  [`GET /realm/profile_fields`](/api/get-custom-profile-fields),
+  [`PATCH /realm/profile_fields/{field_id}`](/api/update-custom-profile-field):
+  Added a new parameter `editable_by_user` to custom profile field objects,
+  which indicates whether regular users can edit the value of the profile
+  field on their own account.
 
 **Feature level 295**
 
@@ -1974,9 +2500,10 @@ No changes; feature level used for Zulip 9.0 release.
 
 **Feature level 252**
 
-* `PATCH /realm/profile_fields/{field_id}`: `name`, `hint`, `display_in_profile_summary`,
-  `required` and `field_data` fields are now optional during an update. Previously we
-  required the clients to populate the fields in the PATCH request even if there was
+* [`PATCH /realm/profile_fields/{field_id}`](/api/update-custom-profile-field):
+  `name`, `hint`, `display_in_profile_summary`, `required` and `field_data`
+  fields are now optional during an update. Previously we required the
+  clients to populate the fields in the PATCH request even if there was
   no change to those fields' values.
 
 **Feature level 251**
@@ -2039,10 +2566,11 @@ No changes; feature level used for Zulip 9.0 release.
 
 * [`POST /register`](/api/register-queue), [`GET /events`](/api/get-events),
   [`POST /realm/profile_fields`](/api/create-custom-profile-field),
-  [`GET /realm/profile_fields`](/api/get-custom-profile-fields): Added a new
-  parameter `required`, on custom profile field objects, indicating whether an
-  organization administrator has configured the field as something users should
-  be required to provide.
+  [`GET /realm/profile_fields`](/api/get-custom-profile-fields),
+  [`PATCH /realm/profile_fields/{field_id}`](/api/update-custom-profile-field):
+  Added a new parameter `required`, on custom profile field objects,
+  indicating whether an organization administrator has configured the
+  field as something users should be required to provide.
 
 **Feature level 243**
 
@@ -2345,14 +2873,16 @@ No changes; feature level used for Zulip 8.0 release.
 
 **Feature level 212**
 
-* [`GET /events`](/api/get-events), [`POST /register`](/api/register-queue),
-  `PATCH /realm`: Added the `jitsi_server_url` field to the `realm` object,
-  allowing organizations to set a custom Jitsi Meet server. Previously, this
-  was only available as a server-level configuration.
+* [`GET /events`](/api/get-events), [`POST /register`](/api/register-queue)
+  `PATCH /realm`: Added the `jitsi_server_url` realm setting, allowing
+  organizations to set a custom Jitsi Meet server. Previously, this was
+  only available as a server-level configuration.
 
 * [`POST /register`](/api/register-queue): Added `server_jitsi_server_url`
-  fields to the `realm` object. The existing `jitsi_server_url` will now be
-  calculated as `realm_jitsi_server_url || server_jitsi_server_url`.
+  field to the response for the Jitsi Meet server-level configuration. The
+  existing `jitsi_server_url` field, which previously was the same value of
+  the new field, is now deprecated and will be calculated as
+  `realm_jitsi_server_url ?? server_jitsi_server_url`.
 
 **Feature level 211**
 
@@ -2565,7 +3095,7 @@ No changes; feature level used for Zulip 8.0 release.
   `enable_followed_topic_desktop_notifications`
   and `enable_followed_topic_audible_notifications` to control whether a user
   receives email, push, wildcard mention, visual desktop and audible desktop
-  notifications, respectively, for messages sent to followed topics.
+  notifications, respectively, for messages sent to followed topics.
 
 **Feature level 188**
 
@@ -2833,8 +3363,9 @@ No changes; feature level used for Zulip 7.0 release.
 
 **Feature level 160**
 
-* `POST /api/v1/jwt/fetch_api_key`: Added new endpoint to fetch API
-  keys using JSON Web Token (JWT) authentication.
+* [`POST /api/v1/jwt/fetch_api_key`](/api/jwt-fetch-api-key): Added
+  new endpoint to fetch API keys using JSON Web Token (JWT)
+  authentication.
 * `accounts/login/jwt/`: Adjusted format of requests to undocumented,
   optional endpoint for JWT authentication log in support.
 
@@ -2952,10 +3483,11 @@ No changes; feature level used for Zulip 6.0 release.
 **Feature level 146**
 
 * [`POST /realm/profile_fields`](/api/create-custom-profile-field),
-[`GET /realm/profile_fields`](/api/get-custom-profile-fields): Added a
-new parameter `display_in_profile_summary`, which clients use to
-decide whether to display the field in a small/summary section of the
-user's profile.
+[`GET /realm/profile_fields`](/api/get-custom-profile-fields),
+[`PATCH /realm/profile_fields/{field_id}`](/api/update-custom-profile-field):
+Added a new parameter `display_in_profile_summary`, which clients use
+to decide whether to display the field in a small/summary section of
+the user's profile.
 
 **Feature level 145**
 
@@ -2974,9 +3506,11 @@ user's profile.
   `emails_restricted_to_domains`, `invite_required`, and
   `waiting_period_threshold` settings can no longer be changed by
   organization administrators who are not owners.
-* `PATCH /realm/domains`, `POST /realm/domains`, `DELETE
-  /realm/domains`: Organization administrators who are not owners can
-  no longer access these endpoints.
+* [`POST /realm/domains`](/api/add-realm-domain),
+  [`PATCH /realm/domains/{domain}`](/api/patch-realm-domain),
+  [`DELETE /realm/domains/{domain}`](/api/delete-realm-domain):
+  Organization administrators who are not owners can no longer access
+  these endpoints.
 
 **Feature level 142**
 
@@ -3593,8 +4127,8 @@ No changes; feature level used for Zulip 4.0 release.
   parameter `default_language`.
 * `POST /users/me/tutorial_status`: Removed unnecessary JSON-encoding of string
   parameter `status`.
-* `POST /realm/domains`: Removed unnecessary JSON-encoding of string
-  parameter `domain`.
+* [`POST /realm/domains`](/api/add-realm-domain): Removed unnecessary
+  JSON-encoding of string parameter `domain`.
 * `PATCH /default_stream_groups/{user_id}`: Removed unnecessary JSON-encoding of string
   parameters `new_group_name` and `new_description`.
 * `POST /users/me/hotspots`: Removed unnecessary JSON-encoding of string

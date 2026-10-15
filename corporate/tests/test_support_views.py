@@ -1,3 +1,4 @@
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from unittest import mock
@@ -5,6 +6,7 @@ from unittest import mock
 import orjson
 import time_machine
 from django.conf import settings
+from django.test import override_settings
 from django.utils.timezone import now as timezone_now
 from typing_extensions import override
 
@@ -14,6 +16,7 @@ from corporate.lib.stripe import (
     RemoteServerBillingSession,
     add_months,
     get_configured_fixed_price_plan_offer,
+    get_next_billing_cycle_for_plan,
     start_of_next_billing_cycle,
 )
 from corporate.models.customers import Customer, get_customer_by_realm
@@ -73,8 +76,8 @@ class TestRemoteServerSupportEndpoint(ZulipTestCase):
                 LicenseLedger.objects.filter(plan=complimentary_access_plan).order_by("-id").first()
             )
             assert last_ledger_entry is not None
-            last_ledger_entry.licenses_at_next_renewal = billed_licenses
-            last_ledger_entry.save(update_fields=["licenses_at_next_renewal"])
+            last_ledger_entry.workplace_licenses_at_next_renewal = billed_licenses
+            last_ledger_entry.save(update_fields=["workplace_licenses_at_next_renewal"])
             complimentary_access_plan.status = CustomerPlan.SWITCH_PLAN_TIER_AT_PLAN_END
             complimentary_access_plan.save(update_fields=["status"])
             plan_params = {
@@ -669,6 +672,7 @@ class TestRemoteServerSupportEndpoint(ZulipTestCase):
             "/activity/remote/support",
             {
                 "remote_server_id": f"{remote_server_with_upgrade.id}",
+                "remote_server_deactivation_reason": "tos_violation",
                 "remote_server_status": "deactivated",
             },
         )
@@ -687,6 +691,7 @@ class TestRemoteServerSupportEndpoint(ZulipTestCase):
             "/activity/remote/support",
             {
                 "remote_server_id": f"{remote_server_no_upgrade.id}",
+                "remote_server_deactivation_reason": "tos_violation",
                 "remote_server_status": "deactivated",
             },
         )
@@ -708,6 +713,7 @@ class TestRemoteServerSupportEndpoint(ZulipTestCase):
                 '<span class="remote-label">Remote server: deactivated</span>',
                 "♻️ Reactivate server:",
                 "<b>Acting user</b>: iago@zulip.com",
+                "<b>Deactivation reason</b>: tos_violation",
             ],
             result,
         )
@@ -756,8 +762,8 @@ class TestSupportEndpoint(ZulipTestCase):
             next_invoice_date=add_months(now, months),
         )
         LicenseLedger.objects.create(
-            licenses=10,
-            licenses_at_next_renewal=10,
+            workplace_licenses=10,
+            workplace_licenses_at_next_renewal=10,
             event_time=now,
             is_renewal=True,
             plan=plan,
@@ -767,7 +773,7 @@ class TestSupportEndpoint(ZulipTestCase):
     def test_realm_support_view_queries(self) -> None:
         iago = self.example_user("iago")
         self.login_user(iago)
-        with self.assert_database_query_count(23):
+        with self.assert_database_query_count(22):
             result = self.client_get("/activity/support", {"q": "zulip"}, subdomain="zulip")
             self.assertEqual(result.status_code, 200)
 
@@ -1564,7 +1570,6 @@ class TestSupportEndpoint(ZulipTestCase):
         )
 
         customer = self.create_customer_and_plan(lear_realm, True)
-        assert customer is not None
         current_plan = get_current_plan_by_customer(customer)
         assert current_plan is not None
         self.assertIsNone(current_plan.end_date)
@@ -1653,6 +1658,19 @@ class TestSupportEndpoint(ZulipTestCase):
         self.assertEqual(plan_offer.status, CustomerPlanOffer.CONFIGURED)
         self.assertEqual(plan_offer.fixed_price, 36000)
         self.assertIsNone(plan_offer.sent_invoice_id)
+
+        # Trying to schedule a second fixed-price plan renewal fails.
+        result = self.client_post(
+            "/activity/support", {"realm_id": f"{lear_realm.id}", "fixed_price": 500}
+        )
+        self.assert_in_success_response(
+            ["Customer already has a configured fixed-price plan offer."],
+            result,
+        )
+        customer.refresh_from_db()
+        plan_offer = get_configured_fixed_price_plan_offer(customer, customer.required_plan_tier)
+        assert plan_offer is not None
+        self.assertEqual(plan_offer.fixed_price, 36000)
 
         # Test deleting the fixed-price plan offer via support.
         result = self.client_post(
@@ -1768,7 +1786,7 @@ class TestSupportEndpoint(ZulipTestCase):
         )
 
         billing_session = RealmBillingSession(user=iago, realm=lear_realm, support_session=True)
-        next_billing_cycle = billing_session.get_next_billing_cycle(plan).date().isoformat()
+        next_billing_cycle = get_next_billing_cycle_for_plan(plan).date().isoformat()
         with time_machine.travel(datetime(2016, 1, 3, tzinfo=timezone.utc), tick=False):
             result = self.client_post(
                 "/activity/support",
@@ -1812,20 +1830,42 @@ class TestSupportEndpoint(ZulipTestCase):
         self.assertEqual(next_plan.charge_automatically, plan.charge_automatically)
         self.assertTrue(next_plan.automanage_licenses)
 
-        # Test deleting the fixed-price next plan via support.
+        # Trying to schedule a second fixed-price plan renewal fails.
         result = self.client_post(
-            "/activity/support",
-            {
-                "realm_id": f"{lear_realm.id}",
-                "delete_fixed_price_next_plan": "true",
-            },
+            "/activity/support", {"realm_id": f"{lear_realm.id}", "fixed_price": 500}
         )
+        self.assert_in_success_response(
+            ["Customer already has a fixed-price plan renewal scheduled."],
+            result,
+        )
+        plan.refresh_from_db()
+        next_plan = billing_session.get_next_plan(plan)
+        assert next_plan is not None
+        self.assertEqual(next_plan.fixed_price, 36000)
+
+        # Test deleting the fixed-price next plan via support.
+        with (
+            self.assertLogs("corporate.stripe", "INFO") as m,
+        ):
+            result = self.client_post(
+                "/activity/support",
+                {
+                    "realm_id": f"{lear_realm.id}",
+                    "delete_fixed_price_next_plan": "true",
+                },
+            )
+            expected_log = f"INFO:corporate.stripe:Change plan status: Customer.id: {customer.id}, CustomerPlan.id: {plan.id}, status: {CustomerPlan.ACTIVE}"
+            self.assertEqual(m.output[0], expected_log)
         self.assert_in_success_response(
             ["Fixed-price scheduled plan deleted"],
             result,
         )
         next_plan = billing_session.get_next_plan(plan)
         self.assertIsNone(next_plan)
+
+        # Confirm that the existing plan's status has been reset to active.
+        plan.refresh_from_db()
+        self.assertEqual(plan.status, CustomerPlan.ACTIVE)
 
     def test_deactivated_realm_support_view_and_actions(self) -> None:
         support_admin = self.example_user("iago")
@@ -2131,3 +2171,182 @@ class TestSupportEndpoint(ZulipTestCase):
             )
             m.assert_called_once_with(hamlet, acting_user=self.example_user("iago"))
             self.assert_in_success_response([f"{hamlet_email} in zulip deleted"], result)
+
+
+class TestContactForms(ZulipTestCase):
+    def test_demo_request(self) -> None:
+        result = self.client_get("/request-demo/")
+        self.assertEqual(result.status_code, 200)
+        self.assert_in_success_response(["Request a demo"], result)
+
+        data = {
+            "full_name": "King Hamlet",
+            "email": "test@zulip.com",
+            "role": "Manager",
+            "organization_name": "Zulip",
+            "organization_type": "Business",
+            "organization_website": "https://example.com",
+            "expected_user_count": "10 (2 unpaid members)",
+            "type_of_hosting": "Zulip Cloud",
+            "message": "Need help!",
+        }
+
+        from django.core.mail import outbox
+
+        # A validation failure re-renders the form with the error
+        # displayed and the submitted values preserved.
+        result = self.client_post("/request-demo/", {**data, "email": "invalid"})
+        self.assert_in_success_response(
+            ["Enter a valid email address.", "King Hamlet", "Need help!"], result
+        )
+        self.assert_length(outbox, 0)
+
+        result = self.client_post("/request-demo/", data)
+        self.assert_in_success_response(["Thanks for contacting us!"], result)
+
+        self.assert_length(outbox, 1)
+
+        for message in outbox:
+            self.assert_length(message.to, 1)
+            self.assertEqual(message.to[0], "sales@zulip.com")
+            self.assertEqual(message.subject, "Demo request for Zulip")
+            self.assertEqual(message.reply_to, ["test@zulip.com"])
+            self.assertEqual(self.email_envelope_from(message), settings.NOREPLY_EMAIL_ADDRESS)
+            self.assertIn("Zulip demo request <noreply-", self.email_display_from(message))
+            self.assertIn("Full name: King Hamlet", message.body)
+            self.assertIn("Zulip Cloud", message.body)
+
+    @override_settings(USING_CAPTCHA=True, ALTCHA_HMAC_KEY="secret")
+    def test_demo_request_with_captcha(self) -> None:
+        result = self.client_get("/request-demo/")
+        self.assert_in_success_response(["altcha-widget"], result)
+
+        data = {
+            "full_name": "King Hamlet",
+            "email": "test@zulip.com",
+            "role": "Manager",
+            "organization_name": "Zulip",
+            "organization_type": "Business",
+            "organization_website": "https://example.com",
+            "expected_user_count": "10 (2 unpaid members)",
+            "type_of_hosting": "Zulip Cloud",
+            "message": "Need help!",
+        }
+
+        from django.core.mail import outbox
+
+        # Without a solved captcha, the request is rejected, and no
+        # email is sent.
+        result = self.client_post("/request-demo/", data)
+        self.assert_in_success_response(["Validation failed, please try again."], result)
+        self.assert_length(outbox, 0)
+
+        # Fetch a challenge, to submit solutions for, mocking out
+        # the cryptographic validation of the payload.
+        challenge_data = self.assert_json_success(self.client_get("/json/antispam_challenge"))
+        captcha = base64.b64encode(
+            orjson.dumps({"challenge": challenge_data["challenge"]})
+        ).decode()
+
+        # A validation failure in some other field shows that field's
+        # error, preserves the typed input, and does not consume the
+        # solved challenge.
+        with mock.patch("zerver.lib.captcha.verify_solution", return_value=(True, None)) as verify:
+            result = self.client_post(
+                "/request-demo/", {**data, "email": "invalid", "captcha": captcha}
+            )
+            verify.assert_not_called()
+        self.assert_in_success_response(
+            ["Enter a valid email address.", "King Hamlet", "Need help!"], result
+        )
+        self.assert_length(outbox, 0)
+        self.assert_length(self.client.session["altcha_challenges"], 1)
+
+        # The same solved challenge is accepted on the corrected
+        # resubmission, and is then consumed.
+        with mock.patch("zerver.lib.captcha.verify_solution", return_value=(True, None)):
+            result = self.client_post("/request-demo/", {**data, "captcha": captcha})
+        self.assert_in_success_response(["Thanks for contacting us!"], result)
+        self.assert_length(outbox, 1)
+        self.assertEqual(self.client.session["altcha_challenges"], [])
+
+    def test_support_request(self) -> None:
+        user = self.example_user("hamlet")
+        self.assertIsNone(get_customer_by_realm(user.realm))
+
+        self.login_user(user)
+
+        result = self.client_get("/support/")
+        self.assertEqual(result.status_code, 200)
+        self.assert_in_success_response(["Contact support"], result)
+
+        data = {
+            "request_subject": "Not getting messages.",
+            "request_message": "Running into this weird issue.",
+        }
+        result = self.client_post("/support/", data)
+        self.assert_in_success_response(["Thanks for contacting us!"], result)
+
+        from django.core.mail import outbox
+
+        self.assert_length(outbox, 1)
+
+        for message in outbox:
+            self.assert_length(message.to, 1)
+            self.assertEqual(message.to[0], "desdemona+admin@zulip.com")
+            self.assertEqual(message.subject, "Support request for zulip")
+            self.assertEqual(message.reply_to, ["hamlet@zulip.com"])
+            self.assertEqual(self.email_envelope_from(message), settings.NOREPLY_EMAIL_ADDRESS)
+            self.assertIn("Zulip support request <noreply-", self.email_display_from(message))
+            self.assertIn("Requested by: King Hamlet (Member)", message.body)
+            self.assertIn(
+                "Support URL: http://zulip.testserver/activity/support?q=zulip", message.body
+            )
+            self.assertIn("Subject: Not getting messages.", message.body)
+            self.assertIn("Message:\nRunning into this weird issue", message.body)
+
+    def test_sales_support_request(self) -> None:
+        # Only organization administrators can contact sales.
+        self.login("hamlet")
+        result = self.client_get("/contact-sales/")
+        self.assertEqual(result.status_code, 404)
+
+        iago = self.example_user("iago")
+        self.login_user(iago)
+        result = self.client_get("/contact-sales/")
+        self.assert_in_success_response(
+            ["Contact sales", "Iago (iago@zulip.com)"],
+            result,
+        )
+
+        from django.core.mail import outbox
+
+        data = {
+            "organization_website": "example.com",
+            "expected_user_count": "50-100",
+            "message": "We'd like a quote.",
+        }
+
+        # An invalid submission re-renders the form and sends nothing.
+        result = self.client_post("/contact-sales/", {**data, "message": ""})
+        self.assert_in_success_response(["Contact sales"], result)
+        self.assert_length(outbox, 0)
+
+        result = self.client_post("/contact-sales/", data)
+        self.assert_in_success_response(["Thanks for contacting us!"], result)
+
+        self.assert_length(outbox, 1)
+        message = outbox[0]
+        self.assert_length(message.to, 1)
+        self.assertEqual(message.to[0], "sales@zulip.com")
+        self.assertEqual(message.subject, "Sales support request for Zulip Dev")
+        self.assertEqual(message.reply_to, ["iago@zulip.com"])
+        self.assertEqual(self.email_envelope_from(message), settings.NOREPLY_EMAIL_ADDRESS)
+        self.assertIn("Sales support request <noreply-", self.email_display_from(message))
+        self.assertIn("Full name: Iago", message.body)
+        self.assertIn("Role: administrator", message.body)
+        self.assertIn("Organization type: Business", message.body)
+        self.assertIn("Organization website: https://example.com", message.body)
+        self.assertIn("Expected user count: 50-100", message.body)
+        self.assertIn("Message: We'd like a quote.", message.body)
+        self.assertIn("/activity/support?q=zulip", message.body)

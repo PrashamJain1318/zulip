@@ -140,7 +140,7 @@ def create_confirmation_object(
     obj: ConfirmationObjT,
     confirmation_type: int,
     *,
-    validity_in_minutes: int | None | Unset = UNSET,
+    validity_in_minutes: int | Unset | None = UNSET,
     no_associated_realm_object: bool = False,
 ) -> "Confirmation":
     # validity_in_minutes is an override for the default values which are
@@ -164,7 +164,6 @@ def create_confirmation_object(
         if validity_in_minutes is None:
             expiry_date = None
         else:
-            assert validity_in_minutes is not None
             expiry_date = current_time + timedelta(minutes=validity_in_minutes)
     else:
         expiry_date = current_time + timedelta(days=_properties[confirmation_type].validity_in_days)
@@ -183,7 +182,7 @@ def create_confirmation_link(
     obj: ConfirmationObjT,
     confirmation_type: int,
     *,
-    validity_in_minutes: int | None | Unset = UNSET,
+    validity_in_minutes: int | Unset | None = UNSET,
     url_args: Mapping[str, str] = {},
     no_associated_realm_object: bool = False,
 ) -> str:

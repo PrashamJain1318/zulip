@@ -1,22 +1,30 @@
-import $ from "jquery";
+import {$} from "jquery";
+import _ from "lodash";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 
 import render_delete_topic_modal from "../templates/confirm_dialog/confirm_delete_topic.hbs";
 import render_left_sidebar_topic_actions_popover from "../templates/popovers/left_sidebar/left_sidebar_topic_actions_popover.hbs";
+import render_left_sidebar_topic_links_popover from "../templates/popovers/left_sidebar/left_sidebar_topic_links_popover.hbs";
 
 import * as clipboard_handler from "./clipboard_handler.ts";
 import * as confirm_dialog from "./confirm_dialog.ts";
-import {$t_html} from "./i18n.ts";
+import {$t, $t_html} from "./i18n.ts";
 import * as message_delete from "./message_delete.ts";
 import * as message_edit from "./message_edit.ts";
+import * as message_store from "./message_store.ts";
 import * as message_summary from "./message_summary.ts";
 import * as popover_menus from "./popover_menus.ts";
 import * as popover_menus_data from "./popover_menus_data.ts";
+import * as recent_view_ui from "./recent_view_ui.ts";
 import * as starred_messages_ui from "./starred_messages_ui.ts";
 import {realm} from "./state_data.ts";
+import * as stream_data from "./stream_data.ts";
 import * as stream_popover from "./stream_popover.ts";
 import * as stream_topic_history from "./stream_topic_history.ts";
+import type {StreamSubscription} from "./sub_store.ts";
+import * as tippyjs from "./tippyjs.ts";
+import * as topic_link_util from "./topic_link_util.ts";
 import * as ui_util from "./ui_util.ts";
 import * as unread_ops from "./unread_ops.ts";
 import * as user_topics from "./user_topics.ts";
@@ -57,6 +65,75 @@ function get_conversation(instance: tippy.Instance): {
     return {stream_id, topic_name, url};
 }
 
+// Builds the render context for a cross-conversation link, matching the
+// data expected by the `channel_message_link` / `topic_link` /
+// `decorated_channel_name` templates so the popover renders these links
+// identically to how they appear inline in message content.
+function get_cross_conversation_link_render_context(link: message_store.TopicLink): {
+    url: string;
+    stream: StreamSubscription | undefined;
+    channel_id: number;
+    channel_name: string;
+    topic_display_name_html: string;
+    is_empty_string_topic: boolean;
+    is_message_link: boolean;
+} {
+    const topic_name =
+        stream_topic_history.get_known_topic_name(link.stream_id, link.topic) ?? link.topic;
+    const {url} = topic_link_util.get_topic_link_content_with_stream_id({
+        stream_id: link.stream_id,
+        topic_name,
+        message_id: link.message_id?.toString(),
+    });
+    const stream = stream_data.get_sub_by_id(link.stream_id);
+    return {
+        url,
+        stream,
+        channel_id: link.stream_id,
+        channel_name: stream?.name ?? "",
+        topic_display_name_html: _.escape(util.get_final_topic_display_name(topic_name)),
+        is_empty_string_topic: topic_name === "",
+        is_message_link: link.message_id !== undefined,
+    };
+}
+
+export function open_cross_topic_links(
+    stream_id: number,
+    topic_name: string,
+    placement: tippy.Placement,
+    target: tippy.ReferenceElement,
+): void {
+    popover_menus.toggle_popover_menu(target, {
+        theme: "popover-menu",
+        placement,
+        onShow(instance) {
+            popover_menus.popover_instances.topic_links = instance;
+            ui_util.show_left_sidebar_menu_icon(instance.reference);
+            popover_menus.on_show_prep(instance);
+
+            const links_from_narrow = message_store
+                .topic_links_from_narrow(stream_id, topic_name)
+                .map((link) => get_cross_conversation_link_render_context(link));
+            const links_to_narrow = message_store
+                .topic_links_to_narrow(stream_id, topic_name)
+                .map((link) => get_cross_conversation_link_render_context(link));
+            const context = {
+                has_links_from_narrow: links_from_narrow.length > 0,
+                links_from_narrow,
+                has_links_to_narrow: links_to_narrow.length > 0,
+                links_to_narrow,
+            };
+            instance.setContent(
+                ui_util.parse_html(render_left_sidebar_topic_links_popover(context)),
+            );
+        },
+        onHidden(instance) {
+            instance.destroy();
+            popover_menus.popover_instances.topic_links = null;
+        },
+    });
+}
+
 export function initialize(): void {
     $("body").on("click", ".recipient-bar-copy-link-to-topic", (e) => {
         e.preventDefault();
@@ -85,10 +162,21 @@ export function initialize(): void {
         })();
     });
 
+    register_popover_menu("#stream_filters .topic-sidebar-menu-icon", "right");
+    register_popover_menu("#more-topics-modal .topic-sidebar-menu-icon", "right");
+    register_popover_menu(".inbox-row .inbox-topic-menu", "bottom");
+    register_popover_menu(
+        ".recipient-row-topic-menu, .recent_view_focusable .visibility-status-icon",
+        "bottom",
+    );
+}
+
+function register_popover_menu(target: string, placement: tippy.Placement): void {
     popover_menus.register_popover_menu(
-        "#stream_filters .topic-sidebar-menu-icon, .inbox-row .inbox-topic-menu, .recipient-row-topic-menu, .recent_view_focusable .visibility-status-icon",
+        target,
         {
-            ...popover_menus.left_sidebar_tippy_options,
+            theme: "popover-menu",
+            placement,
             onShow(instance) {
                 popover_menus.popover_instances.topics_menu = instance;
                 ui_util.show_left_sidebar_menu_icon(instance.reference);
@@ -114,9 +202,14 @@ export function initialize(): void {
                 const topic_display_name = context.topic_display_name;
                 const is_empty_string_topic = context.is_empty_string_topic;
 
-                const $elt = $(instance.reference).closest(".recent_view_focusable");
-                if ($elt.length === 1) {
-                    $elt.addClass("topic-popover-visible");
+                const $popover_trigger = $(instance.reference).closest(
+                    ".recent_view_focusable, .inbox-action-button",
+                );
+                if ($popover_trigger.length === 1) {
+                    $popover_trigger.addClass("topic-popover-visible");
+                    if ($popover_trigger.hasClass("recent-view-topic-visibility")) {
+                        recent_view_ui.update_visibility_icon_swap_state($popover_trigger);
+                    }
                 }
 
                 if (!stream_id) {
@@ -124,10 +217,12 @@ export function initialize(): void {
                     return;
                 }
 
-                $popper.on("change", "input[name='sidebar-topic-visibility-select']", (e) => {
+                popover_menus.focus_popover(instance);
+
+                $popper.on("change", "input[name='sidebar-topic-visibility-select']", function () {
                     const start_time = Date.now();
                     const visibility_policy = Number.parseInt(
-                        $(e.currentTarget).attr("data-visibility-policy")!,
+                        $(this).attr("data-visibility-policy")!,
                         10,
                     );
 
@@ -145,7 +240,7 @@ export function initialize(): void {
                             stream_id,
                             topic_name,
                         );
-                        const $prev_visibility_policy_input = $(e.currentTarget)
+                        const $prev_visibility_policy_input = $(this)
                             .parent()
                             .find(`input[data-visibility-policy="${prev_visibility_policy}"]`);
                         setTimeout(
@@ -188,18 +283,20 @@ export function initialize(): void {
                 });
 
                 $popper.one("click", ".sidebar-popover-delete-topic-messages", () => {
-                    const html_body = render_delete_topic_modal({
+                    const modal_content_html = render_delete_topic_modal({
                         topic_display_name,
                         is_empty_string_topic,
                     });
 
                     confirm_dialog.launch({
-                        html_heading: $t_html({defaultMessage: "Delete topic"}),
+                        modal_title_html: $t_html({defaultMessage: "Delete topic"}),
                         help_link: "/help/delete-a-topic",
-                        html_body,
+                        modal_content_html,
+                        modal_submit_button_text: $t({defaultMessage: "Delete"}),
                         on_click() {
                             message_delete.delete_topic(stream_id, topic_name);
                         },
+                        dangerous_action: true,
                     });
 
                     popover_menus.hide_current_popover_if_visible(instance);
@@ -250,6 +347,15 @@ export function initialize(): void {
                     popover_menus.hide_current_popover_if_visible(instance);
                 });
 
+                $popper.on("click", ".sidebar-open-topic-links", () => {
+                    const {stream_id, topic_name} = get_conversation(instance);
+                    // Keep the same placement when replacing the popover.
+                    const placement = tippyjs.get_actual_placement(instance);
+                    const reference = instance.reference;
+                    popover_menus.hide_current_popover_if_visible(instance);
+                    open_cross_topic_links(stream_id, topic_name, placement, reference);
+                });
+
                 $popper.on(
                     "click",
                     ".sidebar-popover-copy-link-to-topic",
@@ -259,13 +365,32 @@ export function initialize(): void {
                 );
             },
             onHidden(instance) {
-                const $elt = $(instance.reference).closest(".recent_view_focusable");
-                if ($elt.length === 1) {
-                    $elt.removeClass("topic-popover-visible");
+                const $popover_trigger = $(instance.reference).closest(
+                    ".recent_view_focusable, .inbox-action-button",
+                );
+                if ($popover_trigger.length === 1) {
+                    $popover_trigger.removeClass("topic-popover-visible");
+                    if ($popover_trigger.hasClass("recent-view-topic-visibility")) {
+                        recent_view_ui.update_visibility_icon_swap_state($popover_trigger);
+                    }
                 }
                 instance.destroy();
                 popover_menus.popover_instances.topics_menu = null;
                 ui_util.hide_left_sidebar_menu_icon();
+            },
+        },
+        {
+            also_trigger_on_enter: true,
+            get_focus_return_element(reference) {
+                // Left sidebar triggers sit inside a `.topic-box` or
+                // `.selectable_sidebar_block`; return focus to that
+                // enclosing row so the user re-lands on a natural
+                // target. From inbox and recent-view triggers there
+                // is no such ancestor, so fall back to the nearest
+                // focusable ancestor (or the reference itself)
+                // rather than crashing in `util.the`.
+                const $block = $(reference).closest(".topic-box, .selectable_sidebar_block");
+                return $block[0] ?? $(reference).closest("[tabindex='0']")[0] ?? reference;
             },
         },
     );

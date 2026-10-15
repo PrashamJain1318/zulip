@@ -14,12 +14,12 @@ from zerver.actions.streams import (
     do_deactivate_stream,
 )
 from zerver.lib.email_mirror_helpers import encode_email_address, get_channel_email_token
+from zerver.lib.event_types import SingleSubscription
 from zerver.lib.subscription_info import gather_subscriptions, gather_subscriptions_helper
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import most_recent_message
 from zerver.lib.types import (
     APIStreamDict,
-    APISubscriptionDict,
     NeverSubscribedStreamDict,
     SubscriptionInfo,
     UserGroupMembersData,
@@ -47,7 +47,6 @@ class GetStreamsTest(ZulipTestCase):
     def test_streams_api_for_bot_owners(self) -> None:
         hamlet = self.example_user("hamlet")
         test_bot = self.create_test_bot("foo", hamlet)
-        assert test_bot is not None
         realm = get_realm("zulip")
         self.login_user(hamlet)
 
@@ -286,7 +285,10 @@ class GetStreamsTest(ZulipTestCase):
             result = self.api_get(admin_user, url, data)
         json = self.assert_json_success(result)
 
-        backward_compatible_result = self.api_get(admin_user, url, backward_compatible_data)
+        with self.assertWarnsRegex(
+            DeprecationWarning, r"^include_all_active parameter is deprecated$"
+        ):
+            backward_compatible_result = self.api_get(admin_user, url, backward_compatible_data)
         json_for_backward_compatible_request = self.assert_json_success(backward_compatible_result)
 
         self.assertEqual(json, json_for_backward_compatible_request)
@@ -439,6 +441,14 @@ class GetStreamsTest(ZulipTestCase):
         self.assertEqual(json["stream"]["name"], "private_stream")
         self.assertEqual(json["stream"]["stream_id"], private_stream.id)
 
+        # Archived stream can also be accessed.
+        do_deactivate_stream(denmark_stream, acting_user=None)
+        result = self.client_get(f"/json/streams/{denmark_stream.id}")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["stream"]["name"], "Denmark")
+        self.assertEqual(json["stream"]["stream_id"], denmark_stream.id)
+        self.assertTrue(json["stream"]["is_archived"])
+
     def test_get_stream_email_address(self) -> None:
         self.login("hamlet")
         hamlet = self.example_user("hamlet")
@@ -566,7 +576,7 @@ class GetSubscribersTest(ZulipTestCase):
 
     def test_api_fields(self) -> None:
         """Verify that all the fields from `Stream.API_FIELDS` and `Subscription.API_FIELDS` present
-        in `APIStreamDict` and `APISubscriptionDict`, respectively.
+        in `APIStreamDict` and `SingleSubscription`, respectively.
         """
         expected_fields = set(Stream.API_FIELDS) | {"stream_id", "is_archived"}
         expected_fields -= {"id", "deactivated"}
@@ -584,11 +594,11 @@ class GetSubscribersTest(ZulipTestCase):
 
         expected_fields = set(Subscription.API_FIELDS)
 
-        subscription_dict_fields = set(APISubscriptionDict.__annotations__.keys())
+        subscription_dict_fields = set(SingleSubscription.model_fields)
         computed_fields = {"in_home_view", "email_address", "stream_weekly_traffic", "subscribers"}
-        # `APISubscriptionDict` is a subclass of `APIStreamDict`, therefore having all the
-        # fields in addition to the computed fields and `Subscription.API_FIELDS` that
-        # need to be excluded here.
+        # `SingleSubscription` has all the fields of `APIStreamDict`, which
+        # need to be excluded here in addition to the computed fields and
+        # `Subscription.API_FIELDS`.
         self.assertEqual(
             subscription_dict_fields - computed_fields - stream_dict_fields,
             expected_fields,
@@ -635,7 +645,7 @@ class GetSubscribersTest(ZulipTestCase):
         # verify that the user was sent a message informing them about the subscription
         realm = user.realm
         msg = most_recent_message(user)
-        self.assertEqual(msg.recipient.type, msg.recipient.PERSONAL)
+        self.assertEqual(msg.recipient.type, msg.recipient.DIRECT_MESSAGE_GROUP)
         self.assertEqual(msg.sender_id, self.notification_bot(realm).id)
 
         def non_ws(s: str) -> str:
@@ -680,6 +690,19 @@ class GetSubscribersTest(ZulipTestCase):
         get_subscribers returns the list of subscribers.
         """
         stream_name = gather_subscriptions(self.user_profile)[0][0]["name"]
+        self.make_successful_subscriber_request(stream_name)
+
+    def test_subscriber_archived_stream(self) -> None:
+        """
+        A user can fetch subscribers of an archived stream.
+        """
+        stream_name = "Saxony"
+        self.subscribe_via_post(self.user_profile, [stream_name])
+        stream = get_stream(stream_name, self.user_profile.realm)
+        do_deactivate_stream(stream, acting_user=None)
+
+        other_user = self.example_user("othello")
+        self.login_user(other_user)
         self.make_successful_subscriber_request(stream_name)
 
     @override_settings(MIN_PARTIAL_SUBSCRIBERS_CHANNEL_SIZE=5)
@@ -859,7 +882,7 @@ class GetSubscribersTest(ZulipTestCase):
             polonius.id,
         ]
 
-        with self.assert_database_query_count(49):
+        with self.assert_database_query_count(67):
             self.subscribe_via_post(
                 self.user_profile,
                 stream_names,

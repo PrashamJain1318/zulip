@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import * as z from "zod/mini";
 
 import * as loading from "../loading.ts";
@@ -61,10 +61,10 @@ async function stripe_checkout_session_status_check(stripe_session_id: string): 
     });
     const response_data = stripe_response_schema.parse(response);
 
-    if (response_data.session.status === "created") {
-        return false;
-    }
-    if (response_data.session.event_handler!.status === "started") {
+    if (
+        response_data.session.status === "created" ||
+        response_data.session.event_handler!.status === "started"
+    ) {
         return false;
     }
     if (response_data.session.event_handler!.status === "succeeded") {
@@ -123,7 +123,7 @@ export async function check_status(): Promise<boolean> {
 }
 
 async function start_status_polling(): Promise<void> {
-    let completed = false;
+    let completed;
     try {
         completed = await check_status();
     } catch {

@@ -20,11 +20,15 @@ from email.headerregistry import Address
 from functools import wraps
 from typing import Any, TypeVar
 
+from django.core.files.base import File
 from typing_extensions import ParamSpec
 from zulip import Client
 
+from zerver.actions.realm_emoji import check_add_realm_emoji
+from zerver.lib.storage import static_path
+from zerver.models.realm_emoji import RealmEmoji
 from zerver.models.realms import get_realm
-from zerver.models.users import get_user
+from zerver.models.users import UserProfile, get_user
 from zerver.openapi.openapi import validate_against_openapi_schema
 
 ZULIP_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,6 +63,18 @@ def openapi_test_function(
         return _record_calls_wrapper
 
     return wrapper
+
+
+def reset_realm_uploaded_emoji(user: UserProfile) -> None:
+    # Due to the way that the test runner varies settings.LOCAL_UPLOADS_DIR
+    # we need to reset the uploaded green_tick emoji in order to generate
+    # successful realm exports for the API python and curl example tests.
+    RealmEmoji.objects.all().delete()
+    IMAGE_FILE_PATH = static_path("images/test-images/checkbox.png")
+    with open(IMAGE_FILE_PATH, "rb") as fp:
+        check_add_realm_emoji(
+            user.realm, "green_tick", user, File(fp, name="checkbox.png"), "image/png"
+        )
 
 
 def ensure_users(ids_list: list[int], user_names: list[str]) -> None:
@@ -139,7 +155,7 @@ def add_subscriptions(client: Client) -> None:
     assert_success_response(result)
     validate_against_openapi_schema(result, "/users/me/subscriptions", "post", "200")
 
-    user_id = 25
+    user_id = 26
     ensure_users([user_id], ["newbie"])
     # {code_example|start}
     # To subscribe other users to a channel, you may pass
@@ -363,7 +379,7 @@ def get_members(client: Client) -> None:
             assert member.get("profile_data", None) is None
         else:
             assert member.get("profile_data", None) is not None
-        assert member["avatar_url"] is None
+        assert member["avatar_url"] is not None
 
 
 @openapi_test_function("/users/{email}:get")
@@ -645,7 +661,7 @@ def reorder_realm_profile_fields(client: Client) -> None:
 
 
 @openapi_test_function("/realm/profile_fields:post")
-def create_realm_profile_field(client: Client) -> None:
+def create_realm_profile_field(client: Client) -> int:
     # {code_example|start}
     # Create a custom profile field in the user's organization.
     request = {"name": "Phone", "hint": "Contact no.", "field_type": 1}
@@ -653,6 +669,30 @@ def create_realm_profile_field(client: Client) -> None:
     # {code_example|end}
     assert_success_response(result)
     validate_against_openapi_schema(result, "/realm/profile_fields", "post", "200")
+    return result["id"]
+
+
+@openapi_test_function("/realm/profile_fields/{field_id}:patch")
+def update_realm_profile_field(client: Client, field_id: int) -> None:
+    # {code_example|start}
+    # Update a custom profile field in the user's organization.
+    request = {"name": "Cell", "hint": "Contact number."}
+    result = client.call_endpoint(
+        url=f"/realm/profile_fields/{field_id}", method="PATCH", request=request
+    )
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/realm/profile_fields/{field_id}", "patch", "200")
+
+
+@openapi_test_function("/realm/profile_fields/{field_id}:delete")
+def delete_realm_profile_field(client: Client, field_id: int) -> None:
+    # {code_example|start}
+    # Delete a custom profile field in the user's organization.
+    result = client.call_endpoint(url=f"/realm/profile_fields/{field_id}", method="DELETE")
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/realm/profile_fields/{field_id}", "delete", "200")
 
 
 @openapi_test_function("/realm/filters:post")
@@ -666,6 +706,8 @@ def add_realm_filter(client: Client) -> int:
     request = {
         "pattern": "#(?P<id>[0-9]+)",
         "url_template": "https://github.com/zulip/zulip/issues/{id}",
+        "example_input": "#1234",
+        "reverse_template": "#{id}",
     }
     result = client.call_endpoint("/realm/filters", method="POST", request=request)
     # {code_example|end}
@@ -681,6 +723,8 @@ def update_realm_filter(client: Client, filter_id: int) -> None:
     request = {
         "pattern": "#(?P<id>[0-9]+)",
         "url_template": "https://github.com/zulip/zulip/issues/{id}",
+        "example_input": "#1234",
+        "reverse_template": "#{id}",
     }
     result = client.call_endpoint(
         url=f"/realm/filters/{filter_id}", method="PATCH", request=request
@@ -736,13 +780,14 @@ def get_realm_exports(client: Client) -> None:
 
 
 @openapi_test_function("/export/realm:post")
-def export_realm(client: Client) -> None:
+def export_realm(client: Client) -> int:
     # {code_example|start}
     # Create a public data export of the organization.
     result = client.call_endpoint(url="/export/realm", method="POST")
     # {code_example|end}
     assert_success_response(result)
     validate_against_openapi_schema(result, "/export/realm", "post", "200")
+    return result["id"]
 
 
 @openapi_test_function("/export/realm/consents:get")
@@ -753,6 +798,16 @@ def get_realm_export_consents(client: Client) -> None:
     # {code_example|end}
     assert_success_response(result)
     validate_against_openapi_schema(result, "/export/realm/consents", "get", "200")
+
+
+@openapi_test_function("/export/realm/{export_id}:delete")
+def delete_realm_export(client: Client, export_id: int) -> None:
+    # {code_example|start}
+    # Delete a completed public or standard data export.
+    result = client.call_endpoint(url=f"/export/realm/{export_id}", method="DELETE")
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/export/realm/{export_id}", "delete", "200")
 
 
 @openapi_test_function("/users/me:get")
@@ -781,6 +836,89 @@ def deactivate_own_user(client: Client, owner_client: Client) -> None:
 
     # Reactivate the account to avoid polluting other tests.
     owner_client.reactivate_user_by_id(user_id)
+
+
+@openapi_test_function("/users/me/api_key/regenerate:post")
+def regenerate_api_key(client: Client) -> None:
+    # {code_example|start}
+    # Generate a new API key for the current user/bot.
+    result = client.call_endpoint(
+        url="/users/me/api_key/regenerate",
+        method="POST",
+    )
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/users/me/api_key/regenerate", "post", "200")
+
+    # Update the client with the new API key so subsequent tests don't fail.
+    client.api_key = result["api_key"]
+    # Reset the session so it is re-created with the new API key.
+    client.session = None
+
+
+@openapi_test_function("/bots/{bot_id}/api_key:get")
+def get_bot_api_key(client: Client) -> None:
+    bot_id = 17
+    ensure_users([bot_id], ["default-bot"])
+
+    # {code_example|start}
+    # Fetch a bot's API key, given the bot's ID.
+    result = client.call_endpoint(
+        url=f"/bots/{bot_id}/api_key",
+        method="GET",
+    )
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/bots/{bot_id}/api_key", "get", "200")
+
+
+@openapi_test_function("/bots/{bot_id}/api_key/regenerate:post")
+def regenerate_bot_api_key(client: Client) -> None:
+    bot_id = 17
+    ensure_users([bot_id], ["default-bot"])
+
+    # {code_example|start}
+    # Generate a new API key for a bot, given the bot's ID.
+    result = client.call_endpoint(
+        url=f"/bots/{bot_id}/api_key/regenerate",
+        method="POST",
+    )
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/bots/{bot_id}/api_key/regenerate", "post", "200")
+
+
+@openapi_test_function("/bot_storage:put")
+def update_bot_storage(client: Client) -> None:
+    # {code_example|start}
+    # Store value of "bar" for the key "foo" for a bot user.
+    result = client.update_storage({"storage": {"foo": "bar"}})
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/bot_storage", "put", "200")
+
+
+@openapi_test_function("/bot_storage:get")
+def get_bot_storage(client: Client) -> None:
+    # {code_example|start}
+    # Retrieve all data stored for a bot user.
+    result = client.get_storage()
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/bot_storage", "get", "200")
+
+
+@openapi_test_function("/bot_storage:delete")
+def remove_bot_storage(client: Client) -> None:
+    # {code_example|start}
+    # Remove all data stored for a bot user.
+    result = client.call_endpoint(
+        url="/bot_storage",
+        method="DELETE",
+    )
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/bot_storage", "delete", "200")
 
 
 @openapi_test_function("/get_stream_id:get")
@@ -879,7 +1017,7 @@ def get_user_groups(client: Client) -> int:
 
 @openapi_test_function("/streams/{stream_id}/members:get")
 def get_subscribers(client: Client) -> None:
-    user_ids = [11, 25]
+    user_ids = [11, 26]
     ensure_users(user_ids, ["iago", "newbie"])
     # {code_example|start}
     # Get the subscribers to a channel. Note that `client.get_subscribers`
@@ -1095,6 +1233,29 @@ def update_subscription_settings(client: Client) -> None:
     # {code_example|end}
     assert_success_response(result)
     validate_against_openapi_schema(result, "/users/me/subscriptions/properties", "POST", "200")
+
+
+@openapi_test_function("/users/me/subscriptions/{stream_id}:patch")
+def update_subscription_property(client: Client) -> None:
+    subscriptions = client.get_subscriptions()["subscriptions"]
+    assert len(subscriptions) >= 1
+    stream_id = subscriptions[0]["stream_id"]
+
+    # {code_example|start}
+    # Update the user's subscription of the channel with ID `stream_id`
+    # so that it's pinned to the top of the user's channel list.
+    request = {
+        "property": "pin_to_top",
+        "value": True,
+    }
+    result = client.call_endpoint(
+        f"users/me/subscriptions/{stream_id}",
+        method="PATCH",
+        request=request,
+    )
+    # {code_example|end}
+
+    validate_against_openapi_schema(result, "/users/me/subscriptions/{stream_id}", "patch", "200")
 
 
 @openapi_test_function("/messages/render:post")
@@ -1647,6 +1808,30 @@ def upload_file(client: Client) -> None:
     validate_against_openapi_schema(result, "/user_uploads", "post", "200")
 
 
+@openapi_test_function("/thumbnail/status/{realm_id_str}/{filename}:get")
+def check_thumbnail_status(client: Client) -> None:
+    path_to_file = os.path.join(ZULIP_DIR, "zerver", "tests", "images", "img.jpg")
+    with open(path_to_file, "rb") as fp:
+        result = client.upload_file(fp)
+
+    url = result["url"]
+    parts = url.split("/")
+    realm_id_str = parts[2]
+    filename = "/".join(parts[3:])
+
+    # {code_example|start}
+    # Check thumbnail status.
+    result = client.call_endpoint(
+        url=f"/thumbnail/status/{realm_id_str}/{filename}",
+        method="GET",
+    )
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(
+        result, "/thumbnail/status/{realm_id_str}/{filename}", "get", "200"
+    )
+
+
 @openapi_test_function("/users/me/{stream_id}/topics:get")
 def get_stream_topics(client: Client, stream_id: int) -> None:
     # {code_example|start}
@@ -1708,19 +1893,48 @@ def remove_fcm_token(client: Client) -> None:
 
 @openapi_test_function("/mobile_push/register:post")
 def register_push_device(client: Client) -> None:
+    result = client.call_endpoint(url="/register_client_device", method="POST")
+    device_id = result["device_id"]
     # {code_example|start}
-    # Register a push device.
+    # Register a device for push notifications.
     request = {
+        "device_id": device_id,
         "token_kind": "fcm",
-        "push_account_id": 2408,
         "push_key": "MTaUDJDMWypQ1WufZ1NRTHSSvgYtXh1qVNSjN3aBiEFt",
+        "push_key_id": 2408,
         "bouncer_public_key": "bouncer-public-key",
         "encrypted_push_registration": "encrypted-push-registration-data",
+        "token_id": "hGsEWGmyyfI=",
     }
     result = client.call_endpoint(url="/mobile_push/register", method="POST", request=request)
     # {code_example|end}
     assert_success_response(result)
     validate_against_openapi_schema(result, "/mobile_push/register", "post", "200")
+
+
+@openapi_test_function("/register_client_device:post")
+def register_device(client: Client) -> None:
+    # {code_example|start}
+    # Register a logged-in device.
+    result = client.call_endpoint(url="/register_client_device", method="POST")
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/register_client_device", "post", "200")
+
+
+@openapi_test_function("/remove_client_device:post")
+def remove_device(client: Client) -> None:
+    # First register a device to get a device_id.
+    result = client.call_endpoint(url="/register_client_device", method="POST")
+    device_id = result["device_id"]
+
+    # {code_example|start}
+    # Remove a registered device.
+    request = {"device_id": device_id}
+    result = client.call_endpoint(url="/remove_client_device", method="POST", request=request)
+    # {code_example|end}
+    assert_success_response(result)
+    validate_against_openapi_schema(result, "/remove_client_device", "post", "200")
 
 
 @openapi_test_function("/typing:post")
@@ -1976,6 +2190,7 @@ def test_invalid_stream_error(client: Client) -> None:
 
 
 def test_messages(client: Client, nonadmin_client: Client) -> None:
+    check_thumbnail_status(client)
     render_message(client)
     message_id, content = send_message(client)
     set_message_edit_typing_status(client, message_id)
@@ -2051,6 +2266,8 @@ def test_users(client: Client, owner_client: Client) -> None:
     add_fcm_token(client)
     remove_fcm_token(client)
     register_push_device(client)
+    register_device(client)
+    remove_device(client)
 
 
 def test_streams(client: Client, nonadmin_client: Client) -> None:
@@ -2066,6 +2283,7 @@ def test_streams(client: Client, nonadmin_client: Client) -> None:
     toggle_mute_topic(client)
     update_user_topic(client)
     update_subscription_settings(client)
+    update_subscription_property(client)
     get_stream_topics(client, 1)
     delete_topic(client, 1, "test")
     archive_stream(client)
@@ -2105,10 +2323,13 @@ def test_server_organizations(client: Client) -> None:
     delete_custom_emoji(client)
     get_realm_profile_fields(client)
     reorder_realm_profile_fields(client)
-    create_realm_profile_field(client)
-    export_realm(client)
+    profile_field_id = create_realm_profile_field(client)
+    update_realm_profile_field(client, profile_field_id)
+    delete_realm_profile_field(client, profile_field_id)
+    export_id = export_realm(client)
     get_realm_exports(client)
     get_realm_export_consents(client)
+    delete_realm_export(client, export_id)
 
 
 def test_errors(client: Client) -> None:
@@ -2125,8 +2346,29 @@ def test_invitations(client: Client) -> None:
     resend_email_invitation(client)
 
 
-def test_the_api(client: Client, nonadmin_client: Client, owner_client: Client) -> None:
+def test_api_key_endpoints(client: Client) -> None:
+    get_bot_api_key(client)
+    regenerate_bot_api_key(client)
+    regenerate_api_key(client)
+
+
+def test_bot_storage(bot_client: Client) -> None:
+    update_bot_storage(bot_client)
+    get_bot_storage(bot_client)
+    remove_bot_storage(bot_client)
+
+
+def test_the_api(
+    client: Client, nonadmin_client: Client, owner_client: Client, bot_client: Client
+) -> None:
     get_user_agent(client)
+    # test_bot_storage authenticates as default-bot, whose API key is
+    # regenerated in test_api_key_endpoints.
+    test_bot_storage(bot_client)
+    # Run `test_api_key_endpoints` before `test_users` so Device records created by
+    # `register_push_device` & `register_device` are not bulk-deleted by
+    # `regenerate_api_key`, since they are needed for curl tests.
+    test_api_key_endpoints(client)
     test_users(client, owner_client)
     test_streams(client, nonadmin_client)
     test_messages(client, nonadmin_client)

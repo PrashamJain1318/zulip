@@ -13,6 +13,10 @@
         z-index: 1;
     }
 
+    .navbar-search:has(#searchbox-input-container:focus-visible) {
+        outline: 2px solid var(--color-outline-focus);
+    }
+
     .search_icon {
         grid-area: search-icon;
         align-self: center;
@@ -48,6 +52,7 @@
         color: var(--color-search-icons);
         padding: 0;
         outline: none;
+        font-size: inherit;
 
         &:hover {
             opacity: 1;
@@ -66,9 +71,13 @@
     .search-input-and-pills {
         grid-area: search-pills;
         display: flex;
-        padding: 0;
+        /* Match the pills' single-line centering slack so wrapped rows
+           get the same breathing room without changing the single-line
+           box height. */
+        padding: calc((var(--search-box-height) - var(--height-input-pill)) / 2)
+            0;
         flex-wrap: wrap;
-        gap: 0.125em; /* 2px at 16px em */
+        gap: 0.3571em; /* 5px at 14px em, matches pill spacing in typeahead dropdown */
         align-self: center;
     }
 
@@ -84,6 +93,8 @@
             width: var(--search-box-width);
 
             @media (width < $md_min) {
+                /* Square off the icon-only presentation. */
+                width: var(--search-box-height);
                 grid-template:
                     "search-icon search-pills" var(--search-box-height)
                     / var(--search-box-height) 0;
@@ -150,6 +161,7 @@
     }
 
     .typeahead.dropdown-menu {
+        container: search-typeahead / inline-size;
         /* Match the typeahead's width to its parent container. */
         right: 0;
         top: 0;
@@ -196,7 +208,6 @@
         border: none;
         outline: none;
         border-radius: 0;
-        font-family: "Source Sans 3 VF", sans-serif;
         font-weight: 400;
         background: transparent;
         text-overflow: ellipsis;
@@ -206,8 +217,8 @@
 
         color: var(--color-text-search);
 
-        display: flex;
-        align-items: center;
+        display: block;
+        align-self: center;
 
         &:empty::before {
             content: attr(data-placeholder-text);
@@ -329,7 +340,10 @@
                 display: grid;
                 grid-template-columns:
                     var(--length-search-pill-image) minmax(0, 1fr)
-                    var(--length-input-pill-exit);
+                    calc(
+                        var(--length-input-pill-exit) +
+                            var(--length-input-pill-exit-margin)
+                    );
                 align-content: center;
                 /* Don't inherit large line-height for user pills themselves, either. */
                 line-height: 1.1;
@@ -388,8 +402,6 @@
 
     .typeahead-menu .simplebar-content > li > a {
         padding: 3px var(--search-left-padding);
-        /* Override white-space: nowrap from zulip.css */
-        white-space: normal;
 
         .search_list_item {
             max-width: 100%;
@@ -398,8 +410,19 @@
             align-items: center;
         }
 
+        .search_list_item > * {
+            /* Share the row equally, but never grow past the content
+               width. Space an item does not need goes to the others,
+               so the widest item is the one cut off when the row is
+               too narrow. */
+            flex: 1 1 0;
+            max-width: max-content;
+        }
+
         .search_list_item .description {
             margin: 2px 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .search_list_item .pill-container {
@@ -408,7 +431,6 @@
             border: none;
             cursor: pointer;
             padding: 0;
-            max-width: 100%;
         }
 
         .pill {
@@ -452,10 +474,23 @@
             line-height: var(--height-input-pill);
             align-self: center;
         }
-    }
 
-    /* Break really long words (unlikely to happen). */
-    .search_list_item span {
-        overflow-wrap: anywhere;
+        @container search-typeahead (width < $cq_sm_min) {
+            /* There is too little room to keep a suggestion on one
+               line, so let it flow onto more lines instead. */
+            white-space: normal;
+            /* Leave more space between suggestions than between the
+               lines of one suggestion, so each suggestion reads as one. */
+            padding-block: 6px;
+
+            .search_list_item {
+                flex-wrap: wrap;
+                row-gap: 0;
+            }
+
+            .search_list_item > * {
+                flex-basis: auto;
+            }
+        }
     }
 }

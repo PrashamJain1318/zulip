@@ -14,6 +14,7 @@ from django.utils.translation import gettext_lazy
 from typing_extensions import override
 
 from zerver.lib.cache import (
+    active_guest_user_ids_cache_key,
     active_non_guest_user_ids_cache_key,
     active_user_ids_cache_key,
     bot_dict_fields,
@@ -472,9 +473,20 @@ class UserProfile(AbstractBaseUser, PermissionsMixin, UserBaseSettings):
         EMBEDDED_BOT: "Embedded bot",
     }
 
-    SERVICE_BOT_TYPES = [
+    MESSAGE_TRIGGERED_BOT_TYPES = [
         OUTGOING_WEBHOOK_BOT,
         EMBEDDED_BOT,
+    ]
+
+    # Certain fields can imply an unusually elevated level of permissions
+    # for the user in some way. Such privileges generally should not be
+    # carried over to a new server at import time.
+    SPECIAL_PERMISSIONS_TO_RESET_AT_IMPORT = [
+        "is_staff",
+        "can_forge_sender",
+        "can_create_users",
+        "can_change_user_emails",
+        "rate_limits",
     ]
 
     id = models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")
@@ -499,8 +511,6 @@ class UserProfile(AbstractBaseUser, PermissionsMixin, UserBaseSettings):
     email = models.EmailField(blank=False, db_index=True)
 
     realm = models.ForeignKey("zerver.Realm", on_delete=CASCADE)
-    # Foreign key to the Recipient object for PERSONAL type messages to this user.
-    recipient = models.ForeignKey("zerver.Recipient", null=True, on_delete=models.SET_NULL)
 
     INACCESSIBLE_USER_NAME = gettext_lazy("Unknown user")
     # The user's name.  We prefer the model of a full_name
@@ -537,6 +547,11 @@ class UserProfile(AbstractBaseUser, PermissionsMixin, UserBaseSettings):
     #
     # See also `long_term_idle`.
     is_active = models.BooleanField(default=True, db_index=True)
+
+    # Deleted users are a subset of deactivated users whose metadata
+    # has been removed as well. They cannot be reactivated, to ensure
+    # is_deleted=True, is_active=True is impossible.
+    is_deleted = models.BooleanField(db_default=False, default=False)
 
     is_bot = models.BooleanField(default=False, db_index=True)
     bot_type = models.PositiveSmallIntegerField(null=True, db_index=True)
@@ -600,17 +615,16 @@ class UserProfile(AbstractBaseUser, PermissionsMixin, UserBaseSettings):
     last_active_message_id = models.IntegerField(null=True)
 
     # Mirror dummies are fake (!is_active) users used to provide
-    # message senders in cross-protocol mirroring integrations, so
-    # that we can display mirrored content like native Zulip messages
-    # (with a name + avatar, etc.).  We also abuse this for data
-    # imports and deleted users.
+    # message senders for content imported from other products and for
+    # deleted users, so that we can display their messages like native
+    # Zulip messages (with a name + avatar, etc.).
     is_mirror_dummy = models.BooleanField(default=False)
 
     # Flag used for imported users who have not activated their account.
     is_imported_stub = models.BooleanField(default=False)
 
     # Users with this flag set are allowed to forge messages as sent by another
-    # user and to send to private streams; also used for Jabber mirroring.
+    # user and to send to private streams.
     can_forge_sender = models.BooleanField(default=False, db_index=True)
     # Users with this flag set can create other users via API.
     can_create_users = models.BooleanField(default=False, db_index=True)
@@ -653,13 +667,16 @@ class UserProfile(AbstractBaseUser, PermissionsMixin, UserBaseSettings):
     timezone = models.CharField(max_length=40, default="")
 
     AVATAR_FROM_GRAVATAR = "G"
+    AVATAR_FROM_JDENTICON = "J"
     AVATAR_FROM_USER = "U"
     AVATAR_SOURCES = (
         (AVATAR_FROM_GRAVATAR, "Hosted by Gravatar"),
+        (AVATAR_FROM_JDENTICON, "Generated using Jdenticon"),
         (AVATAR_FROM_USER, "Uploaded by user"),
     )
+    DEFAULT_AVATAR_SOURCE = AVATAR_FROM_JDENTICON
     avatar_source = models.CharField(
-        default=AVATAR_FROM_GRAVATAR, choices=AVATAR_SOURCES, max_length=1
+        default=DEFAULT_AVATAR_SOURCE, choices=AVATAR_SOURCES, max_length=1
     )
     avatar_version = models.PositiveSmallIntegerField(default=1)
     # This is only used for LDAP-provided avatars; it contains the
@@ -730,7 +747,7 @@ class UserProfile(AbstractBaseUser, PermissionsMixin, UserBaseSettings):
         }
         data: ProfileData = []
         for field in custom_profile_fields_for_realm(self.realm_id):
-            field_values = user_data.get(field.id, None)
+            field_values = user_data.get(field.id)
             if field_values:
                 value, rendered_value = (
                     field_values.get("value"),
@@ -999,7 +1016,6 @@ def base_get_user_narrow_queryset() -> QuerySet[UserProfile]:
         "presence_enabled",
         "rate_limits",
         "role",
-        "recipient_id",
         "realm__string_id",
         "realm__deactivated",
     )
@@ -1108,7 +1124,6 @@ def get_active_user_profile_by_id_in_realm(uid: int, realm: "Realm") -> UserProf
 def get_user_including_cross_realm(email: str, realm: "Realm") -> UserProfile:
     if is_cross_realm_bot_email(email):
         return get_system_bot(email, realm.id)
-    assert realm is not None
     return get_user(email, realm)
 
 
@@ -1202,6 +1217,16 @@ def active_non_guest_user_ids(realm_id: int) -> list[int]:
         )
         .values_list("id", flat=True)
     )
+    return list(query)
+
+
+@cache_with_key(active_guest_user_ids_cache_key, timeout=3600 * 24 * 7)
+def active_guest_user_ids(realm_id: int) -> list[int]:
+    query = UserProfile.objects.filter(
+        realm_id=realm_id,
+        is_active=True,
+        role=UserProfile.ROLE_GUEST,
+    ).values_list("id", flat=True)
     return list(query)
 
 

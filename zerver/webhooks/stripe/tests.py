@@ -1,6 +1,8 @@
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
+import orjson
+
 from zerver.lib.test_classes import WebhookTestCase
 
 
@@ -23,6 +25,17 @@ class StripeHookTests(WebhookTestCase):
             expected_topic_name,
             expected_message,
             content_type="application/x-www-form-urlencoded",
+        )
+
+    def test_charge_dispute_created_pdp_prefix(self) -> None:
+        payload = orjson.loads(self.get_body("charge_dispute_created"))
+        payload["data"]["object"]["id"] = "pdp_00000000000000"
+        self.check_webhook(
+            "charge_dispute_created",
+            "disputes",
+            "[Dispute](https://dashboard.stripe.com/disputes/pdp_00000000000000) created. Current status: needs response.",
+            content_type="application/x-www-form-urlencoded",
+            custom_payload=orjson.dumps(payload).decode(),
         )
 
     def test_charge_failed(self) -> None:

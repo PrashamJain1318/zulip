@@ -3,8 +3,8 @@ label {
 }
 
 label,
-h4,
-h3,
+.settings-subsection-title,
+.settings-table-title,
 /* We need settings-section-title here because some legacy settings
    widgets use a <div> with this class for their heading. */
 .settings-section-title {
@@ -12,6 +12,27 @@ h3,
         top: 1px;
         position: relative;
     }
+}
+
+/* Shared font for the subsection and table/list-panel headings across the
+   settings, channel, and group settings overlays. */
+.settings-subsection-title,
+.settings-table-title {
+    font-size: 1.5em;
+    font-weight: normal;
+    line-height: 1.5;
+}
+
+/* Subsection headings, used by both the settings panels and the channel
+   and group overlays. */
+.settings-subsection-title {
+    margin: calc(0.3125 * var(--base-font-size-px)) 0; /* 5px 0 at 16px font size. */
+}
+
+/* Table/list-panel headings ('.settings_panel_list_header') use the larger
+   table heading margin rather than the subsection margin. */
+.settings-table-title {
+    margin: 10px 0;
 }
 
 /* TODO: This should ideally be added to help_link_widget.hbs,
@@ -39,10 +60,12 @@ a.help_link_widget {
     &:hover {
         color: inherit;
         opacity: 1;
+        text-decoration: none;
     }
 }
 
-h3,
+.settings-subsection-title,
+.settings-table-title,
 .settings-section-title {
     .help_link_widget {
         margin-left: 5px;
@@ -93,12 +116,6 @@ h3,
 
 #change-email-form-input-email {
     max-width: 90%;
-}
-
-#change_email_modal {
-    #change_email_form {
-        margin: 0;
-    }
 }
 
 .disabled_setting_tooltip {
@@ -188,8 +205,12 @@ h3,
 .play_notification_sound {
     .notification-sound-icon {
         font-size: 1.5714em; /* 22px at 14px / em */
-        /* Visually center with chevron in select */
-        line-height: 1.8571em; /* 26px at 14px / em */
+        /* Visually center with chevron in select
+        by setting the line-height equal to the height
+        of select which is equal to - 1.4em + 8px (4px
+        each for top and bottom paddings) + 2px (1px each
+        for top and bottom borders). */
+        line-height: calc(1.4 * var(--base-font-size-px) + 10px);
         cursor: pointer;
     }
 }
@@ -238,12 +259,8 @@ h3,
     }
 }
 
-#playground-settings {
-    #playground_pygments_language,
-    #playground_name,
-    #playground_url_template {
-        width: calc(100% - 10em - 6em);
-    }
+#playground-settings .new-playground-form input {
+    width: calc(100% - 10em - 6em);
 }
 
 #language_selection_modal {
@@ -340,10 +357,6 @@ h3,
         padding-bottom: 4px;
         height: 1.4em; /* To match height of input elements */
     }
-
-    .account-settings-heading {
-        margin-right: 10px;
-    }
 }
 
 /* Make this one less wide because it's indented, so that the right
@@ -359,13 +372,14 @@ h3,
     padding: 0 25px 0 6px;
     color: var(--color-text-default);
     border-radius: 4px;
-    border: 1px solid hsl(0deg 0% 80%);
+    border: var(--input-border-width) solid var(--color-border-legacy-input);
     cursor: pointer;
-    background-color: hsl(0deg 0% 100%);
+    background-color: var(--color-background-legacy-input);
+    font-size: inherit;
 
     &:disabled {
         cursor: not-allowed;
-        background-color: hsl(0deg 0% 93%);
+        background-color: var(--color-background-disabled-settings-select);
 
         /* This is reset for other browsers to use Chrome's opacity. */
         opacity: 0.7;
@@ -381,10 +395,12 @@ select.settings_select {
     background-repeat: no-repeat;
     background-position: 98%;
     background-size: 1em;
+    font-family: inherit;
 }
 
 #admin-active-users-list,
-#admin-bot-list {
+#admin-bot-list,
+#personal-bot-list {
     .table tr:first-of-type td {
         border-top: none;
     }
@@ -395,13 +411,33 @@ select.settings_select {
     }
 }
 
-#admin-bot-list .user-status-settings {
+#admin-bot-list .user-status-settings,
+#personal-bot-list .user-status-settings {
     display: flex;
     justify-content: flex-end;
+    /* Matches the height of one row of action icon-buttons, so rows keep a consistent height even when no buttons are shown. */
+    min-height: 2.1875em;
+}
+
+.bot-list-table td {
+    /* Keeps row height consistent whether or not the actions column is shown for this table. */
+    height: 2.1875em;
+}
+
+.bot-list-table.hide-actions-column th.actions,
+.bot-list-table.hide-actions-column td.actions {
+    display: none;
 }
 
 .config-download-text {
     margin-top: 10px;
+    display: flex;
+    align-items: center;
+}
+
+.bot-list-error {
+    margin-top: 10px;
+    margin-bottom: 10px;
 }
 
 .user_role,
@@ -439,7 +475,8 @@ select.settings_select {
     width: fit-content;
 }
 
-#bot-edit-form {
+#bot-edit-form,
+#api-key-modal {
     .api-key-details-container,
     .zuliprc-container {
         display: flex;
@@ -451,9 +488,19 @@ select.settings_select {
             align-items: center;
         }
     }
+
+    .modal_text_input {
+        margin-bottom: 0;
+    }
 }
 
 #zuliprc-section {
+    /* Normally all input-group elements have bottom margin of 1.25em.
+    But here the buttons have bottom padding of 0.375em and thus there is
+    already some extra space between this and the section below it, so we
+    reduce the bottom margin by 0.375em. */
+    margin-bottom: calc(1.25em - var(--icon-button-padding));
+
     .modal-field-label {
         margin-bottom: 0;
     }
@@ -512,11 +559,6 @@ input[type="checkbox"] {
            16px-square box (at 16px/1em) for the
            chevron icon. */
         max-width: calc(100% - 1em);
-        display: flex;
-        align-items: baseline;
-        /* Mimic the space from the previous inline
-           layout. */
-        gap: 0.4ch;
     }
 
     .decorated-channel-name {
@@ -535,23 +577,8 @@ input[type="checkbox"] {
     margin-bottom: 0;
 }
 
-.admin-realm-form {
-    & h3 {
-        margin: 10px 0 5px;
-    }
-
-    .subsection-header h3 {
-        display: inline;
-    }
-}
-
 .preferences-settings-form,
 .notification-settings-form {
-    .subsection-header h3 {
-        display: inline-block;
-        margin: 10px 0 5px;
-    }
-
     .tip {
         width: fit-content;
         margin-top: 0;
@@ -638,14 +665,6 @@ input[type="checkbox"] {
     }
 }
 
-#confirm_reset_stream_notifications_modal {
-    .channel-privacy-type-icon {
-        padding-left: 3px;
-        padding-right: 0;
-        width: auto;
-    }
-}
-
 #customizable_stream_notifications_table .dropdown-widget-button {
     /* 225px at 16px/1em */
     width: 14.0625em;
@@ -662,13 +681,11 @@ input[type="checkbox"] {
 .advanced-configurations-container {
     .advance-config-toggle-area {
         cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 0 0.625em;
-
-        .stream_setting_subsection_title {
-            margin: 4px 0;
-        }
+        /* Unlike other subsection headers, which wrap their save/discard
+           widget below the title, this row is just a caret and a title;
+           a long translated title should wrap within the title rather
+           than dropping below the caret. */
+        flex-wrap: nowrap;
 
         .toggle-advanced-configurations-icon {
             font-size: 1.4286em; /* 20px at 14px / em */
@@ -686,20 +703,12 @@ input[type="checkbox"] {
     margin-bottom: 1em;
 }
 
-.organization-settings-parent {
-    padding-top: 5px;
-}
-
 #id_org_profile_preview {
     width: max-content;
     display: flex;
     gap: 5px;
     align-items: center;
     margin-bottom: 20px;
-}
-
-.inline-block.organization-permissions-parent {
-    padding-top: 5px;
 }
 
 #org-other-permissions .tip {
@@ -757,11 +766,6 @@ input[type="checkbox"] {
     color: hsl(156deg 30% 50%);
     padding: 3px 10px;
 
-    &.account-alert-notification {
-        margin: 0 0 10px;
-        vertical-align: middle;
-    }
-
     &:not(:empty) {
         border: 1px solid hsl(156deg 30% 50%);
     }
@@ -786,6 +790,12 @@ input[type="checkbox"] {
         margin-top: 0;
         font-size: inherit;
         vertical-align: top;
+    }
+
+    .alert-notification-content {
+        /* Push back against inherited value, which
+           is not relevant in this DOM element. */
+        white-space: normal;
     }
 
     & img {
@@ -898,7 +908,7 @@ input[type="checkbox"] {
     align-items: center;
     width: var(--modal-input-width);
 
-    .flatpickr-wrapper {
+    input.date-field-alt-input {
         grid-column: datepicker-start / close-button-end;
         grid-row: close-button;
     }
@@ -926,14 +936,15 @@ input[type="checkbox"] {
         display: inline-flex;
     }
 
-    .default_stream_choices_table {
-        margin-top: 2px;
-    }
-
     .choice-row {
         margin-bottom: 10px;
 
         &:last-of-type {
+            /* Remove margin-bottom for last choice row
+               to remove extra space between the modal
+               content and footer. */
+            margin-bottom: 0;
+
             .delete-choice {
                 display: none;
             }
@@ -957,10 +968,6 @@ input[type="checkbox"] {
 }
 
 #add-custom-emoji-modal {
-    & form {
-        margin: 0;
-    }
-
     & input[type="text"] {
         padding: 6px;
     }
@@ -994,10 +1001,9 @@ input[type="checkbox"] {
     }
 }
 
-.add-new-linkifier-box,
 .add-new-playground-box {
     & button {
-        margin-left: calc(10em + 20px) !important;
+        margin-left: calc(10em + 20px);
     }
     margin-bottom: 15px;
 
@@ -1030,9 +1036,36 @@ input[type="checkbox"] {
     }
 }
 
-#admin-linkifier-pattern-status,
-#admin-linkifier-template-status {
-    margin: 20px 0 0;
+.admin_linkifiers_table {
+    th:first-child,
+    td:first-child {
+        white-space: nowrap;
+    }
+
+    th.convert-url-heading {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+    }
+
+    td.convert-cell {
+        text-align: center;
+    }
+}
+
+.alternative-url-template-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 4px;
+
+    & input {
+        flex: 1;
+    }
+
+    &:last-child .delete-alternative-url-template {
+        visibility: hidden;
+    }
 }
 
 #organization-permissions {
@@ -1047,7 +1080,8 @@ input[type="checkbox"] {
     }
 }
 
-.org-permissions-form .pill-container {
+.org-permissions-form .pill-container,
+.org-settings-form .pill-container {
     /* Subtract 2 * (2px padding) + 2 * (1px border) */
     min-width: calc(var(--modal-input-width) - 6px);
 
@@ -1068,9 +1102,14 @@ input[type="checkbox"] {
     max-height: calc(95vh - 280px);
 }
 
+#admin-default-channels-list .pill {
+    &:hover {
+        background-color: var(--color-background-input-pill-hover);
+    }
+}
+
 .edit_bot_form {
     font-size: 100%;
-    margin: 0;
     padding: 0;
 
     .buttons {
@@ -1148,12 +1187,6 @@ input[type="checkbox"] {
     }
 }
 
-#change_password_modal {
-    #change_password_container {
-        margin: 0;
-    }
-}
-
 #api_key_status {
     margin: 0 0 10px;
 }
@@ -1223,8 +1256,17 @@ input[type="checkbox"] {
 
                 opacity: 0.6;
 
-                &:hover {
+                &:focus {
+                    outline: none;
+                }
+
+                &:hover,
+                &:focus-visible {
                     opacity: 1;
+                }
+
+                &:focus-visible {
+                    outline: 2px solid var(--color-outline-focus);
                 }
             }
 
@@ -1291,6 +1333,35 @@ label.preferences-radio-choice-label {
     }
 }
 
+.default_avatar_source_values {
+    width: 25em; /* 400px / 16px em */
+
+    .preferences-radio-choice-label {
+        align-items: center;
+
+        .radio-choice-controls {
+            display: flex;
+            align-items: center;
+        }
+
+        input[type="radio"] {
+            top: 0;
+            margin-right: 0.5em; /* 8px / 16px em */
+        }
+    }
+
+    .right {
+        display: flex;
+        gap: 0.5em; /* 8px / 16px em */
+    }
+
+    .avatar {
+        height: 2.625em; /* 42px / 16px em */
+        width: 2.625em; /* 42px / 16px em */
+        border-radius: 0.25em; /* 4px / 16px em */
+    }
+}
+
 .user_list_style_values {
     max-width: 25em; /* 350px / 14px em */
 
@@ -1336,6 +1407,23 @@ label.preferences-radio-choice-label {
     min-width: initial !important;
 }
 
+#show_api_key {
+    .api-key-container {
+        padding-bottom: 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+
+        .copy-button {
+            padding: 0;
+
+            &:focus {
+                outline: none;
+            }
+        }
+    }
+}
+
 #api_key_buttons {
     display: inline-flex;
 
@@ -1377,12 +1465,6 @@ label.preferences-radio-choice-label {
         vertical-align: middle;
     }
 
-    & h3 {
-        font-size: 1.5em;
-        font-weight: normal;
-        line-height: 1.5;
-    }
-
     & h5 {
         font-size: 1em;
         font-weight: normal;
@@ -1420,7 +1502,7 @@ label.preferences-radio-choice-label {
     .sidebar {
         height: calc(100% - var(--settings-overlay-header-height));
         overflow-y: auto;
-        border-right: 1px solid var(--color-border-modal);
+        border-right: 1px solid var(--color-border-modal-bar);
 
         .your-bots-link {
             text-decoration: none;
@@ -1455,7 +1537,7 @@ label.preferences-radio-choice-label {
             transition:
                 background-color 0.2s ease,
                 border-bottom 0.2s ease;
-            border-bottom: 1px solid var(--color-border-modal);
+            border-bottom: 1px solid var(--color-border-modal-bar);
 
             &:last-of-type .text {
                 border-bottom: none;
@@ -1536,6 +1618,7 @@ label.preferences-radio-choice-label {
         & h1 {
             text-align: center;
             font-size: 1.1em;
+            font-weight: bold;
             line-height: 1;
             text-transform: uppercase;
         }
@@ -1601,6 +1684,7 @@ label.preferences-radio-choice-label {
     transition:
         border-color linear 0.2s,
         box-shadow linear 0.2s;
+    font-family: inherit;
 
     &:focus {
         border-color: hsl(206deg 80% 62% / 80%);
@@ -1634,7 +1718,7 @@ label.preferences-radio-choice-label {
             resize: vertical;
         }
 
-        &:hover .remove_date {
+        &.has-date:hover .remove_date {
             display: inline-flex;
         }
 
@@ -1719,13 +1803,6 @@ label.preferences-radio-choice-label {
     }
 }
 
-.subsection-failed-status p {
-    background-color: hsl(0deg 43% 91%);
-    padding: 2px 6px;
-    border-radius: 4px;
-    margin: 0 0 0 5px;
-}
-
 #muted_topics_table {
     width: 90%;
     margin: 0 auto;
@@ -1745,6 +1822,42 @@ label.preferences-radio-choice-label {
     margin-bottom: var(--margin-bottom-field-description);
     /* Avoid having the clickable area extend to the full width of the containing element */
     width: fit-content;
+}
+
+#realm_invite_required_container {
+    /* Keep the disabled-setting tooltip's hover area on the checkbox, not
+       the empty space its wider siblings stretch this container across. */
+    width: fit-content;
+}
+
+#realm-user-default-settings {
+    .settings-field-label,
+    .settings-checkbox-wrapper,
+    .info-density-controls {
+        .reset-user-setting-to-default {
+            display: inline-flex;
+            padding: 0.1875em; /* 3px at 16px */
+            margin-left: 0.1875em; /* 3px at 16px */
+
+            position: relative;
+            top: -0.0625em; /* 1px at 16px */
+
+            .zulip-icon {
+                width: 1em; /* 15px at 16px */
+                height: 1em; /* 15px at 16px */
+                font-size: 0.9375em; /* 15px at 16px */
+            }
+        }
+    }
+
+    .general_notifications .reset-user-setting-to-default {
+        font-size: 1.2em;
+        margin-top: 0.3125em; /* 6px at 16px */
+        /* This is needed to adjust the gap property used
+        for flex layout so that button is not too far from
+        the heading. */
+        margin-left: -0.5em; /* 9.6px at 16px */
+    }
 }
 
 .settings-profile-user-field-hint {
@@ -1849,7 +1962,7 @@ label.preferences-radio-choice-label {
 
     font-size: 1em;
     line-height: var(--base-line-height-unitless);
-    font-family: "Source Sans 3 VF", sans-serif;
+    font-family: inherit;
 
     &:focus {
         border-color: var(--focus-border-color-textarea);
@@ -1874,10 +1987,10 @@ label.preferences-radio-choice-label {
    rendered realm and channel descriptions. */
 .settings-view-only-textarea {
     margin: 0;
-    /* 5px at 16px and 10px at 16px */
-    padding: 0.3125em 0.625em;
+    /* 5px at 16px */
+    padding: 0.3125em var(--view-only-field-horizontal-padding);
     background-color: var(--background-color-view-only-textarea);
-    border: 1px solid var(--border-color-textarea);
+    border: var(--input-border-width) solid var(--border-color-textarea);
     border-radius: 4px;
 }
 
@@ -1906,10 +2019,6 @@ label.preferences-radio-choice-label {
     .user-avatar-section,
     .realm-icon-section {
         display: block;
-    }
-
-    .subsection-failed-status p {
-        margin: 5px 0 0;
     }
 }
 
@@ -2021,7 +2130,8 @@ label.preferences-radio-choice-label {
     }
 
     #admin-user-list,
-    #admin-bot-list {
+    #admin-bot-list,
+    #personal-bot-list {
         .user_row {
             .user_name,
             .email {
@@ -2040,7 +2150,8 @@ label.preferences-radio-choice-label {
 
 @media (width < $sm_min) {
     #admin-user-list,
-    #admin-bot-list {
+    #admin-bot-list,
+    #personal-bot-list {
         .user_row,
         .table-sticky-headers {
             .bot_type,
@@ -2059,19 +2170,17 @@ label.preferences-radio-choice-label {
         margin: auto;
     }
 
-    #linkifier-settings .new-linkifier-form input,
-    #playground-settings .new-playground-form input,
-    #profile-field-settings .new-profile-field-form input {
-        width: calc(100% - 20px) !important;
+    #playground-settings .new-playground-form input {
+        width: calc(
+            100% - 2 * var(--input-horizontal-padding) - 2 *
+                var(--input-border-width)
+        );
     }
 
-    #linkifier-settings .new-linkifier-form label,
-    #playground-settings .new-playground-form label,
-    #profile-field-settings .new-profile-field-form label {
+    #playground-settings .new-playground-form label {
         display: block;
         width: 120px;
         padding: 0;
-        padding-top: 0;
         text-align: center;
         margin: auto;
         float: none;
@@ -2102,6 +2211,20 @@ label.preferences-radio-choice-label {
             min-width: 8em;
         }
     }
+
+    .add-new-playground-box {
+        .action-button {
+            margin-left: 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+    }
+
+    .tab-switcher.org-user-settings-switcher {
+        gap: 0.5em;
+        display: flex;
+        flex-wrap: wrap;
+    }
 }
 
 @media (width < $ml_min) {
@@ -2122,8 +2245,8 @@ label.preferences-radio-choice-label {
 }
 
 #edit-linkifier-form {
-    #edit-linkifier-pattern,
-    #edit-linkifier-url-template {
+    #linkifier-pattern,
+    #linkifier-url-template {
         width: 400px;
     }
 
@@ -2131,8 +2254,8 @@ label.preferences-radio-choice-label {
         margin-bottom: 4px;
     }
 
-    #edit-linkifier-pattern-status,
-    #edit-linkifier-template-status {
+    #linkifier-pattern-status,
+    #linkifier-template-status {
         margin-top: 10px;
     }
 
@@ -2148,10 +2271,6 @@ label.preferences-radio-choice-label {
     align-items: center;
     justify-content: space-between;
 
-    & h3 {
-        display: inline-block;
-    }
-
     .user_filters,
     .bot-filters {
         display: flex;
@@ -2162,7 +2281,6 @@ label.preferences-radio-choice-label {
 
         & .dropdown-widget-button {
             height: 1.4em;
-            max-width: 160px;
             box-sizing: content-box;
         }
 
@@ -2171,6 +2289,14 @@ label.preferences-radio-choice-label {
             filters to keep them aligned in .settings_panel_list_header */
             margin: 0;
         }
+    }
+
+    .user_filters .dropdown-widget-button {
+        max-width: 11em; /* 176px at 16px */
+    }
+
+    .bot-filters .dropdown-widget-button {
+        max-width: 160px;
     }
 
     .add_default_streams_button_container {
@@ -2208,6 +2334,7 @@ label.preferences-radio-choice-label {
             border: none;
             outline: none;
             display: grid;
+            font-size: inherit;
 
             &:hover {
                 color: var(--color-text-clear-search-button-hover);
@@ -2252,6 +2379,7 @@ label.preferences-radio-choice-label {
 }
 
 #admin_users_table .deactivated_user,
+#admin_imported_users_table .deactivated_user,
 #admin_deactivated_users_table .active-user {
     color: hsl(0deg 0% 64%);
 
@@ -2281,6 +2409,7 @@ label.preferences-radio-choice-label {
         var(--modal-input-width) - 2 * var(--input-horizontal-padding) - 2 *
             var(--input-border-width)
     );
+    font-family: inherit;
 
     &:focus {
         border-color: hsl(206deg 80% 62% / 80%);
@@ -2289,6 +2418,14 @@ label.preferences-radio-choice-label {
             inset 0 1px 1px hsl(0deg 0% 0% / 7.5%),
             0 0 8px hsl(206deg 80% 62% / 60%);
     }
+}
+
+/* Use `input.settings_*:disabled` to match the specificity of the
+   `input[type=...]` rule in zulip.css and override its background. */
+input.settings_url_input:disabled,
+input.settings_text_input:disabled {
+    background-color: var(--color-background-disabled-settings-select);
+    opacity: 0.7;
 }
 
 .empty-required-field {
@@ -2341,6 +2478,25 @@ label.preferences-radio-choice-label {
         width: 75%;
     }
 
+    .integration-url-topic {
+        position: relative;
+    }
+
+    #integration-url-topic-placeholder {
+        position: absolute;
+        left: 8px;
+        top: 50%;
+        pointer-events: none;
+        visibility: hidden;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+
+        &.visible {
+            visibility: visible;
+        }
+    }
+
     #stream-not-specified-notice {
         margin-top: -10px;
     }
@@ -2351,7 +2507,8 @@ label.preferences-radio-choice-label {
 }
 
 #admin-user-list .tab-switcher .ind-tab {
-    width: 110px;
+    width: auto;
+    min-width: 110px;
 }
 
 #admin-user-list .tab-switcher {
@@ -2359,7 +2516,14 @@ label.preferences-radio-choice-label {
 }
 
 #data-exports .tab-switcher .ind-tab {
-    width: 160px;
+    width: auto;
+    min-width: 160px;
+}
+
+#admin-bot-list .tab-switcher .ind-tab,
+#personal-bot-list .tab-switcher .ind-tab {
+    width: auto;
+    min-width: 90px;
 }
 
 #admin_invites_table {
@@ -2372,4 +2536,9 @@ label.preferences-radio-choice-label {
             display: none;
         }
     }
+}
+
+.profile-field-choices .choice-row input.modal_text_input:disabled {
+    opacity: var(--opacity-disabled-profile-field-choice-input);
+    color: var(--color-text-default);
 }

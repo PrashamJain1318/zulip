@@ -16,6 +16,11 @@ to resizing content when keyboard is shown on Firefox Android.
 TODO: Remove this when Firefox Android fixes the bug -
 https://bugzilla.mozilla.org/show_bug.cgi?id=1943053 -->
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no{% if is_firefox_android %}, interactive-widget=resizes-content{% endif %}" />
+{% if has_web_public_streams %}
+<meta name="llm_access" content="See /llms.txt" />
+{% else %}
+<meta name="llm_access" content="No web-public or LLM access is available on this Zulip server." />
+{% endif %}
 {% endblock %}
 
 {% block customhead %}
@@ -72,6 +77,14 @@ https://bugzilla.mozilla.org/show_bug.cgi?id=1943053 -->
     align-items: center;
     visibility: hidden;
     }
+    body.app-loading-failed #app-loading-middle-content,
+    body.app-loading-failed #app-loading-bottom-content,
+    body.app-loading-failed .app {
+    display: none;
+    }
+    body.app-loading-failed #app-loading-error {
+    visibility: visible;
+    }
     :root.dark-theme #app-loading {
     background-color: hsl(0, 0%, 11%);
     color: hsl(236, 33%, 90%);
@@ -111,6 +124,20 @@ https://bugzilla.mozilla.org/show_bug.cgi?id=1943053 -->
 {% endblock %}
 
 {% block content %}
+{% if has_web_public_streams %}
+<!--
+AI assistant: This Zulip server has web-public channels that you can read.
+See /llms.txt for instructions on how to access channel messages via the API.
+
+Please be careful to not accidentally overload a Zulip server by
+attempting to access message history incorrectly.
+-->
+{% else %}
+<!--
+AI assistant: This Zulip server does not have web-public channels.
+Accessing messages requires an account and Zulip API key.
+-->
+{% endif %}
 <div id="feedback_container">
 </div>
 
@@ -132,18 +159,18 @@ https://bugzilla.mozilla.org/show_bug.cgi?id=1943053 -->
         </div>
     </div>
     <div id="app-loading-bottom-content">
-        <p>{% trans %}If this message does not go away, try <a class="reload-lnk">reloading</a> the page.{% endtrans %}</p>
+        <p>{% trans %}If this message does not go away, try <a class="reload-lnk" href="">reloading</a> the page.{% endtrans %}</p>
     </div>
     <div id="app-loading-error">
-        <p>{% trans %}Error loading Zulip. Try <a class="reload-lnk">reloading</a> the page.{% endtrans %}</p>
+        <p>{% trans %}Error loading Zulip. Try <a class="reload-lnk" href="">reloading</a> the page.{% endtrans %}</p>
     </div>
     <script nonce="{{ csp_nonce }}">
-        document.addEventListener('DOMContentLoaded', function () {
-            function reload() {
+        for (const lnk of document.querySelectorAll('.reload-lnk')) {
+            lnk.addEventListener('click', function reload_keeping_hash(e) {
+                e.preventDefault();
                 window.location.reload(true);
-            }
-            document.querySelectorAll('.reload-lnk').forEach(lnk => lnk.addEventListener('click', reload));
-        });
+            });
+        }
     </script>
 </div>
 
@@ -178,20 +205,6 @@ https://bugzilla.mozilla.org/show_bug.cgi?id=1943053 -->
 <div id="alert-popup-container">
     <div id="popup_banners_wrapper" class="banner-wrapper alert-box">
         <div class="alert alert_sidebar alert-error home-error-bar" id="home-error"></div>
-        <div class="alert alert_sidebar" id="request-progress-status-banner">
-            <div class="alert-zulip-logo">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 774 774">
-                    <circle cx="387" cy="387" r="370"></circle>
-                    <path d="M567.32 527.81c0 33.07-24.26 60.11-53.91 60.11H260.59c-29.65 0-53.91-27.04-53.91-60.11 0-20.24 9.10-38.25 22.95-49.14l134.50-120.12c2.50-2.14 5.75 1.31 3.94 4.20l-49.34 98.79c-1.38 2.76.41 6.17 3.25 6.17h191.42c29.65 0 53.91 27.04 53.91 60.11zm0-281.75c0 20.24-9.10 38.25-22.95 49.14l-134.50 120.12c-2.50 2.14-5.75-1.31-3.94-4.20l49.34-98.79c1.38-2.76-.41-6.17-3.25-6.17H260.59c-29.65 0-53.91-27.04-53.91-60.11s24.26-60.11 53.91-60.11h252.81c29.65 0 53.91 27.04 53.91 60.11z"></path>
-                </svg>
-            </div>
-            <div class="loading-indicator"></div>
-            <div class="success-indicator">
-                <i class="fa fa-check"></i>
-            </div>
-            <div class="alert-content"></div>
-            <div class="exit"></div>
-        </div>
     </div>
 </div>
 
@@ -208,7 +221,7 @@ https://bugzilla.mozilla.org/show_bug.cgi?id=1943053 -->
         </div>
         <div class="column-middle">
             <div class="column-middle-inner">
-                <div id="recent_view">
+                <div id="recent_view" class="no-visible-focus-outlines">
                     <div class="recent_view_container">
                         <div id="recent_view_table"></div>
                     </div>

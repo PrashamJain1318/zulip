@@ -444,6 +444,54 @@ class TypingHappyPathTestDirectMessages(ZulipTestCase):
         self.assertEqual(event["op"], "stop")
 
 
+class TypingRestrictedUserAccessTest(ZulipTestCase):
+    def test_direct_typing_notification_to_inaccessible_user(self) -> None:
+        """
+        Verifies that a user in a realm with restricted user access
+        cannot send direct-message typing notifications to users they cannot
+        access.
+        """
+        self.set_up_db_for_testing_user_access()
+        polonius = self.example_user("polonius")
+        # Polonius shares "test_stream1" with hamlet, but not with othello,
+        # so hamlet is accessible and othello is not.
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+
+        # Sending to an inaccessible user is rejected.
+        with self.capture_send_event_calls(expected_num_events=0):
+            result = self.api_post(
+                polonius,
+                "/api/v1/typing",
+                {"to": orjson.dumps([othello.id]).decode(), "op": "start"},
+            )
+        self.assert_json_error(
+            result, "You do not have permission to access some of the recipients."
+        )
+
+        # A group with any inaccessible recipient is rejected too.
+        with self.capture_send_event_calls(expected_num_events=0):
+            result = self.api_post(
+                polonius,
+                "/api/v1/typing",
+                {"to": orjson.dumps([hamlet.id, othello.id]).decode(), "op": "start"},
+            )
+        self.assert_json_error(
+            result, "You do not have permission to access some of the recipients."
+        )
+
+        # Sending to an accessible user still works.
+        with self.capture_send_event_calls(expected_num_events=1) as events:
+            result = self.api_post(
+                polonius,
+                "/api/v1/typing",
+                {"to": orjson.dumps([hamlet.id]).decode(), "op": "start"},
+            )
+        self.assert_json_success(result)
+        event_recipient_ids = {user["user_id"] for user in events[0]["event"]["recipients"]}
+        self.assertEqual(event_recipient_ids, {polonius.id, hamlet.id})
+
+
 class TypingHappyPathTestStreams(ZulipTestCase):
     def test_valid_type_and_op_parameters(self) -> None:
         recipient_type_name = ["channel", "stream"]
@@ -893,3 +941,24 @@ class TestSendTypingNotificationsSettings(ZulipTestCase):
         self.assert_length(events, 1)
         event_user_ids = set(events[0]["users"])
         self.assertEqual(expected_recipient_ids, event_user_ids)
+
+    def test_message_edit_notifications_for_direct_messages_to_self(self) -> None:
+        hamlet = self.example_user("hamlet")
+        msg_id = self.send_personal_message(hamlet, hamlet)
+
+        params = dict(
+            op="start",
+        )
+        with self.capture_send_event_calls(expected_num_events=1) as events:
+            result = self.api_post(hamlet, f"/api/v1/messages/{msg_id}/typing", params)
+
+        self.assert_json_success(result)
+        self.assert_length(events, 1)
+
+        # Make sure that hamlet being both the sender and recipient is not included twice.
+        self.assert_length(events[0]["users"], 1)
+        self.assertEqual([hamlet.id], events[0]["users"])
+
+        event = events[0]["event"]
+        self.assert_length(event["recipient"]["user_ids"], 1)
+        self.assertEqual([hamlet.id], event["recipient"]["user_ids"])

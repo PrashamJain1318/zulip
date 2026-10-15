@@ -19,7 +19,7 @@ hash_replacements = {
 
 
 def encode_hash_component(s: str) -> str:
-    encoded = urllib.parse.quote(s, safe="*")
+    encoded = urllib.parse.quote(s, safe="")
     return "".join(hash_replacements.get(c, c) for c in encoded)
 
 
@@ -141,8 +141,11 @@ def topic_narrow_url(*, realm: Realm, stream: Stream, topic_name: str) -> str:
 
 
 def message_link_url(
-    realm: Realm, message: dict[str, Any], *, conversation_link: bool = False
+    realm: Realm | None, message: dict[str, Any], *, conversation_link: bool = False
 ) -> str:
+    """Builds a link to a message. Passing a realm produces an absolute
+    URL; passing None produces a link relative to the Zulip server.
+    """
     if message["type"] == "stream":
         url = stream_message_url(
             realm=realm,
@@ -164,10 +167,8 @@ def stream_message_url(
     message: dict[str, Any],
     *,
     conversation_link: bool = False,
-    include_base_url: bool = True,
+    include_channel_name: bool = True,
 ) -> str:
-    if include_base_url and realm is None:
-        raise ValueError("realm is required when include_base_url=True")
     if conversation_link:
         with_or_near = "with"
     else:
@@ -177,19 +178,23 @@ def stream_message_url(
     stream_name = message["display_recipient"]
     topic_name = get_topic_from_message_info(message)
     encoded_topic_name = encode_hash_component(topic_name)
-    encoded_stream = encode_channel(stream_id, stream_name)
+    if include_channel_name:
+        encoded_stream = encode_channel(stream_id, stream_name)
+    else:
+        # Used when the URL must not reveal the channel name (e.g. for a
+        # write-only bot); Zulip still resolves the channel from the ID alone.
+        encoded_stream = str(stream_id)
 
     narrow_fragments = (
         f"#narrow/channel/{encoded_stream}/topic/{encoded_topic_name}/{with_or_near}/{message_id}"
     )
-    if include_base_url is True:
-        assert realm is not None
-        return f"{realm.url}/{narrow_fragments}"
-    return narrow_fragments
+    if realm is None:
+        return narrow_fragments
+    return f"{realm.url}/{narrow_fragments}"
 
 
 def pm_message_url(
-    realm: Realm, message: dict[str, Any], *, conversation_link: bool = False
+    realm: Realm | None, message: dict[str, Any], *, conversation_link: bool = False
 ) -> str:
     if conversation_link:
         with_or_near = "with"
@@ -201,16 +206,10 @@ def pm_message_url(
 
     direct_message_slug = encode_user_ids(user_ids)
 
-    parts = [
-        realm.url,
-        "#narrow",
-        "dm",
-        direct_message_slug,
-        with_or_near,
-        message_id,
-    ]
-    full_url = "/".join(parts)
-    return full_url
+    narrow_fragments = f"#narrow/dm/{direct_message_slug}/{with_or_near}/{message_id}"
+    if realm is None:
+        return narrow_fragments
+    return f"{realm.url}/{narrow_fragments}"
 
 
 def append_url_query_string(original_url: str, query: str) -> str:

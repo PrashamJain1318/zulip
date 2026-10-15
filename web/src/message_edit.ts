@@ -1,6 +1,6 @@
 import autosize from "autosize";
 import ClipboardJS from "clipboard";
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 import * as tippy from "tippy.js";
@@ -25,6 +25,7 @@ import * as channel from "./channel.ts";
 import * as compose_actions from "./compose_actions.ts";
 import * as compose_banner from "./compose_banner.ts";
 import * as compose_call from "./compose_call.ts";
+import {compose_call_session_manager} from "./compose_call_session.ts";
 import * as compose_tooltips from "./compose_tooltips.ts";
 import * as compose_ui from "./compose_ui.ts";
 import * as compose_validate from "./compose_validate.ts";
@@ -41,6 +42,7 @@ import {$t, $t_html} from "./i18n.ts";
 import * as keydown_util from "./keydown_util.ts";
 import * as loading from "./loading.ts";
 import * as markdown from "./markdown.ts";
+import * as message_fetch_raw_content from "./message_fetch_raw_content.ts";
 import * as message_lists from "./message_lists.ts";
 import * as message_live_update from "./message_live_update.ts";
 import * as message_store from "./message_store.ts";
@@ -66,6 +68,12 @@ import * as util from "./util.ts";
 // textarea element which has the modified content.
 // Storing textarea makes it easy to get the current content.
 export const currently_editing_messages = new Map<number, JQuery<HTMLTextAreaElement>>();
+// Stores the raw content each message had when its edit box was
+// opened. We cannot read this from `message.raw_content` when saving,
+// because we deliberately avoid caching that for messages in channels
+// the user is not subscribed to; see
+// `message_store.maybe_update_raw_content`.
+const pre_edit_raw_content = new Map<number, string>();
 const resized_edit_box_height = new Map<number, number>();
 let currently_topic_editing_message_ids: number[] = [];
 const currently_echoing_messages = new Map<number, EchoedMessageData>();
@@ -98,11 +106,7 @@ export let notify_old_thread_default = false;
 export let notify_new_thread_default = true;
 
 export function is_topic_editable(message: Message, edit_limit_seconds_buffer = 0): boolean {
-    if (!is_message_editable_ignoring_permissions(message)) {
-        return false;
-    }
-
-    if (message.type !== "stream") {
+    if (!is_message_editable_ignoring_permissions(message) || message.type !== "stream") {
         return false;
     }
 
@@ -189,19 +193,12 @@ export function is_message_editable_ignoring_permissions(message: Message): bool
 }
 
 export function is_content_editable(message: Message, edit_limit_seconds_buffer = 0): boolean {
-    if (!is_message_editable_ignoring_permissions(message)) {
-        return false;
-    }
-
-    if (!realm.realm_allow_message_editing) {
-        return false;
-    }
-
-    if (!message.sent_by_me) {
-        return false;
-    }
-
-    if (is_widget_message(message)) {
+    if (
+        !is_message_editable_ignoring_permissions(message) ||
+        !realm.realm_allow_message_editing ||
+        !message.sent_by_me ||
+        is_widget_message(message)
+    ) {
         return false;
     }
 
@@ -209,15 +206,12 @@ export function is_content_editable(message: Message, edit_limit_seconds_buffer 
         return false;
     }
 
-    if (realm.realm_message_content_edit_limit_seconds === null) {
-        return true;
-    }
-
     if (
+        realm.realm_message_content_edit_limit_seconds === null ||
         realm.realm_message_content_edit_limit_seconds +
             edit_limit_seconds_buffer +
             (message.timestamp - Date.now() / 1000) >
-        0
+            0
     ) {
         return true;
     }
@@ -233,11 +227,7 @@ export function remaining_content_edit_time(message: Message): number {
 }
 
 export function is_stream_editable(message: Message, edit_limit_seconds_buffer = 0): boolean {
-    if (!is_message_editable_ignoring_permissions(message)) {
-        return false;
-    }
-
-    if (message.type !== "stream") {
+    if (!is_message_editable_ignoring_permissions(message) || message.type !== "stream") {
         return false;
     }
 
@@ -345,13 +335,15 @@ export function hide_message_edit_spinner($row: JQuery): void {
     $row.find(".message_edit_cancel").removeClass("message-edit-button-disabled");
 }
 
-export function show_message_edit_spinner($row: JQuery): void {
+export function show_message_edit_spinner($row: JQuery, keep_cancel_enabled = false): void {
     // Always show the white spinner like we
     // do for send button in compose box.
     loading.show_button_spinner($row.find(".loader"), true);
     $row.find(".message_edit_save span").addClass("showing-button-spinner");
     $row.find(".message_edit_save").addClass("message-edit-button-disabled");
-    $row.find(".message_edit_cancel").addClass("message-edit-button-disabled");
+    if (!keep_cancel_enabled) {
+        $row.find(".message_edit_cancel").addClass("message-edit-button-disabled");
+    }
 }
 
 export function show_topic_edit_spinner($row: JQuery): void {
@@ -559,7 +551,8 @@ function timer_text(seconds_left: number): string {
     const seconds = seconds_left % 60;
     if (minutes >= 1) {
         return $t({defaultMessage: "{minutes} min to edit"}, {minutes: minutes.toString()});
-    } else if (seconds_left >= 10) {
+    }
+    if (seconds_left >= 10) {
         return $t(
             {defaultMessage: "{seconds} sec to edit"},
             {seconds: (seconds - (seconds % 5)).toString()},
@@ -779,15 +772,7 @@ function start_edit_maintaining_scroll($row: JQuery, content: string): void {
     }
 }
 
-function start_edit_with_content(
-    $row: JQuery,
-    content: string,
-    edit_box_open_callback?: () => void,
-): void {
-    start_edit_maintaining_scroll($row, content);
-    if (edit_box_open_callback) {
-        edit_box_open_callback();
-    }
+function setup_edit_form_widgets($row: JQuery): void {
     const row_id = rows.id($row);
     upload.setup_upload(upload.edit_config(row_id));
     // Setup dropdown for saved snippets button in the current
@@ -795,6 +780,19 @@ function start_edit_with_content(
     saved_snippets_ui.setup_saved_snippets_dropdown_widget(
         `.saved-snippets-message-edit-widget[data-message-id="${CSS.escape(row_id.toString())}"]`,
     );
+}
+
+function start_edit_with_content(
+    $row: JQuery,
+    content: string,
+    edit_box_open_callback?: () => void,
+): void {
+    pre_edit_raw_content.set(rows.id($row), content);
+    start_edit_maintaining_scroll($row, content);
+    if (edit_box_open_callback) {
+        edit_box_open_callback();
+    }
+    setup_edit_form_widgets($row);
 }
 
 export function start($row: JQuery, edit_box_open_callback?: () => void): void {
@@ -815,18 +813,15 @@ export function start($row: JQuery, edit_box_open_callback?: () => void): void {
     }
 
     const msg_list = message_lists.current;
-    void channel.get({
-        url: "/json/messages/" + message.id,
-        data: {allow_empty_topic_name: true, apply_markdown: false},
-        success(raw_data) {
-            const data = message_store.single_message_content_schema.parse(raw_data);
-            assert(data.message.content_type === "text/x-markdown");
-
-            const message_markdown_content = data.message.content;
+    message_fetch_raw_content.get_raw_content_for_single_message({
+        message_id: message.id,
+        on_success(raw_content) {
             if (message_lists.current === msg_list) {
-                message.raw_content = message_markdown_content;
-                start_edit_with_content($row, message.raw_content, edit_box_open_callback);
+                start_edit_with_content($row, raw_content, edit_box_open_callback);
             }
+        },
+        on_error() {
+            // do nothing
         },
     });
 }
@@ -865,7 +860,8 @@ function get_resolve_topic_time_limit_error_string(
                 },
                 {N: time_limit},
             );
-        } else if (time_limit_unit === "hour") {
+        }
+        if (time_limit_unit === "hour") {
             return $t(
                 {
                     defaultMessage:
@@ -891,7 +887,8 @@ function get_resolve_topic_time_limit_error_string(
             },
             {N: time_limit},
         );
-    } else if (time_limit_unit === "hour") {
+    }
+    if (time_limit_unit === "hour") {
         return $t(
             {
                 defaultMessage:
@@ -919,7 +916,7 @@ function handle_resolve_topic_failure_due_to_time_limit(topic_is_resolved: boole
         topic_is_resolved,
     );
 
-    const html_body = render_resolve_topic_time_limit_error_modal({
+    const modal_content_html = render_resolve_topic_time_limit_error_modal({
         topic_is_resolved,
         resolve_topic_time_limit_error_string,
     });
@@ -930,9 +927,9 @@ function handle_resolve_topic_failure_due_to_time_limit(topic_is_resolved: boole
         modal_heading = $t_html({defaultMessage: "Could not resolve topic"});
     }
     dialog_widget.launch({
-        html_heading: modal_heading,
-        html_body,
-        html_submit_button: $t_html({defaultMessage: "Close"}),
+        modal_title_html: modal_heading,
+        modal_content_html,
+        modal_submit_button_text: $t({defaultMessage: "Close"}),
         on_click() {
             /* Nothing extra needs to happen when the dialog is closed. */
         },
@@ -943,12 +940,12 @@ function handle_resolve_topic_failure_due_to_time_limit(topic_is_resolved: boole
 
 function show_intro_resolve_topic_modal(topic_name: string, cb: () => void): void {
     confirm_dialog.launch({
-        html_heading: $t_html({defaultMessage: "Mark topic as resolved"}),
-        html_body: render_intro_resolve_topic_modal({topic_name}),
+        modal_title_html: $t_html({defaultMessage: "Mark topic as resolved"}),
+        modal_content_html: render_intro_resolve_topic_modal({topic_name}),
         id: "intro_resolve_topic_modal",
         on_click: cb,
-        html_submit_button: $t({defaultMessage: "Got it — Confirm"}),
-        html_exit_button: $t({defaultMessage: "Got it — Cancel"}),
+        modal_submit_button_text: $t({defaultMessage: "Got it — Confirm"}),
+        modal_exit_button_text: $t({defaultMessage: "Got it — Cancel"}),
     });
 }
 
@@ -1048,7 +1045,7 @@ function do_toggle_resolve_topic(
 
                 if (report_errors_in_global_banner) {
                     const {msg} = z.object({msg: z.string()}).parse(xhr.responseJSON);
-                    ui_report.generic_embed_error(msg, 3500);
+                    ui_report.generic_embed_error(_.escape(msg), 3500);
                 }
             }
         },
@@ -1136,11 +1133,15 @@ export function end_message_row_edit($row: JQuery): void {
     if (message !== undefined && currently_editing_messages.has(message.id)) {
         typing.stop_message_edit_notifications(message.id);
         currently_editing_messages.delete(message.id);
+        pre_edit_raw_content.delete(message.id);
         resized_edit_box_height.delete(message.id);
         message_lists.current.hide_edit_message($row);
-        compose_call.abort_video_callbacks(message.id.toString());
+        compose_call_session_manager.abandon_session(message.id.toString());
     }
-    if ($row.find(".could-be-condensed").length > 0) {
+
+    if (message?.collapsed) {
+        condense.show_message_expander($row);
+    } else if ($row.find(".could-be-condensed").length > 0) {
         if ($row.find(".condensed").length > 0) {
             condense.show_message_expander($row);
         } else {
@@ -1167,6 +1168,7 @@ export function end_message_edit(message_id: number): void {
         // We should delete the message_id from currently_editing_messages
         // if it exists there but we cannot find the row.
         currently_editing_messages.delete(message_id);
+        pre_edit_raw_content.delete(message_id);
     }
 }
 
@@ -1205,8 +1207,8 @@ export function try_save_inline_topic_edit($row: JQuery): void {
     const stream_topics = stream_topic_history.get_recent_topic_names(stream_id);
     if (stream_topics.includes(new_topic)) {
         confirm_dialog.launch({
-            html_heading: $t_html({defaultMessage: "Merge with another topic?"}),
-            html_body: render_confirm_merge_topics_with_rename({
+            modal_title_html: $t_html({defaultMessage: "Merge with another topic?"}),
+            modal_content_html: render_confirm_merge_topics_with_rename({
                 topic_display_name: util.get_final_topic_display_name(new_topic),
                 is_empty_string_topic: new_topic === "",
             }),
@@ -1223,7 +1225,7 @@ export function do_save_inline_topic_edit($row: JQuery, message: Message, new_to
     show_topic_edit_spinner($row);
 
     if (message.locally_echoed) {
-        message = echo.edit_locally(message, {new_topic});
+        echo.edit_locally(message, {new_topic});
         assert(message_lists.current !== undefined);
         $row = message_lists.current.get_row(message.id);
         end_inline_topic_edit($row);
@@ -1301,14 +1303,14 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
         stream_id = Number.parseInt(stream_id_data, 10);
     }
     const msg_list = message_lists.current;
-    let message_id = rows.id($row);
-    let message = message_lists.current.get(message_id);
+    const message_id = rows.id($row);
+    const message = message_lists.current.get(message_id);
     assert(message !== undefined);
     let changed = false;
     let edit_locally_echoed = false;
 
     let new_content;
-    const old_content = message.raw_content;
+    const old_content = pre_edit_raw_content.get(message_id);
     assert(old_content !== undefined);
 
     const $edit_content_input = $row.find<HTMLTextAreaElement>("textarea.message_edit_content");
@@ -1340,7 +1342,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
     if (message.locally_echoed) {
         if (new_content !== message.raw_content) {
             // `edit_locally` handles the case where `new_topic/new_stream_id` is undefined
-            message = echo.edit_locally(message, {
+            echo.edit_locally(message, {
                 raw_content: new_content,
             });
             $row = message_lists.current.get_row(message_id);
@@ -1366,13 +1368,15 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
         currently_echoing_messages.set(message_id, {
             raw_content: new_content ?? "",
             orig_content: message.content,
-            orig_raw_content: message.raw_content ?? "",
+            // The raw content counterpart to orig_content above; we have
+            // no cached copy of it for channels we're not subscribed to.
+            orig_raw_content: message.raw_content ?? old_content,
             starred: message.starred,
             historical: message.historical,
             collapsed: message.collapsed,
             alerted: message.alerted,
             mentioned: message.mentioned,
-            mentioned_me_directly: message.mentioned,
+            mentioned_me_directly: message.mentioned_me_directly,
         });
         edit_locally_echoed = true;
 
@@ -1381,7 +1385,7 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
         // the message is acknowledged by the server.
         message.local_edit_timestamp = Math.round(Date.now() / 1000);
 
-        message = echo.edit_locally(message, currently_echoing_messages.get(message_id)!);
+        echo.edit_locally(message, currently_echoing_messages.get(message_id)!);
 
         $row = message_lists.current.get_row(message_id);
         end_message_row_edit($row);
@@ -1411,76 +1415,86 @@ export async function save_message_row_edit($row: JQuery): Promise<void> {
             }
         },
         error(xhr) {
-            if (msg_list === message_lists.current) {
-                message_id = rows.id($row);
+            // The save is over, so stop indicating progress on the row
+            // we started from, which may since have been detached.
+            hide_message_edit_spinner($row);
 
-                if (edit_locally_echoed) {
-                    let echoed_message = message_store.get(message_id);
-                    assert(echoed_message !== undefined);
-                    const echo_data = currently_echoing_messages.get(message_id);
-                    assert(echo_data !== undefined);
+            let echo_data: EchoedMessageData | undefined;
+            if (edit_locally_echoed) {
+                echo_data = currently_echoing_messages.get(message_id);
+                assert(echo_data !== undefined);
 
-                    delete echoed_message.local_edit_timestamp;
-                    currently_echoing_messages.delete(message_id);
+                delete message.local_edit_timestamp;
+                currently_echoing_messages.delete(message_id);
 
-                    // Restore the original content.
-                    echoed_message = echo.edit_locally(echoed_message, {
-                        content: echo_data.orig_content,
-                        raw_content: echo_data.orig_raw_content,
-                        mentioned: echo_data.mentioned,
-                        mentioned_me_directly: echo_data.mentioned_me_directly,
-                        alerted: echo_data.alerted,
-                    });
+                // Restore the original content.
+                echo.edit_locally(message, {
+                    content: echo_data.orig_content,
+                    raw_content: echo_data.orig_raw_content,
+                    mentioned: echo_data.mentioned,
+                    mentioned_me_directly: echo_data.mentioned_me_directly,
+                    alerted: echo_data.alerted,
+                });
+            }
 
-                    $row = message_lists.current.get_row(message_id);
-                    if (!currently_editing_messages.has(message_id)) {
-                        // Return to the message editing open UI state with the edited content.
-                        start_edit_maintaining_scroll($row, echo_data.raw_content);
+            if (msg_list !== message_lists.current) {
+                // Reopening the edit form takes keyboard focus and
+                // scrolls the message feed, which we don't want to do
+                // to whatever view the user has moved on to. Leave
+                // the message alone now that its content is restored.
+                return;
+            }
+
+            if (echo_data !== undefined) {
+                $row = message_lists.current.get_row(message_id);
+                if (!currently_editing_messages.has(message_id)) {
+                    // Return to the message editing open UI state with the edited content.
+                    pre_edit_raw_content.set(message_id, echo_data.orig_raw_content);
+                    start_edit_maintaining_scroll($row, echo_data.raw_content);
+                }
+            }
+
+            if (xhr.readyState !== 0) {
+                const $container = compose_banner.get_compose_banner_container(
+                    $row.find("textarea"),
+                );
+
+                if (xhr.responseJSON !== undefined) {
+                    const {code} = z.object({code: z.string()}).parse(xhr.responseJSON);
+                    if (code === "TOPIC_WILDCARD_MENTION_NOT_ALLOWED") {
+                        const new_row_html = render_wildcard_mention_not_allowed_error({
+                            banner_type: compose_banner.ERROR,
+                            classname: compose_banner.CLASSNAMES.wildcards_not_allowed,
+                        });
+                        compose_banner.append_compose_banner_to_banner_list(
+                            $(new_row_html),
+                            $container,
+                        );
+                        return;
+                    }
+                    if (code === "EXPECTATION_MISMATCH") {
+                        const message = $t({
+                            defaultMessage:
+                                "Error editing message: Message was edited by another client.",
+                        });
+                        compose_banner.show_error_message(
+                            message,
+                            compose_banner.CLASSNAMES.generic_compose_error,
+                            $container,
+                        );
+                        return;
                     }
                 }
 
-                hide_message_edit_spinner($row);
-                if (xhr.readyState !== 0) {
-                    const $container = compose_banner.get_compose_banner_container(
-                        $row.find("textarea"),
-                    );
-
-                    if (xhr.responseJSON !== undefined) {
-                        const {code} = z.object({code: z.string()}).parse(xhr.responseJSON);
-                        if (code === "TOPIC_WILDCARD_MENTION_NOT_ALLOWED") {
-                            const new_row_html = render_wildcard_mention_not_allowed_error({
-                                banner_type: compose_banner.ERROR,
-                                classname: compose_banner.CLASSNAMES.wildcards_not_allowed,
-                            });
-                            compose_banner.append_compose_banner_to_banner_list(
-                                $(new_row_html),
-                                $container,
-                            );
-                            return;
-                        } else if (code === "EXPECTATION_MISMATCH") {
-                            const message = $t({
-                                defaultMessage:
-                                    "Error editing message: Message was edited by another client.",
-                            });
-                            compose_banner.show_error_message(
-                                message,
-                                compose_banner.CLASSNAMES.generic_compose_error,
-                                $container,
-                            );
-                            return;
-                        }
-                    }
-
-                    const message = channel.xhr_error_message(
-                        $t({defaultMessage: "Error editing message"}),
-                        xhr,
-                    );
-                    compose_banner.show_error_message(
-                        message,
-                        compose_banner.CLASSNAMES.generic_compose_error,
-                        $container,
-                    );
-                }
+                const message = channel.xhr_error_message(
+                    $t({defaultMessage: "Error editing message"}),
+                    xhr,
+                );
+                compose_banner.show_error_message(
+                    message,
+                    compose_banner.CLASSNAMES.generic_compose_error,
+                    $container,
+                );
             }
         },
     });
@@ -1495,15 +1509,21 @@ export function maybe_show_edit($row: JQuery, id: number): void {
     if (currently_editing_messages.has(id)) {
         const $message_edit_content = currently_editing_messages.get(id);
         edit_message($row, $message_edit_content?.val() ?? "");
+        setup_edit_form_widgets($row);
+        if ($row.hasClass("show_preview")) {
+            show_preview_area($row);
+            $row.removeClass("show_preview");
+        }
     }
 }
 
 function warn_user_about_unread_msgs(last_sent_msg_id: number, num_unread: number): void {
     confirm_dialog.launch({
-        html_heading: $t({defaultMessage: "Edit your last message?"}),
-        html_body: render_confirm_edit_messages({
+        modal_title_html: $t({defaultMessage: "Edit your last message?"}),
+        modal_content_html: render_confirm_edit_messages({
             num_unread,
         }),
+        is_compact: true,
         on_click() {
             // Select the message we want to edit to mark messages between it and the
             // current selected id as read.
@@ -1611,13 +1631,13 @@ function handle_message_move_failure_due_to_time_limit(
         },
     );
 
-    const html_body = render_confirm_moving_messages_modal({
+    const modal_content_html = render_confirm_moving_messages_modal({
         messages_allowed_to_move_text,
         messages_not_allowed_to_move_text,
     });
     confirm_dialog.launch({
-        html_heading: $t_html({defaultMessage: "Move some messages?"}),
-        html_body,
+        modal_title_html: $t_html({defaultMessage: "Move some messages?"}),
+        modal_content_html,
         on_click: handle_confirm,
         loading_spinner: true,
         ...(on_hide_callback !== undefined && {on_hide: on_hide_callback}),
@@ -1630,7 +1650,13 @@ type ToastParams = {
 };
 
 function show_message_moved_toast(toast_params: ToastParams): void {
-    const new_stream_name = sub_store.maybe_get_stream_name(toast_params.new_stream_id);
+    const new_stream = sub_store.get(toast_params.new_stream_id);
+    if (new_stream === undefined) {
+        blueslip.error("Cannot find stream for message moved toast", {
+            stream_id: toast_params.new_stream_id,
+        });
+        return;
+    }
     const new_topic_display_name = util.get_final_topic_display_name(toast_params.new_topic_name);
     const is_empty_string_topic = toast_params.new_topic_name === "";
     const new_location_url = hash_util.by_stream_topic_url(
@@ -1640,7 +1666,7 @@ function show_message_moved_toast(toast_params: ToastParams): void {
     feedback_widget.show({
         populate($container) {
             const widget_body_html = render_message_moved_widget_body({
-                new_stream_name,
+                stream: new_stream,
                 new_topic_display_name,
                 new_location_url,
                 is_empty_string_topic,
@@ -1822,15 +1848,7 @@ export function is_message_oldest_or_newest(
 
 export function show_preview_area($element: JQuery): void {
     const $row = rows.get_closest_row($element);
-
-    // Disable unneeded compose_control_buttons as we don't
-    // need them in preview mode.
-    $row.addClass("preview_mode");
-    $row.find(".preview_mode_disabled .compose_control_button").attr("tabindex", -1);
-
-    $row.find(".markdown_preview").hide();
-    $row.find(".undo_markdown_preview").show();
-
+    compose_ui.enter_preview_mode($row);
     render_preview_area($row);
 }
 
@@ -1839,27 +1857,25 @@ export function render_preview_area($row: JQuery): void {
     const content = $msg_edit_content.val();
     assert(content !== undefined);
     const $preview_message_area = $row.find(".preview_message_area");
-    compose_ui.render_and_show_preview(
-        $row,
-        $row.find(".markdown_preview_spinner"),
-        $row.find(".preview_content"),
-        content,
-    );
+    compose_ui.render_and_show_preview($row, content);
     const edit_height = $msg_edit_content.height();
     $preview_message_area.css({"min-height": edit_height + "px"});
     $preview_message_area.show();
 }
 
+export function update_preview_embeds(content: string, rendered_content: string): void {
+    for (const $message_edit_content of currently_editing_messages.values()) {
+        if ($message_edit_content.val() === content) {
+            compose_ui.apply_preview_embeds(
+                rows.get_closest_row($message_edit_content),
+                content,
+                rendered_content,
+            );
+        }
+    }
+}
+
 export function clear_preview_area($element: JQuery): void {
     const $row = rows.get_closest_row($element);
-
-    // While in preview mode we disable unneeded compose_control_buttons,
-    // so here we are re-enabling those compose_control_buttons
-    $row.removeClass("preview_mode");
-    $row.find(".preview_mode_disabled .compose_control_button").attr("tabindex", 0);
-
-    $row.find(".undo_markdown_preview").hide();
-    $row.find(".preview_message_area").hide();
-    $row.find(".preview_content").empty();
-    $row.find(".markdown_preview").show();
+    compose_ui.exit_preview_mode($row);
 }

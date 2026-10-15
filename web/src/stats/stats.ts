@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import PlotlyBar from "plotly.js/lib/bar";
 import Plotly from "plotly.js/lib/core";
@@ -22,10 +22,8 @@ type AggregatedData<T> = {
     last_value_is_partial: boolean;
 };
 
-// Partial used here because the @types/plotly.js define the full
-// set of properties while we only assign several of them.
 type PlotTrace = {
-    trace: Partial<Plotly.PlotData>;
+    trace: Plotly.BarData | Plotly.ScatterData;
 };
 
 type DataByEveryoneMe<T> = {
@@ -122,7 +120,7 @@ const font_12pt = {
     color: "#000000",
 };
 
-let last_full_update = Number.POSITIVE_INFINITY;
+let last_full_update = Infinity;
 
 function handle_parse_server_stats_result<T>(
     result: z.core.util.SafeParseResult<T>,
@@ -241,9 +239,9 @@ $(() => {
 
 // Helper used in vertical bar charts
 function make_rangeselector(
-    button1: Partial<Plotly.RangeSelectorButton>,
-    button2: Partial<Plotly.RangeSelectorButton>,
-): Partial<Plotly.RangeSelector> {
+    button1: NonNullable<NonNullable<Plotly.LayoutAxis["rangeselector"]>["buttons"]>[number],
+    button2: NonNullable<NonNullable<Plotly.LayoutAxis["rangeselector"]>["buttons"]>[number],
+): NonNullable<Plotly.LayoutAxis["rangeselector"]> {
     return {
         x: -0.045,
         y: -0.62,
@@ -351,17 +349,19 @@ function populate_messages_sent_over_time(raw_data: unknown): void {
     function make_traces(
         dates: Date[],
         values: DataByUserType<number[]>,
-        type: Plotly.PlotType,
+        type: "bar" | "scatter",
         date_formatter: DateFormatter,
-    ): DataByUserType<Partial<Plotly.PlotData>> {
+    ): DataByUserType<Plotly.BarData | Plotly.ScatterData> {
         const text = dates.map((date) => date_formatter(date));
-        const common: Partial<Plotly.PlotData> = {
+        const common: Plotly.BarData | Plotly.ScatterData = {
             x: dates,
             type,
             hoverinfo: "none",
             text,
-            textposition: "none",
         };
+        if (common.type === "bar") {
+            common.textposition = "none";
+        }
         return {
             human: {
                 // 5062a0
@@ -386,7 +386,7 @@ function populate_messages_sent_over_time(raw_data: unknown): void {
         };
     }
 
-    const layout: Partial<Plotly.Layout> = {
+    const layout: Plotly.Layout = {
         barmode: "group",
         width: 750,
         height: 400,
@@ -422,8 +422,9 @@ function populate_messages_sent_over_time(raw_data: unknown): void {
             .querySelector<Plotly.PlotlyHTMLElement>("#id_messages_sent_over_time")!
             .on("plotly_hover", (data) => {
                 $("#hoverinfo").show();
+                assert(data.points[0]?.data.type === "bar");
                 document.querySelector("#hover_date")!.textContent =
-                    data.points[0]!.data.text[data.points[0]!.pointNumber]!;
+                    data.points[0].data.text![data.points[0].pointNumber]!;
                 const values: Plotly.Datum[] = [null, null, null];
                 for (const trace of data.points) {
                     values[trace.curveNumber] = trace.y;
@@ -513,10 +514,7 @@ function populate_messages_sent_over_time(raw_data: unknown): void {
     }
 
     // Generate traces
-    let date_formatter = function (date: Date): string {
-        return format_date(date, true);
-    };
-    let values = {me: data.user.human, human: data.everyone.human, bot: data.everyone.bot};
+    let date_formatter: (date: Date) => string;
 
     let info = aggregate_data(data, "day");
     date_formatter = function (date) {
@@ -534,7 +532,7 @@ function populate_messages_sent_over_time(raw_data: unknown): void {
     const weekly_traces = make_traces(info.dates, info.values, "bar", date_formatter);
 
     const dates = data.end_times.map((timestamp: number) => new Date(timestamp * 1000));
-    values = {
+    const values = {
         human: partial_sums(data.everyone.human),
         bot: partial_sums(data.everyone.bot),
         me: partial_sums(data.user.human),
@@ -552,8 +550,8 @@ function populate_messages_sent_over_time(raw_data: unknown): void {
     let clicked_cumulative = false;
 
     function draw_or_update_plot(
-        rangeselector: Partial<Plotly.RangeSelector>,
-        traces: DataByUserType<Partial<Plotly.PlotData>>,
+        rangeselector: NonNullable<Plotly.LayoutAxis["rangeselector"]>,
+        traces: DataByUserType<Plotly.BarData | Plotly.ScatterData>,
         last_value_is_partial: boolean,
         initial_draw: boolean,
     ): void {
@@ -712,10 +710,10 @@ function populate_messages_sent_by_client(raw_data: unknown): void {
         trace: {
             x: number[];
         };
-        trace_annotations: Partial<Plotly.PlotData>;
+        trace_annotations: Plotly.BarData | Plotly.ScatterData;
     };
 
-    const layout: Partial<Plotly.Layout> = {
+    const layout: Plotly.Layout = {
         width: 750,
         // height set in draw_plot()
         margin: {l: 10, r: 10, b: 40, t: 10},
@@ -739,10 +737,7 @@ function populate_messages_sent_by_client(raw_data: unknown): void {
         });
     }
     label_values.sort((a, b) => b.value - a.value);
-    const labels: string[] = [];
-    for (const item of label_values) {
-        labels.push(item.label);
-    }
+    const labels = Array.from(label_values, (item) => item.label);
 
     function make_plot_data(
         time_series_data: Record<string, number[]>,
@@ -762,7 +757,7 @@ function populate_messages_sent_by_client(raw_data: unknown): void {
                 annotations.values.push(plot_data.values[i]!);
                 annotations.labels.push(plot_data.labels[i]!);
                 annotations.text.push(
-                    "   " + plot_data.labels[i] + " (" + plot_data.percentages[i] + ")",
+                    " ".repeat(3) + plot_data.labels[i] + " (" + plot_data.percentages[i] + ")",
                 );
             }
         }
@@ -772,7 +767,6 @@ function populate_messages_sent_by_client(raw_data: unknown): void {
                 y: plot_data.labels,
                 type: "bar",
                 orientation: "h",
-                textinfo: "text",
                 hoverinfo: "none",
                 marker: {color: "#537c5e"},
             },
@@ -813,22 +807,22 @@ function populate_messages_sent_by_client(raw_data: unknown): void {
     }
 
     if (data.end_times.length < 365) {
-        $("#pie_messages_sent_by_client button[data-time='year']").remove();
+        $("#messages_sent_by_client button[data-time='year']").remove();
         if (data.end_times.length < 30) {
-            $("#pie_messages_sent_by_client button[data-time='month']").remove();
+            $("#messages_sent_by_client button[data-time='month']").remove();
             if (data.end_times.length < 7) {
-                $("#pie_messages_sent_by_client button[data-time='week']").remove();
+                $("#messages_sent_by_client button[data-time='week']").remove();
             }
         }
     }
 
     function draw_plot(): void {
-        $("#id_messages_sent_by_client > div").removeClass("spinner");
+        $("#messages_sent_by_client_chart > div").removeClass("spinner");
         const data_ = plot_data[user_button][time_button];
         layout.height = layout.margin!.b! + data_.trace.x.length * 30;
         layout.xaxis = {range: [0, Math.max(...data_.trace.x) * 1.3]};
         void Plotly.newPlot(
-            "id_messages_sent_by_client",
+            "messages_sent_by_client_chart",
             [data_.trace, data_.trace_annotations],
             layout,
             {displayModeBar: false, staticPlot: true},
@@ -839,16 +833,16 @@ function populate_messages_sent_by_client(raw_data: unknown): void {
 
     // Click handlers
     function set_user_button($button: JQuery): void {
-        $("#pie_messages_sent_by_client button[data-user]").removeClass("selected");
+        $("#messages_sent_by_client button[data-user]").removeClass("selected");
         $button.addClass("selected");
     }
 
     function set_time_button($button: JQuery): void {
-        $("#pie_messages_sent_by_client button[data-time]").removeClass("selected");
+        $("#messages_sent_by_client button[data-time]").removeClass("selected");
         $button.addClass("selected");
     }
 
-    $("#pie_messages_sent_by_client button").on("click", function () {
+    $("#messages_sent_by_client button").on("click", function () {
         if ($(this).attr("data-user")) {
             set_user_button($(this));
             user_button = user_button_schema.parse($(this).attr("data-user"));
@@ -872,7 +866,7 @@ function populate_messages_sent_by_message_type(raw_data: unknown): void {
     }
 
     type PlotDataByMessageType = {
-        trace: Partial<Plotly.PieData>;
+        trace: Plotly.PieData;
         total_html: string;
     };
 
@@ -1012,7 +1006,7 @@ function populate_number_of_users(raw_data: unknown): void {
         {count: 6, label: $t({defaultMessage: "Last 6 months"}), step: "month"},
     );
 
-    const layout: Partial<Plotly.Layout> = {
+    const layout: Plotly.Layout = {
         width: 750,
         height: 370,
         margin: {l: 40, r: 10, b: 40, t: 0},
@@ -1030,7 +1024,10 @@ function populate_number_of_users(raw_data: unknown): void {
 
     const text = end_dates.map((date) => format_date(date, false));
 
-    function make_traces(values: Plotly.Datum[], type: Plotly.PlotType): Partial<Plotly.PlotData> {
+    function make_traces(
+        values: Plotly.Datum[],
+        type: "bar" | "scatter",
+    ): Plotly.BarData | Plotly.ScatterData {
         return {
             x: end_dates,
             y: values,
@@ -1046,9 +1043,10 @@ function populate_number_of_users(raw_data: unknown): void {
         document
             .querySelector<Plotly.PlotlyHTMLElement>("#id_number_of_users")!
             .on("plotly_hover", (data) => {
+                assert(data.points[0]?.data.type === "scatter");
                 $("#users_hover_info").show();
                 document.querySelector("#users_hover_date")!.textContent =
-                    data.points[0]!.data.text[data.points[0]!.pointNumber]!;
+                    data.points[0].data.text![data.points[0].pointNumber]!;
                 const values: Plotly.Datum[] = [null, null, null];
                 for (const trace of data.points) {
                     values[trace.curveNumber] = trace.y;
@@ -1125,17 +1123,19 @@ function populate_messages_read_over_time(raw_data: unknown): void {
     function make_traces(
         dates: Date[],
         values: DataByEveryoneMe<number[]>,
-        type: Plotly.PlotType,
+        type: "bar" | "scatter",
         date_formatter: DateFormatter,
-    ): DataByEveryoneMe<Partial<Plotly.PlotData>> {
+    ): DataByEveryoneMe<Plotly.BarData | Plotly.ScatterData> {
         const text = dates.map((date) => date_formatter(date));
-        const common: Partial<Plotly.PlotData> = {
+        const common: Plotly.BarData | Plotly.ScatterData = {
             x: dates,
             type,
             hoverinfo: "none",
             text,
-            textposition: "none",
         };
+        if (common.type === "bar") {
+            common.textposition = "none";
+        }
         return {
             everyone: {
                 name: $t({defaultMessage: "Everyone"}),
@@ -1152,7 +1152,7 @@ function populate_messages_read_over_time(raw_data: unknown): void {
         };
     }
 
-    const layout: Partial<Plotly.Layout> = {
+    const layout: Plotly.Layout = {
         barmode: "group",
         width: 750,
         height: 400,
@@ -1187,9 +1187,10 @@ function populate_messages_read_over_time(raw_data: unknown): void {
         document
             .querySelector<Plotly.PlotlyHTMLElement>("#id_messages_read_over_time")!
             .on("plotly_hover", (data) => {
+                assert(data.points[0]?.data.type === "bar");
                 $("#read_hover_info").show();
                 document.querySelector("#read_hover_date")!.textContent =
-                    data.points[0]!.data.text[data.points[0]!.pointNumber]!;
+                    data.points[0].data.text![data.points[0].pointNumber]!;
                 const values: Plotly.Datum[] = [null, null];
                 for (const trace of data.points) {
                     values[trace.curveNumber] = trace.y;
@@ -1272,10 +1273,7 @@ function populate_messages_read_over_time(raw_data: unknown): void {
     }
 
     // Generate traces
-    let date_formatter = function (date: Date): string {
-        return format_date(date, true);
-    };
-    let values = {me: data.user.read, everyone: data.everyone.read};
+    let date_formatter: (date: Date) => string;
 
     let info = aggregate_data(data, "day");
     date_formatter = function (date) {
@@ -1292,7 +1290,7 @@ function populate_messages_read_over_time(raw_data: unknown): void {
     const weekly_traces = make_traces(info.dates, info.values, "bar", date_formatter);
 
     const dates = data.end_times.map((timestamp: number) => new Date(timestamp * 1000));
-    values = {everyone: partial_sums(data.everyone.read), me: partial_sums(data.user.read)};
+    const values = {everyone: partial_sums(data.everyone.read), me: partial_sums(data.user.read)};
     date_formatter = function (date) {
         return format_date(date, true);
     };
@@ -1305,8 +1303,8 @@ function populate_messages_read_over_time(raw_data: unknown): void {
     let clicked_cumulative = false;
 
     function draw_or_update_plot(
-        rangeselector: Partial<Plotly.RangeSelector>,
-        traces: DataByEveryoneMe<Partial<Plotly.PlotData>>,
+        rangeselector: NonNullable<Plotly.LayoutAxis["rangeselector"]>,
+        traces: DataByEveryoneMe<Plotly.BarData | Plotly.ScatterData>,
         last_value_is_partial: boolean,
         initial_draw: boolean,
     ): void {

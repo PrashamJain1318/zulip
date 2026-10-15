@@ -1,10 +1,7 @@
-import base64
 import logging
 import re
 from typing import Any
 
-import orjson
-from altcha import verify_solution
 from django import forms
 from django.conf import settings
 from django.contrib.auth import authenticate, password_validation
@@ -12,10 +9,7 @@ from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm, Set
 from django.contrib.auth.tokens import PasswordResetTokenGenerator, default_token_generator
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
-from django.forms.renderers import BaseRenderer
 from django.http import HttpRequest
-from django.utils.html import format_html
-from django.utils.safestring import SafeString
 from django.utils.translation import gettext as _
 from django.utils.translation import gettext_lazy
 from markupsafe import Markup
@@ -25,6 +19,7 @@ from typing_extensions import override
 
 from zerver.actions.user_settings import do_change_password, do_change_user_setting
 from zerver.actions.users import do_send_password_reset_email
+from zerver.lib.captcha import CaptchaFormMixin
 from zerver.lib.email_validation import (
     email_allowed_for_realm,
     email_reserved_for_system_bots_error,
@@ -33,7 +28,12 @@ from zerver.lib.email_validation import (
 from zerver.lib.exceptions import JsonableError, RateLimitedError
 from zerver.lib.i18n import get_language_list
 from zerver.lib.name_restrictions import is_reserved_subdomain
-from zerver.lib.rate_limiter import RateLimitedObject, rate_limit_request_by_ip, should_rate_limit
+from zerver.lib.rate_limiter import (
+    RateLimitedObject,
+    rate_limit_request_by_ip,
+    readable_expiry_string_for_plaintext,
+    should_rate_limit,
+)
 from zerver.lib.subdomains import get_subdomain, is_root_domain_available
 from zerver.lib.users import check_full_name
 from zerver.models import PreregistrationRealm, Realm, UserProfile
@@ -226,9 +226,8 @@ class RegistrationForm(HowFoundZulipFormMixin, RealmDetailsForm):
         return password
 
 
-class DemoRegistrationForm(HowFoundZulipFormMixin, forms.Form):
+class DemoRegistrationForm(CaptchaFormMixin, HowFoundZulipFormMixin, forms.Form):
     terms = forms.BooleanField(required=False)
-    realm_name = forms.CharField(max_length=Realm.MAX_REALM_NAME_LENGTH)
     realm_type = forms.TypedChoiceField(
         coerce=int, choices=[(t["id"], t["name"]) for t in Realm.ORG_TYPES.values()]
     )
@@ -267,6 +266,7 @@ class HomepageForm(forms.Form):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.realm = kwargs.pop("realm", None)
         self.from_multiuse_invite = kwargs.pop("from_multiuse_invite", False)
+        self.has_pending_invitation = kwargs.pop("has_pending_invitation", False)
         self.require_password_backend = kwargs.pop("require_password_backend", False)
         self.invited_as = kwargs.pop("invited_as", None)
         super().__init__(*args, **kwargs)
@@ -288,7 +288,7 @@ class HomepageForm(forms.Form):
             )
 
         if not from_multiuse_invite:
-            if realm.invite_required:
+            if realm.invite_required and not self.has_pending_invitation:
                 raise ValidationError(
                     _(
                         "Please request an invite for {email} from the organization administrator."
@@ -339,7 +339,7 @@ class ImportRealmOwnerSelectionForm(forms.Form):
     user_id = forms.IntegerField(required=False)
 
 
-class RealmCreationForm(RealmDetailsForm):
+class RealmCreationForm(CaptchaFormMixin, RealmDetailsForm):
     # This form determines whether users can create a new realm.
     email = forms.EmailField(
         validators=[email_not_system_bot, email_is_not_disposable], max_length=EMAIL_MAX_LENGTH
@@ -356,115 +356,6 @@ class RealmCreationForm(RealmDetailsForm):
     def clean_import_from(self) -> str:
         # Convert "" to "none".
         return self.cleaned_data["import_from"] or "none"
-
-
-class AltchaWidget(forms.TextInput):
-    @override
-    def render(
-        self,
-        name: str,
-        value: Any,
-        attrs: dict[str, Any] | None = None,
-        renderer: BaseRenderer | None = None,
-    ) -> SafeString:
-        return format_html(
-            (
-                "<altcha-widget"
-                '  name="captcha"'
-                '  challengeurl="/json/antispam_challenge"'
-                "  hidelogo"
-                "  hidefooter"
-                "  refetchonexpire"
-                '  style="{}"'
-                '  strings="{}"'
-                ">"
-            ),
-            "--altcha-max-width: 300px;",
-            orjson.dumps(
-                {
-                    "verified": _("Verified that you're a human user!"),
-                    "verifying": _("Verifying that you're not a bot…"),
-                }
-            ).decode(),
-        )
-
-
-def validate_captcha_payload(request: HttpRequest, captcha_payload: str) -> None:
-    if not settings.USING_CAPTCHA or not settings.ALTCHA_HMAC_KEY:  # nocoverage
-        raise forms.ValidationError(_("Challenges are not enabled."))
-
-    try:
-        ok, err = verify_solution(captcha_payload, settings.ALTCHA_HMAC_KEY, check_expires=True)
-        if not ok:
-            logging.warning("Invalid altcha solution: %s", err)
-            raise forms.ValidationError(_("Validation failed, please try again."))
-    except forms.ValidationError:
-        raise
-    except Exception as e:
-        logging.exception(e)
-        raise forms.ValidationError(_("Validation failed, please try again."))
-
-    captcha_data = orjson.loads(base64.b64decode(captcha_payload))
-    challenge = captcha_data["challenge"]
-    session_challenges = [e[0] for e in request.session.get("altcha_challenges", [])]
-    if challenge not in session_challenges:
-        logging.warning("Expired or replayed altcha solution")
-        raise forms.ValidationError(_("Validation failed, please try again."))
-
-    # Remove the successful solve from the session, to prevent replay
-    request.session["altcha_challenges"] = [
-        e for e in request.session.get("altcha_challenges", []) if e[0] != challenge
-    ]
-
-
-class CaptchaRealmCreationForm(RealmCreationForm):
-    captcha = forms.CharField(required=True, widget=AltchaWidget)
-
-    def __init__(
-        self,
-        *,
-        request: HttpRequest,
-        data: dict[str, Any] | None = None,
-        initial: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(data=data, initial=initial)
-        self.request = request
-
-    @override
-    def clean(self) -> None:
-        super().clean()
-        if not self.data.get("captcha"):
-            self.add_error("captcha", _("Validation failed, please try again."))
-
-    def clean_captcha(self) -> str:
-        payload = self.data.get("captcha", "")
-        validate_captcha_payload(self.request, payload)
-        return payload
-
-
-class CaptchaDemoRegistrationForm(DemoRegistrationForm):
-    captcha = forms.CharField(required=True, widget=AltchaWidget)
-
-    def __init__(
-        self,
-        *,
-        request: HttpRequest,
-        data: dict[str, Any] | None = None,
-        initial: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(data=data, initial=initial)
-        self.request = request
-
-    @override
-    def clean(self) -> None:
-        super().clean()
-        if not self.data.get("captcha"):
-            self.add_error("captcha", _("Validation failed, please try again."))
-
-    def clean_captcha(self) -> str:
-        payload = self.data.get("captcha", "")
-        validate_captcha_payload(self.request, payload)
-        return payload
 
 
 class LoggingSetPasswordForm(SetPasswordForm[UserProfile]):
@@ -627,12 +518,13 @@ class OurAuthenticationForm(AuthenticationForm):
             except RateLimitedError as e:
                 assert e.secs_to_freedom is not None
                 secs_to_freedom = int(e.secs_to_freedom)
+                retry_after_string = readable_expiry_string_for_plaintext(secs_to_freedom)
                 error_message = _(
                     "You're making too many attempts to sign in."
-                    " Try again in {seconds} seconds or contact your organization administrator"
+                    " Try again in {retry_after_string} or contact your organization administrator"
                     " for help."
                 )
-                raise ValidationError(error_message.format(seconds=secs_to_freedom))
+                raise ValidationError(error_message.format(retry_after_string=retry_after_string))
 
             if return_data.get("inactive_realm"):
                 raise AssertionError("Programming error: inactive realm in authentication form")

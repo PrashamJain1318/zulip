@@ -1,5 +1,5 @@
 import copy
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from email.headerregistry import Address
 from typing import Any, TypedDict
@@ -30,7 +30,7 @@ class RawReactionRow(TypedDict):
 def sew_messages_and_reactions(
     messages: list[dict[str, Any]], reactions: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Given a iterable of messages and reactions stitch reactions
+    """Given an iterable of messages and reactions stitch reactions
     into messages.
     """
     # Add all messages with empty reaction item
@@ -91,13 +91,10 @@ def update_message_cache(
 
 def save_message_rendered_content(message: Message, content: str) -> str:
     rendering_result = render_message_markdown(message, content, realm=message.get_realm())
-    rendered_content = None
-    if rendering_result is not None:
-        rendered_content = rendering_result.rendered_content
-    message.rendered_content = rendered_content
+    message.rendered_content = rendering_result.rendered_content
     message.rendered_content_version = markdown_version
     message.save_rendered_content()
-    return rendered_content
+    return rendering_result.rendered_content
 
 
 class ReactionDict:
@@ -134,7 +131,12 @@ class MessageDict:
     """
 
     @staticmethod
-    def wide_dict(message: Message, realm_id: int | None = None) -> dict[str, Any]:
+    def wide_dict(
+        message: Message,
+        realm_id: int | None = None,
+        *,
+        dm_involved_user_ids: set[int] | None = None,
+    ) -> dict[str, Any]:
         """
         The next two lines get the cacheable field related
         to our message object, with the side effect of
@@ -150,7 +152,10 @@ class MessageDict:
         processor.
         """
         MessageDict.bulk_hydrate_sender_info([obj])
-        MessageDict.bulk_hydrate_recipient_info([obj])
+        MessageDict.bulk_hydrate_recipient_info(
+            [obj],
+            {} if dm_involved_user_ids is None else {obj["recipient_id"]: dm_involved_user_ids},
+        )
 
         return obj
 
@@ -162,7 +167,6 @@ class MessageDict:
         client_gravatar: bool,
         allow_empty_topic_name: bool,
         realm: Realm,
-        user_recipient_id: int | None,
     ) -> None:
         """
         NOTE: This function mutates the objects in
@@ -185,7 +189,6 @@ class MessageDict:
                 skip_copy=True,
                 can_access_sender=can_access_sender,
                 realm_host=realm.host,
-                is_incoming_1_to_1=obj["recipient_id"] == user_recipient_id,
             )
 
     @staticmethod
@@ -199,7 +202,6 @@ class MessageDict:
         skip_copy: bool = False,
         can_access_sender: bool,
         realm_host: str,
-        is_incoming_1_to_1: bool,
     ) -> dict[str, Any]:
         """
         By default, we make a shallow copy of the incoming dict to avoid
@@ -245,13 +247,6 @@ class MessageDict:
         else:
             obj["content_type"] = "text/x-markdown"
 
-        if is_incoming_1_to_1 and "sender_recipient_id" in obj:
-            # For an incoming 1:1 DM, the recipient’s own recipient_id is
-            # useless to the recipient themselves. Substitute the sender’s
-            # recipient_id, so the recipient can use recipient_id as documented
-            # to uniquely represent the set of 2 users in this conversation.
-            obj["recipient_id"] = obj["sender_recipient_id"]
-
         for item in obj.get("edit_history", []):
             if "prev_rendered_content_version" in item:
                 del item["prev_rendered_content_version"]
@@ -263,7 +258,6 @@ class MessageDict:
 
         if not keep_rendered_content:
             del obj["rendered_content"]
-        obj.pop("sender_recipient_id")
         del obj["sender_realm_id"]
         del obj["sender_avatar_source"]
         del obj["sender_delivery_email"]
@@ -439,8 +433,10 @@ class MessageDict:
             edit_history: list[EditHistoryEvent] = orjson.loads(edit_history_json)
             obj["edit_history"] = edit_history
 
-        if Message.need_to_render_content(
-            rendered_content, rendered_content_version, markdown_version
+        if (
+            rendered_content is None
+            or rendered_content_version is None
+            or rendered_content_version < markdown_version
         ):
             # We really shouldn't be rendering objects in this method, but there is
             # a scenario where we upgrade the version of Markdown and fail to run
@@ -454,22 +450,13 @@ class MessageDict:
             # TODO: see #1379 to eliminate Markdown dependencies
             message = Message.objects.select_related("sender").get(id=message_id)
 
-            assert message is not None  # Hint for mypy.
             # It's unfortunate that we need to have side effects on the message
             # in some cases.
             rendered_content = save_message_rendered_content(message, content)
 
-        if rendered_content is not None:
-            obj["rendered_content"] = rendered_content
-        else:
-            obj["rendered_content"] = (
-                "<p>[Zulip note: Sorry, we could not understand the formatting of your message]</p>"
-            )
+        obj["rendered_content"] = rendered_content
 
-        if rendered_content is not None:
-            obj["is_me_message"] = Message.is_status_message(content, rendered_content)
-        else:
-            obj["is_me_message"] = False
+        obj["is_me_message"] = Message.is_status_message(content, rendered_content)
 
         obj["reactions"] = [
             ReactionDict.build_dict_from_raw_db_row(reaction) for reaction in reactions
@@ -489,7 +476,6 @@ class MessageDict:
             "full_name",
             "delivery_email",
             "email",
-            "recipient_id",
             "realm__string_id",
             "avatar_source",
             "avatar_version",
@@ -504,7 +490,6 @@ class MessageDict:
         for obj in objs:
             sender_id = obj["sender_id"]
             user_row = sender_dict[sender_id]
-            obj["sender_recipient_id"] = user_row["recipient_id"]
             obj["sender_full_name"] = user_row["full_name"]
             obj["sender_email"] = user_row["email"]
             obj["sender_delivery_email"] = user_row["delivery_email"]
@@ -532,7 +517,7 @@ class MessageDict:
 
         if recipient_type == Recipient.STREAM:
             display_type = "stream"
-        elif recipient_type in (Recipient.DIRECT_MESSAGE_GROUP, Recipient.PERSONAL):
+        elif recipient_type == Recipient.DIRECT_MESSAGE_GROUP:
             assert not isinstance(display_recipient, str)
             display_type = "private"
             if len(display_recipient) == 1:
@@ -557,7 +542,10 @@ class MessageDict:
             obj["stream_id"] = recipient_type_id
 
     @staticmethod
-    def bulk_hydrate_recipient_info(objs: list[dict[str, Any]]) -> None:
+    def bulk_hydrate_recipient_info(
+        objs: list[dict[str, Any]],
+        recipient_dm_user_ids: Mapping[int, set[int]] = {},
+    ) -> None:
         recipient_tuples = {  # We use set to eliminate duplicate tuples.
             (
                 obj["recipient_id"],
@@ -566,7 +554,7 @@ class MessageDict:
             )
             for obj in objs
         }
-        display_recipients = bulk_fetch_display_recipients(recipient_tuples)
+        display_recipients = bulk_fetch_display_recipients(recipient_tuples, recipient_dm_user_ids)
 
         for obj in objs:
             MessageDict.hydrate_recipient_info(obj, display_recipients[obj["recipient_id"]])

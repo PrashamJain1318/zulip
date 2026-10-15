@@ -35,6 +35,7 @@ from .configured_settings import (
     DEFAULT_RATE_LIMITING_RULES,
     EMAIL_BACKEND,
     EMAIL_HOST,
+    EMAIL_MAX_CONNECTION_LIFETIME_IN_MINUTES,
     ERROR_REPORTING,
     EXTERNAL_HOST,
     EXTERNAL_HOST_WITHOUT_PORT,
@@ -70,6 +71,7 @@ from .configured_settings import (
     USING_CAPTCHA,
     USING_PGROONGA,
     ZULIP_ADMINISTRATOR,
+    ZULIP_SERVICE_ADVERTISE_REALMS,
     ZULIP_SERVICE_PUSH_NOTIFICATIONS,
     ZULIP_SERVICE_SECURITY_ALERTS,
     ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS,
@@ -101,12 +103,13 @@ ZULIP_ORG_KEY = get_secret("zulip_org_key")
 ZULIP_ORG_ID = get_secret("zulip_org_id")
 
 raw_keys: str | None = get_secret("push_registration_encryption_keys")
-PUSH_REGISTRATION_ENCRYPTION_KEYS: dict[str, str] | None = None
+PUSH_REGISTRATION_ENCRYPTION_KEYS: dict[str, str] = {}
 if raw_keys is not None:
     PUSH_REGISTRATION_ENCRYPTION_KEYS = json.loads(raw_keys)
 
 
 service_name_to_required_upload_level = {
+    "advertise_realms": AnalyticsDataUploadLevel.BASIC,
     "security_alerts": AnalyticsDataUploadLevel.BASIC,
     "mobile_push": AnalyticsDataUploadLevel.BILLING,
     "submit_usage_statistics": AnalyticsDataUploadLevel.ALL,
@@ -134,6 +137,8 @@ if ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS:
     services_append("submit_usage_statistics")
 if ZULIP_SERVICE_SECURITY_ALERTS:
     services_append("security_alerts")
+if ZULIP_SERVICE_ADVERTISE_REALMS:
+    services_append("advertise_realms")
 
 if services is None and PUSH_NOTIFICATION_BOUNCER_URL is not None:
     # ZULIP_SERVICE_* are the new settings that control the services
@@ -155,7 +160,7 @@ if services is None and PUSH_NOTIFICATION_BOUNCER_URL is not None:
         services_append("submit_usage_statistics")
 
 if services is not None and set(services).intersection(
-    {"submit_usage_statistics", "security_alerts", "mobile_push"}
+    {"submit_usage_statistics", "security_alerts", "mobile_push", "advertise_realms"}
 ):
     # None of these make sense enabled without ZULIP_SERVICES_URL.
     assert ZULIP_SERVICES_URL is not None, (
@@ -186,7 +191,7 @@ RUNNING_OPENAPI_CURL_TEST = False
 # This is overridden in test_settings.py for the test suites
 GENERATE_STRIPE_FIXTURES = False
 # This is overridden in test_settings.py for the test suites
-GENERATE_LITELLM_FIXTURES = False
+GENERATE_LLM_FIXTURES = False
 # This is overridden in test_settings.py for the test suites
 BAN_CONSOLE_OUTPUT = False
 # This is overridden in test_settings.py for the test suites
@@ -299,6 +304,9 @@ TORNADO_PROCESSES = len(TORNADO_PORTS)
 RUNNING_INSIDE_TORNADO = (
     len(sys.argv) > 1 and "manage.py" in sys.argv[0] and sys.argv[1] == "runtornado"
 )
+
+if RUNNING_INSIDE_TORNADO:
+    ROOT_URLCONF = "zproject.tornado_urls"
 
 SILENCED_SYSTEM_CHECKS = [
     # auth.W004 checks that the UserProfile field named by USERNAME_FIELD has
@@ -442,13 +450,6 @@ CACHES: dict[str, dict[str, object]] = {
 # Merge any local overrides with the default rules.
 RATE_LIMITING_RULES = {**DEFAULT_RATE_LIMITING_RULES, **RATE_LIMITING_RULES}
 
-# List of domains that, when applied to a request in a Tornado process,
-# will be handled with the separate in-memory rate limiting backend for Tornado,
-# which has its own buckets separate from the default backend.
-# In principle, it should be impossible to make requests to tornado that fall into
-# other domains, but we use this list as an extra precaution.
-RATE_LIMITING_DOMAINS_FOR_TORNADO = ["api_by_user", "api_by_ip"]
-
 # These ratelimits are also documented publicly at
 # https://zulip.readthedocs.io/en/latest/production/email-gateway.html
 RATE_LIMITING_MIRROR_REALM_RULES = [
@@ -467,7 +468,7 @@ else:
     TOR_EXIT_NODE_FILE_PATH = "/var/lib/zulip/tor-exit-nodes.json"
 
 if USING_CAPTCHA:
-    ALTCHA_HMAC_KEY = get_secret("altcha_hmac")
+    ALTCHA_HMAC_KEY = get_secret("altcha_hmac", "")
 else:
     ALTCHA_HMAC_KEY = ""
 
@@ -531,6 +532,12 @@ if LOCAL_UPLOADS_DIR is None and S3_REGION is None:
 DROPBOX_APP_KEY = get_secret("dropbox_app_key")
 
 BIG_BLUE_BUTTON_SECRET = get_secret("big_blue_button_secret")
+
+CONSTRUCTOR_GROUPS_ACCESS_KEY = get_secret("constructor_groups_access_key")
+CONSTRUCTOR_GROUPS_SECRET_KEY = get_secret("constructor_groups_secret_key")
+
+NEXTCLOUD_TALK_USERNAME = get_secret("nextcloud_talk_username")
+NEXTCLOUD_TALK_PASSWORD = get_secret("nextcloud_talk_password")
 
 # These are the bots that Zulip sends automated messages as.
 INTERNAL_BOTS = [
@@ -630,6 +637,13 @@ LOCALE_PATHS = (os.path.join(DEPLOY_ROOT, "locale"),)
 
 # We want all temporary uploaded files to be stored on disk.
 FILE_UPLOAD_MAX_MEMORY_SIZE = 0
+
+# Django's default handlers, with the temporary file handler replaced by our
+# subclass that does not crash on a filename with a very long extension.
+FILE_UPLOAD_HANDLERS = [
+    "django.core.files.uploadhandler.MemoryFileUploadHandler",
+    "zerver.upload_handler.ZulipTemporaryFileUploadHandler",
+]
 
 if DEVELOPMENT or "ZULIP_COLLECTING_STATIC" in os.environ:
     STATICFILES_DIRS = [os.path.join(DEPLOY_ROOT, "static")]
@@ -1169,6 +1183,7 @@ SOCIAL_AUTH_GOOGLE_SECRET = get_secret("social_auth_google_secret")
 GOOGLE_OAUTH2_CLIENT_SECRET = get_secret("google_oauth2_client_secret")
 SOCIAL_AUTH_GOOGLE_KEY = SOCIAL_AUTH_GOOGLE_KEY or GOOGLE_OAUTH2_CLIENT_ID
 SOCIAL_AUTH_GOOGLE_SECRET = SOCIAL_AUTH_GOOGLE_SECRET or GOOGLE_OAUTH2_CLIENT_SECRET
+SOCIAL_AUTH_DISCORD_SECRET = get_secret("social_auth_discord_secret")
 
 if PRODUCTION:
     SOCIAL_AUTH_SAML_SP_PUBLIC_CERT = get_from_file_if_exists("/etc/zulip/saml/zulip-cert.crt")
@@ -1233,8 +1248,11 @@ elif not EMAIL_HOST:
     WARN_NO_EMAIL = True
     EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
 else:
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-
+    # Route '0' to Django's default, everything else to custom class
+    if EMAIL_MAX_CONNECTION_LIFETIME_IN_MINUTES == 0:
+        EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    else:
+        EMAIL_BACKEND = "zproject.email_backends.PersistentSMTPEmailBackend"
 EMAIL_TIMEOUT = 15
 
 if DEVELOPMENT:
@@ -1268,6 +1286,17 @@ MOBILE_NOTIFICATIONS_SHARDS = int(
     get_config("application_server", "mobile_notification_shards", "1")
 )
 USER_ACTIVITY_SHARDS = int(get_config("application_server", "user_activity_shards", "1"))
+
+# Process soft reactivations in their own queue and worker process instead of
+# sharing deferred_work. This lives here, not in default_settings, because it
+# can only be configured via zulip.conf: enabling it requires a puppet apply
+# to actually run the dedicated worker, so a settings.py override would be
+# ineffective. Off by default so small servers don't pay for an extra worker
+# process; large servers can enable it so reactivations aren't delayed behind
+# long deferred_work jobs such as realm exports.
+DEDICATED_SOFT_REACTIVATION_QUEUE = get_config(
+    "application_server", "dedicated_soft_reactivation_queue", False
+)
 
 TWO_FACTOR_PATCH_ADMIN = False
 

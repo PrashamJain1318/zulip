@@ -3,12 +3,15 @@ import hmac
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import requests
 from django.http import HttpRequest, QueryDict
 from django.http.response import HttpResponse
 from django.test import override_settings
 from django.utils.encoding import force_bytes
 from typing_extensions import override
 
+from version import ZULIP_VERSION
+from zerver.actions.custom_profile_fields import try_add_realm_custom_profile_field
 from zerver.actions.streams import do_rename_stream
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import InvalidJSONError, JsonableError
@@ -23,10 +26,12 @@ from zerver.lib.webhooks.common import (
     call_fixture_to_headers,
     check_send_webhook_message,
     get_event_header,
+    get_service_api_data,
+    guess_zulip_user_from_external_account,
     standardize_headers,
     validate_webhook_signature,
 )
-from zerver.models import Client, Message, UserProfile
+from zerver.models import Client, CustomProfileField, Message, UserProfile
 from zerver.models.realms import get_realm
 from zerver.models.users import get_user
 
@@ -200,6 +205,81 @@ class WebhooksCommonTestCase(ZulipTestCase):
         self.assertEqual(msg.topic_name(), "Test topic")
 
 
+class TestGuessZulipUserFromExternalAccount(ZulipTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.realm = get_realm("zulip")
+        self.hamlet = self.example_user("hamlet")
+        self.othello = self.example_user("othello")
+        self.github_name = "GitHub username"
+
+    def get_github_field(self) -> CustomProfileField:
+        return CustomProfileField.objects.get(
+            realm=self.realm,
+            name=self.github_name,
+        )
+
+    def set_user_external_account(
+        self, user: UserProfile, field: CustomProfileField, value: str
+    ) -> None:
+        self.set_user_custom_profile_data(user, [{"id": field.id, "value": value}])
+
+    def test_single_exact_match(self) -> None:
+        github_field = self.get_github_field()
+        self.set_user_external_account(self.hamlet, github_field, "octocat")
+
+        result = guess_zulip_user_from_external_account(
+            self.realm, "octocat", self.github_name, external_username_case_insensitive=True
+        )
+        self.assertEqual(result, self.hamlet)
+
+        # Test case-sensitive account names
+        result = guess_zulip_user_from_external_account(
+            self.realm, "ocTOcat", self.github_name, external_username_case_insensitive=False
+        )
+        self.assertIsNone(result)
+
+        # Test multiple matching field values found
+        self.set_user_external_account(self.othello, github_field, "octocat")
+
+        result = guess_zulip_user_from_external_account(
+            self.realm, "octocat", self.github_name, external_username_case_insensitive=True
+        )
+        self.assertIsNone(result)
+
+    def test_no_matches_found(self) -> None:
+        # Test no matching field
+        result = guess_zulip_user_from_external_account(
+            self.realm, "someuser", "gitlab", external_username_case_insensitive=True
+        )
+        self.assertIsNone(result)
+
+        # test no matching field value
+        result = guess_zulip_user_from_external_account(
+            self.realm, "nonexistentuser", self.github_name, external_username_case_insensitive=True
+        )
+        self.assertIsNone(result)
+
+    def test_matches_from_custom_external_account_field(self) -> None:
+        external_account_field_name = "Otherhub username"
+        external_account_field = try_add_realm_custom_profile_field(
+            self.realm,
+            external_account_field_name,
+            CustomProfileField.EXTERNAL_ACCOUNT,
+            field_data={"subtype": "custom", "url_pattern": "https://other.com/%(username)s"},
+        )
+        self.set_user_external_account(self.hamlet, external_account_field, "octocat")
+
+        result = guess_zulip_user_from_external_account(
+            self.realm,
+            "octocat",
+            external_account_field_name,
+            external_username_case_insensitive=True,
+        )
+        self.assertEqual(result, self.hamlet)
+
+
 class WebhookURLConfigurationTestCase(WebhookTestCase):
     WEBHOOK_DIR_NAME = "helloworld"
 
@@ -274,3 +354,103 @@ class MissingEventHeaderTestCase(WebhookTestCase):
     @override
     def get_body(self, fixture_name: str) -> str:
         return self.webhook_fixture_data("groove", fixture_name, file_type="json")
+
+
+class TestGetServiceApiData(ZulipTestCase):
+    @override
+    def setUp(self) -> None:
+        self.url = "https://api.example.com/users/123"
+        self.integration_name = "TestIntegration"
+        self.params = {"id": "123"}
+        self.headers = {"Authorization": "Bearer token"}
+
+        self.mock_response = MagicMock()
+        self.mock_response.status_code = 200
+        self.mock_response.json.return_value = {"name": "Test User"}
+
+    @patch("zerver.lib.webhooks.common.OutgoingSession")
+    def test_get_service_api_data_success(self, mock_session_class: MagicMock) -> None:
+        mock_session_instance = mock_session_class.return_value
+        mock_session_instance.request.return_value = self.mock_response
+
+        test_cases = [
+            {
+                "method": "get",
+                "expected_method": "GET",
+                "json": None,
+                "params": self.params,
+            },
+            {
+                "method": "POST",
+                "expected_method": "POST",
+                "json": self.params,
+                "params": None,
+            },
+        ]
+
+        for case in test_cases:
+            with self.subTest(method=case["method"]):
+                mock_session_class.reset_mock()
+                mock_session_instance.request.reset_mock()
+
+                with self.assertNoLogs("zerver.lib.webhooks.common", level="WARNING"):
+                    result = get_service_api_data(
+                        self.url,
+                        integration_name=self.integration_name,
+                        headers=self.headers,
+                        params=self.params,
+                        method=str(case["method"]),
+                        timeout=10.0,
+                    )
+
+                mock_session_class.assert_called_once_with(
+                    role="webhook_fetch",
+                    headers={
+                        "User-Agent": f"ZulipWebhookFetch/{ZULIP_VERSION}",
+                        **self.headers,
+                    },
+                    timeout=10.0,
+                    max_retries=3,
+                )
+
+                mock_session_instance.request.assert_called_once_with(
+                    method=case["expected_method"],
+                    url=self.url,
+                    json=case["json"],
+                    params=case["params"],
+                )
+                self.assertEqual(result.json(), {"name": "Test User"})
+
+    @patch("zerver.lib.webhooks.common.OutgoingSession.request")
+    def test_get_service_api_data_http_error(self, mock_request: MagicMock) -> None:
+        mock_request.return_value.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+
+        with (
+            self.assertLogs("zerver.lib.webhooks.common", level="WARNING") as cm,
+            self.assertRaises(requests.HTTPError),
+        ):
+            get_service_api_data(self.url, integration_name=self.integration_name)
+
+        self.assertEqual(
+            cm.output[0],
+            "WARNING:zerver.lib.webhooks.common:Failed to fetch data from "
+            "https://api.example.com/users/123 for "
+            "TestIntegration integration: 404 Not Found",
+        )
+
+    @patch("zerver.lib.webhooks.common.OutgoingSession.request")
+    def test_get_service_api_data_request_exception(self, mock_request: MagicMock) -> None:
+        mock_request.side_effect = requests.ConnectionError("Connection failed")
+
+        with (
+            self.assertLogs("zerver.lib.webhooks.common", level="WARNING") as cm,
+            self.assertRaises(requests.ConnectionError),
+        ):
+            get_service_api_data(self.url, integration_name=self.integration_name)
+
+        self.assertEqual(
+            cm.output[0],
+            "WARNING:zerver.lib.webhooks.common:Failed to fetch data from "
+            "https://api.example.com/users/123 for "
+            "TestIntegration integration: Connection failed",
+        )

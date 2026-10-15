@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 
 import render_change_user_group_info_modal from "../templates/user_group_settings/change_user_group_info_modal.hbs";
@@ -12,12 +12,15 @@ import * as loading from "./loading.ts";
 import * as settings_components from "./settings_components.ts";
 import * as settings_data from "./settings_data.ts";
 import {realm} from "./state_data.ts";
+import * as stream_pill from "./stream_pill.ts";
 import type {GroupSettingPillContainer} from "./typeahead_helper.ts";
 import * as ui_report from "./ui_report.ts";
+import {place_caret_at_end} from "./ui_util.ts";
 import * as user_group_components from "./user_group_components.ts";
 import * as user_group_create_members from "./user_group_create_members.ts";
 import * as user_group_create_members_data from "./user_group_create_members_data.ts";
 import * as user_groups from "./user_groups.ts";
+import {the} from "./util.ts";
 
 let created_group_name: string | undefined;
 
@@ -51,6 +54,13 @@ class UserGroupMembershipError {
     report_no_members_to_user_group(): void {
         $("#user_group_membership_error").text(
             $t({defaultMessage: "You cannot create a user group with no members or subgroups."}),
+        );
+        $("#user_group_membership_error").show();
+    }
+
+    report_subscriber_fetch_failed(failed_stream_id: number): void {
+        $("#user_group_membership_error").text(
+            stream_pill.get_subscriber_fetch_failure_message(failed_stream_id),
         );
         $("#user_group_membership_error").show();
     }
@@ -180,11 +190,28 @@ function clear_error_display(): void {
     user_group_membership_error.clear_errors();
 }
 
+function set_create_form_disabled(disabled: boolean): void {
+    $(
+        "#user-group-creation .finalize_create_user_group, #user-group-creation #user_group_go_to_configure_settings",
+    ).prop("disabled", disabled);
+    // Pills added or removed after the members are read would show
+    // in the preview but not end up in the group.
+    const $add_members_container = $("#people_to_add_in_group .add_members_container");
+    $add_members_container.toggleClass("add_members_disabled", disabled);
+    $add_members_container.find(".input").prop("contenteditable", !disabled);
+}
+
 export function show_new_user_group_modal(): void {
     $("#user-group-creation").removeClass("hide");
     $(".right .settings").hide();
 
     user_group_create_members.build_widgets();
+
+    // A previous create click may have left these buttons disabled,
+    // either because the group was created or because the form was
+    // closed while waiting for member data. The sticky footer is not
+    // re-rendered when the form reopens, so reset the buttons here.
+    set_create_form_disabled(false);
 
     clear_error_display();
 }
@@ -202,6 +229,7 @@ function create_user_group(): void {
             $t_html({defaultMessage: "The group description cannot contain newline characters."}),
             $(".user_group_create_info"),
         );
+        set_create_form_disabled(false);
         return;
     }
     const user_ids = user_group_create_members.get_principals();
@@ -234,6 +262,9 @@ function create_user_group(): void {
             $("#create_user_group_description").val("");
             user_group_create_members.clear_member_list();
             loading.destroy_indicator($("#user_group_creating_indicator"));
+            // The form is cleared, so this cannot create the group twice.
+            // Needed in case the event that closes the form never arrives.
+            set_create_form_disabled(false);
             // TODO: The rest of the work should be done via the create event we will get for user group.
         },
         error(xhr) {
@@ -244,6 +275,7 @@ function create_user_group(): void {
             );
             reset_name();
             loading.destroy_indicator($("#user_group_creating_indicator"));
+            set_create_form_disabled(false);
         },
     });
 }
@@ -268,13 +300,6 @@ export function set_up_handlers(): void {
             return;
         }
 
-        const principals = user_group_create_members_data.get_principals();
-        const subgroups = user_group_create_members_data.get_subgroups();
-        if (principals.length === 0 && subgroups.length === 0) {
-            user_group_membership_error.report_no_members_to_user_group();
-            return;
-        }
-
         assert(user_group_create_members.pill_widget !== undefined);
         assert(user_group_create_members.pill_widget !== null);
         if (user_group_create_members.pill_widget.is_pending()) {
@@ -287,7 +312,40 @@ export function set_up_handlers(): void {
             return;
         }
 
-        create_user_group();
+        void (async () => {
+            // Disable the create button until the group is created, so
+            // that clicking it again (or pressing Enter) while we wait
+            // for subscriber data or for the server cannot create the
+            // group twice, the back button so that the settings we
+            // validated cannot be changed underneath us, and the pill
+            // input so that the preview matches what is created. They
+            // are re-enabled if creating fails, or when the form is
+            // reopened.
+            set_create_form_disabled(true);
+            const result = await user_group_create_members.add_members_from_pills();
+            // The creation form was closed while we were fetching
+            // subscriber data, so don't create the group. Leave the
+            // buttons alone, since a newly opened form may have
+            // disabled them for its own fetch.
+            if (result.status === "form_closed") {
+                return;
+            }
+            if (result.status === "failed") {
+                set_create_form_disabled(false);
+                user_group_membership_error.report_subscriber_fetch_failed(result.failed_stream_id);
+                return;
+            }
+
+            const principals = user_group_create_members_data.get_principals();
+            const subgroups = user_group_create_members_data.get_subgroups();
+            if (principals.length === 0 && subgroups.length === 0) {
+                set_create_form_disabled(false);
+                user_group_membership_error.report_no_members_to_user_group();
+                return;
+            }
+
+            create_user_group();
+        })();
     });
 
     $container.on("input", "#create_user_group_name", () => {
@@ -331,11 +389,11 @@ export function set_up_handlers(): void {
         };
         const change_user_group_info_modal = render_change_user_group_info_modal(template_data);
         dialog_widget.launch({
-            html_heading: $t_html(
+            modal_title_html: $t_html(
                 {defaultMessage: "Rename {group_name} (<i>deactivated</i>)"},
                 {group_name: user_groups.get_display_group_name(group.name)},
             ),
-            html_body: change_user_group_info_modal,
+            modal_content_html: change_user_group_info_modal,
             id: "change_group_info_modal",
             loading_spinner: true,
             on_click: save_group_info,
@@ -343,6 +401,9 @@ export function set_up_handlers(): void {
                 $("#change_group_info_modal .dialog_submit_button")
                     .addClass("save-button")
                     .attr("data-group-id", group_id);
+            },
+            on_shown() {
+                place_caret_at_end(the($("#change_user_group_name")));
             },
             update_submit_disabled_state_on_change: true,
         });

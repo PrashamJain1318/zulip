@@ -13,8 +13,9 @@ from django.utils.timezone import now as timezone_now
 
 from corporate.models.customers import Customer
 from corporate.models.plans import CustomerPlan
+from zerver.actions.realm_settings import do_set_realm_property
 from zerver.context_processors import get_apps_page_url
-from zerver.lib.integrations import BOT_INTEGRATIONS, CATEGORIES, INTEGRATIONS, META_CATEGORY
+from zerver.lib.integrations import BOT_INTEGRATIONS, CATEGORIES, INTEGRATIONS
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import HostRequestMock
 from zerver.lib.url_redirects import INTEGRATION_CATEGORY_SLUGS
@@ -312,7 +313,7 @@ class DocPageTest(ZulipTestCase):
         self._test("/history/", ["Zulip released as open source!"])
         # Test the i18n version of one of these pages.
         self._test("/en/history/", ["Zulip released as open source!"])
-        self._test("/values/", ["designed our company"])
+        self._test("/values/", ["Zulip project values"])
         self._test("/hello/", ["remote and flexible work"])
         self._test("/communities/", ["Open communities directory"])
         self._test("/development-community/", ["Zulip development community"])
@@ -322,7 +323,9 @@ class DocPageTest(ZulipTestCase):
         self._test("/zulip-cloud/", ["Zulip Cloud"])
         self._test("/security/", ["TLS encryption"])
         self._test("/use-cases/", ["Use cases and customer stories"])
+        self._test("/case-studies/", ["Case studies"])
         self._test("/why-zulip/", ["Why Zulip?"])
+        self._test("/choosing-a-team-chat-app/", ["3 team chat apps to consider"])
         # /for/... pages
         self._test("/for/open-source/", ["for open source projects"])
         self._test("/for/events/", ["for conferences and events"])
@@ -360,14 +363,12 @@ class DocPageTest(ZulipTestCase):
         realm.want_advertise_in_communities_directory = True
         realm.save()
 
-        realm.description = ""
-        realm.save()
+        do_set_realm_property(realm, "description", "", acting_user=None)
         result = self.client_get("/communities/")
         # Not shown because the realm has default description set.
         self.assert_not_in_success_response(["Zulip Dev"], result)
 
-        realm.description = "Some description"
-        realm.save()
+        do_set_realm_property(realm, "description", "Some description", acting_user=None)
         self._test("/communities/", ["Open communities directory", "Zulip Dev", "Some description"])
 
         # No org with research type so research category not displayed.
@@ -388,6 +389,17 @@ class DocPageTest(ZulipTestCase):
         self.assert_not_in_success_response(
             ["Zulip Dev", "Some description", 'data-category="research"'], result
         )
+
+        # Reset
+        realm.demo_organization_scheduled_deletion_date = None
+        realm.save(update_fields=["demo_organization_scheduled_deletion_date"])
+        self._test("/communities/", ["Open communities directory", "Zulip Dev", "Some description"])
+
+        # Deactivated organizations are not shown.
+        realm.deactivated = True
+        realm.save(update_fields=["deactivated"])
+        result = self.client_get("/communities/")
+        self.assert_not_in_success_response(["Zulip Dev"], result)
 
     def test_integration_doc_endpoints(self) -> None:
         images_in_docs = set()
@@ -446,7 +458,7 @@ class DocPageTest(ZulipTestCase):
         result = self._test(
             "/integrations/asana?category=project-management",
             expected_strings=[
-                '<a href="/integrations/category/project-management" id="integration-list-link" class="no-underline">'
+                '<a href="/integrations/category/project-management" id="integration-list-link"'
             ],
         )
 
@@ -454,9 +466,7 @@ class DocPageTest(ZulipTestCase):
             "/integrations/asana?category=nonexistent_category",
         )
         self.assert_not_in_success_response(
-            [
-                '<a href="/integrations/category/project-management" id="integration-list-link" class="no-underline">'
-            ],
+            ['<a href="/integrations/category/project-management" id="integration-list-link"'],
             response,
         )
 
@@ -465,9 +475,7 @@ class DocPageTest(ZulipTestCase):
             "/integrations/asana?category=communication",
         )
         self.assert_not_in_success_response(
-            [
-                '<a href="/integrations/category/project-management" id="integration-list-link" class="no-underline">'
-            ],
+            ['<a href="/integrations/category/project-management" id="integration-list-link"'],
             response,
         )
 
@@ -503,7 +511,18 @@ class DocPageTest(ZulipTestCase):
         # for the PythonAPIIntegrations, so we cannot avoid going out of sync
         # when adding/deleting screenshots.
         # Use this set to temporarily add exclusions to this test.
-        exception_images: set[str] = {"git/001.png"}
+        exception_images: set[str] = {
+            # Images used in docs of disabled integrations
+            "logos/intercom.svg",
+            "intercom/001.png",
+            "logos/hubot.png",
+            "hubot/001.png",
+            # Images newly added to python-zulip-api docs
+            "github_detail/001.png",
+            "matrix/001.png",
+            "matrix/002.png",
+            "xkcd/001.png",
+        }
         images_in_dir.update(exception_images)
         images_in_docs.update(exception_images)
 
@@ -536,12 +555,8 @@ class DocPageTest(ZulipTestCase):
         # Test category pages
         for category in CATEGORIES:
             url = f"/integrations/category/{category}"
-            if category in META_CATEGORY:
-                title = f"<title>{CATEGORIES[category]} | Zulip integrations</title>"
-                og_title = f'<meta property="og:title" content="{CATEGORIES[category]} | Zulip integrations" />'
-            else:
-                title = f"<title>{CATEGORIES[category]} tools | Zulip integrations</title>"
-                og_title = f'<meta property="og:title" content="{CATEGORIES[category]} tools | Zulip integrations" />'
+            title = f"<title>{CATEGORIES[category]} | Zulip integrations</title>"
+            og_title = f'<meta property="og:title" content="{CATEGORIES[category]} | Zulip integrations" />'
             self._test(url, [title, og_title, og_description, get_canonical_url(url)])
 
         # Test integrations index page
@@ -602,7 +617,6 @@ class CustomShorthandLinksTest(ZulipTestCase):
 class IntegrationTest(ZulipTestCase):
     def test_check_if_every_integration_has_logo_that_exists(self) -> None:
         for integration in INTEGRATIONS.values():
-            assert integration.logo_url is not None
             path = urlsplit(integration.logo_url).path
             self.assertTrue(os.path.isfile(settings.DEPLOY_ROOT + path), integration.name)
 

@@ -13,7 +13,8 @@ from django.template import loader
 from django.template.response import TemplateResponse
 from django.views.generic import TemplateView
 from lxml import html
-from lxml.etree import Element, SubElement, XPath, _Element
+from lxml.etree import XPath, _Element
+from lxml.html import builder as e
 from markupsafe import Markup
 from typing_extensions import override
 
@@ -23,7 +24,6 @@ from zerver.lib.html_to_text import get_content_description
 from zerver.lib.integrations import (
     CATEGORIES,
     INTEGRATIONS,
-    META_CATEGORY,
     HubotIntegration,
     IncomingWebhookIntegration,
     Integration,
@@ -283,12 +283,12 @@ class MarkdownDirectoryView(ApiURLView):
             sidebar_html = ""
         tree = html.fragment_fromstring(sidebar_html, create_parent=True)
         if not context.get("page_is_policy_center", False):
-            home_h1 = Element("h1")
-            home_link = SubElement(home_h1, "a")
-            home_link.attrib["class"] = "no-underline"
-            home_link.attrib["href"] = context["doc_root"]
-            home_link.text = context["doc_root_title"] + " home"
-            tree.insert(0, home_h1)
+            home_link = e.A(
+                {"class": "no-underline", "href": context["doc_root"]},
+                context["doc_root_title"] + " home",
+            )
+            home_h2 = e.H2(home_link)
+            tree.insert(0, home_h2)
         url = context["doc_root"] + article
         # Remove ID attributes from sidebar headings so they don't conflict with index page headings
         headings = sidebar_headings(tree)
@@ -302,7 +302,6 @@ class MarkdownDirectoryView(ApiURLView):
         for a in links:
             assert isinstance(a, _Element)
             old_class = a.attrib.get("class", "")
-            assert isinstance(old_class, str)
             a.attrib["class"] = old_class + " highlighted"
         context["sidebar_html"] = Markup().join(
             Markup(html.tostring(child, encoding="unicode")) for child in tree
@@ -347,10 +346,7 @@ def add_integrations_open_graph_context(context: dict[str, Any], request: HttpRe
 
     elif path_name in CATEGORIES:
         category = CATEGORIES[path_name]
-        if path_name in META_CATEGORY:
-            context["PAGE_TITLE"] = f"{category} | Zulip integrations"
-        else:
-            context["PAGE_TITLE"] = f"{category} tools | Zulip integrations"
+        context["PAGE_TITLE"] = f"{category} | Zulip integrations"
         context["PAGE_DESCRIPTION"] = description
 
     elif path_name == "integrations":
@@ -426,9 +422,9 @@ def add_catalog_integrations_context(request: HttpRequest, category_slug: str) -
 
 
 def get_categories_for_integration(integration: Integration) -> list[tuple[str, str]]:
-    display_to_slug = {str(display): slug for slug, display in CATEGORIES.items()}
+    display_to_slug = {display: slug for slug, display in CATEGORIES.items()}
     result = []
-    for display_name in integration.get_translated_categories():
+    for display_name in integration.categories:
         slug = display_to_slug.get(display_name)
         assert slug is not None
         result.append((slug, display_name))

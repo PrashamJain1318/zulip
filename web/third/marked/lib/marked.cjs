@@ -611,19 +611,20 @@ InlineLexer.output = function(src, links, options) {
  */
 
 InlineLexer.prototype.inlineReplacement = function(regex, src, replace_func) {
-  var cap, out = "";
-  regex.lastIndex = 0;
-  if (cap = regex.exec(src)) {
+  var out = "";
+  var matcher = regex.matcher(src);
+  if (matcher.find()) {
     // Split before-match into its own segment and handle it separately
-    var match_idx = regex.lastIndex;
-    var before = src.substring(0, match_idx - cap[0].length);
+    var match_start = matcher.start(0);
+    var match_end = matcher.end(0);
+    var before = src.substring(0, match_start);
     before = this.output(before);
     out += before;
 
     // Consume all of the matched text
-    src = src.substring(match_idx);
+    src = src.substring(match_end);
 
-    out += replace_func(regex, cap.slice(1), cap[0]);
+    out += replace_func(regex, matcher);
   }
 
   return [src, out];
@@ -649,14 +650,17 @@ InlineLexer.prototype.output = function(src) {
 
     const regexes = this.options.get_linkifier_regexes ? this.options.get_linkifier_regexes() : [];
     regexes.forEach(function (regex) {
-      var ret = self.inlineReplacement(regex, src, function(regex, groups, match) {
+      var ret = self.inlineReplacement(regex, src, function(regex, matcher) {
         // Insert the created URL
-        href = self.linkifier(regex, groups, match);
+        href = self.linkifier(regex, matcher);
         if (href !== undefined) {
           href = escape(href);
-          return self.renderer.link(href, href, match);
+          var leading = matcher.group(1);
+          var link_text = matcher.group(2);
+          var trailing = matcher.group(matcher.groupCount());
+          return leading + self.renderer.link(href, href, link_text) + trailing;
         } else {
-          return match;
+          return matcher.group(0);
         }
       });
 
@@ -714,6 +718,7 @@ InlineLexer.prototype.output = function(src) {
 
     // link
     if (cap = this.rules.link.exec(src)) {
+      cap = this.reparseLinkHref(src, cap);
       src = src.substring(cap[0].length);
       this.inLink = true;
       out += this.outputLink(cap, {
@@ -863,6 +868,68 @@ InlineLexer.prototype.output = function(src) {
  * Compile Link
  */
 
+// An optional quoted title, then the ")" that closes the link:
+//   )            or            "some title")
+var linkEnding = /^(?:\s+(['"])([\s\S]*?)\1)?\s*\)/;
+
+// The link regex stops the href at the first ")". That is wrong when
+// the URL itself contains parentheses, like http://a/b(c)d: the href
+// is cut at "c" and "d)" is left over as text.
+//
+// `cap` is the regex's match:
+//   cap[0]  the text the regex matched, from "[" to ")"
+//   cap[1]  the link text
+//   cap[2]  the href
+//   cap[3]  the title, or undefined
+// This returns an array with the same four entries. cap[0] now ends
+// at the ")" that really closes the link, and cap[2] holds the full
+// href. cap[1] is copied over unchanged. If the link doesn't look the
+// way we expect, `cap` is returned as is.
+//
+// This follows the server's markdown implementation. An href wrapped
+// in <> runs up to the ">". Otherwise, a quoted string followed by
+// ")" is the title and the href runs up to it; the title may itself
+// contain parentheses. With no title, the href runs up to the ")"
+// that balances the link's "(", even across spaces.
+InlineLexer.prototype.reparseLinkHref = function(src, cap) {
+  // Start just after "[text](", or "![text](" for images.
+  var index = (cap[0].charAt(0) === '!' ? 2 : 1) + cap[1].length + 2;
+  // Skip any whitespace before the href.
+  index += /^\s*/.exec(src.substring(index))[0].length;
+  var rest = src.substring(index);
+  var end, ending;
+  if (rest.charAt(0) === '<') {
+    var close = rest.indexOf('>');
+    if (close === -1) {
+      return cap;
+    }
+    ending = linkEnding.exec(rest.substring(close + 1));
+    if (!ending) {
+      return cap;
+    }
+    index += close + 1 + ending[0].length;
+    return [src.substring(0, index), cap[1], rest.substring(1, close), ending[2]];
+  }
+  // Find the ")" that has no matching "(" before it.
+  var unmatched = findClosingBracket(rest, '()');
+  // A quote after whitespace starts the title, as long as it comes
+  // before that ")". Parentheses inside the title don't count.
+  var quote = /\s['"]/.exec(rest);
+  if (quote && (unmatched === -1 || quote.index < unmatched)) {
+    ending = linkEnding.exec(rest.substring(quote.index));
+    if (ending) {
+      end = quote.index;
+      index += quote.index + ending[0].length;
+      return [src.substring(0, index), cap[1], rest.substring(0, end).replace(/\s+$/, ''), ending[2]];
+    }
+  }
+  if (unmatched === -1) {
+    return cap;
+  }
+  index += unmatched + 1;
+  return [src.substring(0, index), cap[1], rest.substring(0, unmatched).replace(/\s+$/, ''), undefined];
+};
+
 InlineLexer.prototype.outputLink = function(cap, link) {
   var href = escape(link.href)
     , title = link.title ? escape(link.title) : null;
@@ -898,11 +965,11 @@ InlineLexer.prototype.timestamp = function (time) {
   return this.options.timestampHandler(time);
 };
 
-InlineLexer.prototype.linkifier = function (linkifier, matches, orig) {
+InlineLexer.prototype.linkifier = function (linkifier, matcher) {
   if (typeof this.options.linkifierHandler !== 'function')
     return;
 
-  return this.options.linkifierHandler(linkifier, matches);
+  return this.options.linkifierHandler(linkifier, matcher);
 };
 
 InlineLexer.prototype.usermention = function (username, orig, silent) {
@@ -1381,6 +1448,27 @@ function unescape(html) {
     }
     return unescapeReplacements[n] || '';
   });
+}
+
+// Adapted from marked v0.6.2 (https://github.com/markedjs/marked/pull/1476).
+// Unlike upstream, backslash-escaped brackets are not skipped, to
+// match the server's markdown implementation.
+function findClosingBracket(str, b) {
+  if (str.indexOf(b[1]) === -1) {
+    return -1;
+  }
+  var level = 0;
+  for (var i = 0; i < str.length; i++) {
+    if (str[i] === b[0]) {
+      level++;
+    } else if (str[i] === b[1]) {
+      level--;
+      if (level < 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
 }
 
 function replace(regex, opt) {

@@ -1,36 +1,29 @@
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
 
-from django.conf import settings
 from django.db import transaction
 from django.db.models import F
 from django.utils.timezone import now as timezone_now
 from django.utils.translation import gettext as _
 
 from analytics.lib.counts import COUNT_STATS, do_increment_logging_stat
+from zerver.lib.event_types import (
+    BaseEvent,
+    UpdateMessageFlagsAddEvent,
+    UpdateMessageFlagsRemoveEvent,
+)
 from zerver.lib.exceptions import JsonableError
 from zerver.lib.message import (
     bulk_access_messages,
     format_unread_message_details,
     get_raw_unread_data,
 )
-from zerver.lib.queue import queue_event_on_commit
+from zerver.lib.queue import mobile_notifications_queue_name, queue_event_on_commit
 from zerver.lib.stream_subscription import get_subscribed_stream_recipient_ids_for_user
 from zerver.lib.topic import filter_by_topic_name_via_message
 from zerver.lib.user_message import DEFAULT_HISTORICAL_FLAGS, create_historical_user_messages
-from zerver.models import Message, PushDevice, PushDeviceToken, Recipient, UserMessage, UserProfile
+from zerver.models import Device, Message, PushDeviceToken, Recipient, UserMessage, UserProfile
 from zerver.tornado.django_api import send_event_on_commit, send_event_rollback_unsafe
-
-
-@dataclass
-class ReadMessagesEvent:
-    messages: list[int]
-    all: bool
-    type: str = field(default="update_message_flags", init=False)
-    op: str = field(default="add", init=False)
-    operation: str = field(default="add", init=False)
-    flag: str = field(default="read", init=False)
 
 
 def do_mark_all_as_read(user_profile: UserProfile, *, timeout: float | None = None) -> int | None:
@@ -90,11 +83,11 @@ def do_mark_all_as_read(user_profile: UserProfile, *, timeout: float | None = No
             if updated_count < batch_size:
                 break
 
-    event = asdict(
-        ReadMessagesEvent(
-            messages=[],  # we don't send messages, since the client reloads anyway
-            all=True,
-        )
+    event = UpdateMessageFlagsAddEvent(
+        flag="read",
+        # Empty list because the client reloads anyway.
+        messages=[],
+        all=True,
     )
     send_event_rollback_unsafe(user_profile.realm, event, [user_profile.id])
 
@@ -131,12 +124,7 @@ def do_mark_stream_messages_as_read(
         flags=F("flags").bitor(UserMessage.flags.read),
     )
 
-    event = asdict(
-        ReadMessagesEvent(
-            messages=message_ids,
-            all=False,
-        )
-    )
+    event = UpdateMessageFlagsAddEvent(flag="read", messages=message_ids, all=False)
     event_time = timezone_now()
 
     send_event_on_commit(user_profile.realm, event, [user_profile.id])
@@ -162,7 +150,13 @@ def do_mark_muted_user_messages_as_read(
 ) -> int:
     query = (
         UserMessage.select_for_update_query()
-        .filter(user_profile=user_profile, message__sender=muted_user)
+        .filter(
+            user_profile=user_profile,
+            message__sender=muted_user,
+            # Filtering by message.realm_id is redundant, but required to use index:
+            # zerver_message_realm_sender_recipient
+            message__realm_id=user_profile.realm_id,
+        )
         .extra(where=[UserMessage.where_unread()])  # noqa: S610
     )
     message_ids = list(query.values_list("message_id", flat=True))
@@ -174,12 +168,7 @@ def do_mark_muted_user_messages_as_read(
         flags=F("flags").bitor(UserMessage.flags.read),
     )
 
-    event = asdict(
-        ReadMessagesEvent(
-            messages=message_ids,
-            all=False,
-        )
-    )
+    event = UpdateMessageFlagsAddEvent(flag="read", messages=message_ids, all=False)
     event_time = timezone_now()
 
     send_event_on_commit(user_profile.realm, event, [user_profile.id])
@@ -268,9 +257,9 @@ def do_clear_mobile_push_notifications_for_ids(
         PushDeviceToken.objects.filter(user_id__in=clear_notifications_user_ids)
         .values_list("user_id", flat=True)
         .union(
-            # Uses index "zerver_pushdevice_user_bouncer_device_id_idx".
-            PushDevice.objects.filter(
-                user_id__in=clear_notifications_user_ids, bouncer_device_id__isnull=False
+            # Uses index "zerver_device_user_push_token_id_idx".
+            Device.objects.filter(
+                user_id__in=clear_notifications_user_ids, push_token_id__isnull=False
             ).values_list("user_id", flat=True)
         )
     )
@@ -302,11 +291,7 @@ def do_clear_mobile_push_notifications_for_ids(
             "user_profile_id": user_profile_id,
             "message_ids": event_message_ids,
         }
-        if settings.MOBILE_NOTIFICATIONS_SHARDS > 1:  # nocoverage
-            shard_id = user_profile_id % settings.MOBILE_NOTIFICATIONS_SHARDS + 1
-            queue_event_on_commit(f"missedmessage_mobile_notifications_shard{shard_id}", notice)
-        else:
-            queue_event_on_commit("missedmessage_mobile_notifications", notice)
+        queue_event_on_commit(mobile_notifications_queue_name(user_profile_id), notice)
 
 
 def do_update_message_flags(
@@ -421,24 +406,23 @@ def do_update_message_flags(
         else:
             to_update.update(flags=F("flags").bitand(~flagattr))
 
-        event = {
-            "type": "update_message_flags",
-            "op": operation,
-            "operation": operation,
-            "flag": flag,
-            "messages": messages,
-            "all": False,
-        }
-
-        if flag == "read" and not is_adding:
+        event: BaseEvent
+        if is_adding:
+            event = UpdateMessageFlagsAddEvent(flag=flag, messages=messages, all=False)
+        elif flag == "read":
             # When removing the read flag (i.e. marking messages as
             # unread), extend the event with an additional object with
             # details on the messages required to update the client's
             # `unread_msgs` data structure.
             raw_unread_data = get_raw_unread_data(user_profile, messages)
-            event["message_details"] = format_unread_message_details(
-                user_profile.id, raw_unread_data
+            event = UpdateMessageFlagsRemoveEvent(
+                flag=flag,
+                messages=messages,
+                all=False,
+                message_details=format_unread_message_details(user_profile.id, raw_unread_data),
             )
+        else:
+            event = UpdateMessageFlagsRemoveEvent(flag=flag, messages=messages, all=False)
 
         send_event_on_commit(user_profile.realm, event, [user_profile.id])
 

@@ -1,9 +1,7 @@
 import time
 from collections import defaultdict
-from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
-import orjson
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.db import transaction
@@ -112,7 +110,7 @@ from zerver.lib.user_groups import (
 from zerver.lib.user_topics import get_users_with_user_topic_visibility_policy
 from zerver.lib.users import access_bot_by_id, bulk_access_users_by_email, bulk_access_users_by_id
 from zerver.lib.utils import assert_is_not_none
-from zerver.models import ChannelFolder, Stream, UserMessage, UserProfile, UserTopic
+from zerver.models import ChannelFolder, Stream, UserGroup, UserMessage, UserProfile, UserTopic
 from zerver.models.groups import SystemGroups
 from zerver.models.streams import StreamTopicsPolicyEnum
 from zerver.models.users import get_system_bot
@@ -128,7 +126,7 @@ def bulk_principals_to_user_profiles(
     # principals are user emails.
     if isinstance(principals[0], str):
         return bulk_access_users_by_email(
-            principals,  # type: ignore[arg-type] # principals guaranteed to be list[str] only.
+            principals,
             acting_user=acting_user,
             allow_deactivated=False,
             allow_bots=True,
@@ -138,7 +136,7 @@ def bulk_principals_to_user_profiles(
     # principals are user ids.
     else:
         return bulk_access_users_by_id(
-            principals,  # type: ignore[arg-type] # principals guaranteed to be list[int] only.
+            principals,
             acting_user=acting_user,
             allow_deactivated=False,
             allow_bots=True,
@@ -302,6 +300,7 @@ def update_stream_backend(
     can_resolve_topics_group: Json[GroupSettingChangeRequest] | None = None,
     can_send_message_group: Json[GroupSettingChangeRequest] | None = None,
     can_subscribe_group: Json[GroupSettingChangeRequest] | None = None,
+    default_push_notifications: Json[bool] | None = None,
     description: ChannelDescription = None,
     folder_id: Json[int | None] | MissingType = Missing,
     history_public_to_subscribers: Json[bool] | None = None,
@@ -440,8 +439,15 @@ def update_stream_backend(
             stream, user_profile, new_message_retention_days_value
         )
 
+    if default_push_notifications is not None:
+        if not user_profile.is_realm_admin:
+            raise JsonableError(_("Insufficient permission"))
+        do_set_stream_property(
+            stream, "default_push_notifications", default_push_notifications, user_profile
+        )
+
     if is_archived is not None and not is_archived:
-        do_unarchive_stream(stream, stream.name, acting_user=None)
+        do_unarchive_stream(stream, stream.name, acting_user=user_profile)
 
     if (
         can_delete_any_message_group is not None or can_delete_own_message_group is not None
@@ -560,49 +566,8 @@ class AddSubscriptionData(BaseModel):
     @model_validator(mode="after")
     def validate_terms(self) -> "AddSubscriptionData":
         if self.color is not None:
-            self.color = check_color("add.color", self.color)
+            self.color = check_color("color", self.color)
         return self
-
-
-@typed_endpoint
-def update_subscriptions_backend(
-    request: HttpRequest,
-    user_profile: UserProfile,
-    *,
-    add: Json[list[AddSubscriptionData]] | None = None,
-    delete: Json[list[str]] | None = None,
-) -> HttpResponse:
-    if delete is None:
-        delete = []
-    if add is None:
-        add = []
-    if not add and not delete:
-        raise JsonableError(_('Nothing to do. Specify at least one of "add" or "delete".'))
-
-    thunks = [
-        lambda: add_subscriptions_backend(request, user_profile, streams_raw=add),
-        lambda: remove_subscriptions_backend(request, user_profile, streams_raw=delete),
-    ]
-    data = compose_views(thunks)
-
-    return json_success(request, data)
-
-
-def compose_views(thunks: list[Callable[[], HttpResponse]]) -> dict[str, Any]:
-    """
-    This takes a series of thunks and calls them in sequence, and it
-    smushes all the json results into a single response when
-    everything goes right.  (This helps clients avoid extra latency
-    hops.)  It rolls back the transaction when things go wrong in any
-    one of the composed methods.
-    """
-
-    json_dict: dict[str, Any] = {}
-    with transaction.atomic(savepoint=False):
-        for thunk in thunks:
-            response = thunk()
-            json_dict.update(orjson.loads(response.content))
-    return json_dict
 
 
 @typed_endpoint
@@ -691,6 +656,7 @@ def create_channel(
     can_resolve_topics_group: Json[int | UserGroupMembersData] | None = None,
     can_send_message_group: Json[int | UserGroupMembersData] | None = None,
     can_subscribe_group: Json[int | UserGroupMembersData] | None = None,
+    default_push_notifications: Json[bool] = False,
     description: ChannelDescription = None,
     folder_id: Json[int] | None = None,
     history_public_to_subscribers: Json[bool] | None = None,
@@ -744,6 +710,9 @@ def create_channel(
         )
     )
 
+    if default_push_notifications and not user_profile.is_realm_admin:
+        raise JsonableError(_("Insufficient permission"))
+
     group_settings_map = stream_group_settings_map[name]
     new_channel, created = create_stream_if_needed(
         realm,
@@ -753,10 +722,14 @@ def create_channel(
         history_public_to_subscribers=history_public_to_subscribers,
         is_web_public=is_web_public,
         message_retention_days=parsed_message_retention_days,
+        default_push_notifications=default_push_notifications,
         anonymous_group_membership=anonymous_group_membership,
         acting_user=user_profile,
         can_add_subscribers_group=group_settings_map["can_add_subscribers_group"],
         can_administer_channel_group=group_settings_map["can_administer_channel_group"],
+        can_create_topic_group=group_settings_map["can_create_topic_group"],
+        can_delete_any_message_group=group_settings_map["can_delete_any_message_group"],
+        can_delete_own_message_group=group_settings_map["can_delete_own_message_group"],
         can_move_messages_out_of_channel_group=group_settings_map[
             "can_move_messages_out_of_channel_group"
         ],
@@ -770,6 +743,16 @@ def create_channel(
         folder=folder,
         topics_policy=topics_policy_value,
     )
+
+    if not created:
+        # The anonymous groups created above can be deleted since
+        # they are not being used.
+        unused_group_ids = [
+            setting_value.id
+            for setting_value in group_settings_map.values()
+            if setting_value.id in anonymous_group_membership
+        ]
+        UserGroup.objects.filter(id__in=unused_group_ids).delete()
 
     if is_default_stream:
         do_add_default_stream(new_channel)
@@ -824,6 +807,7 @@ def add_subscriptions_backend(
     can_resolve_topics_group: Json[int | UserGroupMembersData] | None = None,
     can_send_message_group: Json[int | UserGroupMembersData] | None = None,
     can_subscribe_group: Json[int | UserGroupMembersData] | None = None,
+    default_push_notifications: Json[bool] = False,
     folder_id: Json[int] | None = None,
     history_public_to_subscribers: Json[bool] | None = None,
     invite_only: Json[bool] = False,
@@ -848,6 +832,9 @@ def add_subscriptions_backend(
     if folder_id is not None:
         folder = get_channel_folder_by_id(folder_id, realm)
 
+    if default_push_notifications and not user_profile.is_realm_admin:
+        raise JsonableError(_("Insufficient permission"))
+
     for stream_obj in streams_raw:
         # 'color' field is optional
         # check for its presence in the streams_raw first
@@ -870,6 +857,7 @@ def add_subscriptions_backend(
         if validated_topics_policy is not None:
             stream_dict_copy["topics_policy"] = validated_topics_policy.value
         stream_dict_copy["folder"] = folder
+        stream_dict_copy["default_push_notifications"] = default_push_notifications
 
         stream_dicts.append(stream_dict_copy)
 
@@ -1124,6 +1112,7 @@ def get_subscribers_backend(
     (stream, _sub) = access_stream_by_id(
         user_profile,
         stream_id,
+        require_active_channel=False,
         require_content_access=False,
     )
     subscribers = get_subscriber_ids(stream, user_profile)
@@ -1171,7 +1160,9 @@ def get_stream_backend(
     *,
     stream_id: PathOnly[int],
 ) -> HttpResponse:
-    (stream, _sub) = access_stream_by_id(user_profile, stream_id, require_content_access=False)
+    (stream, _sub) = access_stream_by_id(
+        user_profile, stream_id, require_active_channel=False, require_content_access=False
+    )
 
     recent_traffic = get_streams_traffic(user_profile.realm, {stream.id})
     anonymous_group_membership = get_anonymous_group_membership_dict_for_streams([stream])
@@ -1196,7 +1187,6 @@ def get_topics_backend(
         is_web_public_query = False
         assert isinstance(maybe_user_profile, UserProfile)
         user_profile = maybe_user_profile
-        assert user_profile is not None
 
     if is_web_public_query:
         realm = get_valid_realm_from_request(request)
@@ -1210,7 +1200,7 @@ def get_topics_backend(
     else:
         assert user_profile is not None
 
-        (stream, _sub) = access_stream_by_id(user_profile, stream_id)
+        (stream, _sub) = access_stream_by_id(user_profile, stream_id, require_active_channel=False)
 
         assert stream.recipient_id is not None
         result = get_topic_history_for_stream(
@@ -1254,7 +1244,9 @@ def delete_in_topic(
             return json_success(request, data={"complete": False})
         with transaction.atomic(durable=True):
             messages_to_delete = messages.order_by("-id")[0:batch_size].select_for_update(
-                of=("self",)
+                # We're deleting, so a FOR UPDATE lock is needed.
+                no_key=False,
+                of=("self",),
             )
             if not messages_to_delete:
                 break
@@ -1280,8 +1272,9 @@ def delete_in_topic(
         )
         users_with_stale_user_topic_rows = list(
             filter(
-                lambda user_profile: user_profile.id
-                not in user_ids_with_access_to_protected_messages,
+                lambda user_profile: (
+                    user_profile.id not in user_ids_with_access_to_protected_messages
+                ),
                 users_with_stale_user_topic_rows,
             )
         )
@@ -1326,7 +1319,11 @@ class SubscriptionPropertyChangeRequest(BaseModel):
         }
 
         if self.property == "color":
-            self.value = check_color("color", self.value)
+            try:
+                self.value = check_color("color", self.value)
+            except ValueError as e:
+                # Raise JsonableError on validation failure to avoid 500.
+                raise JsonableError(str(e))
         elif self.property in boolean_properties:
             if not isinstance(self.value, bool):
                 raise JsonableError(_("{property} is not a boolean").format(property=self.property))

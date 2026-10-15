@@ -4,14 +4,13 @@ from collections.abc import Callable, Collection, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import timedelta
-from email.headerregistry import Address
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import orjson
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, transaction
-from django.db.models import Exists, F, OuterRef, Q, QuerySet
+from django.db import transaction
+from django.db.models import Exists, F, OuterRef, QuerySet
 from django.utils.html import escape
 from django.utils.timezone import now as timezone_now
 from django.utils.translation import gettext as _
@@ -25,8 +24,13 @@ from zerver.actions.user_topics import (
 )
 from zerver.lib.addressee import Addressee
 from zerver.lib.alert_words import get_alert_word_automaton
-from zerver.lib.cache import cache_with_key, user_profile_delivery_email_cache_key
-from zerver.lib.create_user import create_user
+from zerver.lib.cache import (
+    cache_get,
+    cache_set,
+    latest_preview_draft_cache_key,
+    pending_preview_draft_cache_key,
+    preview_draft_content_hash,
+)
 from zerver.lib.exceptions import (
     DirectMessageInitiationError,
     DirectMessagePermissionError,
@@ -61,7 +65,10 @@ from zerver.lib.notification_data import (
 )
 from zerver.lib.query_helpers import query_for_ids
 from zerver.lib.queue import queue_event_on_commit
-from zerver.lib.recipient_users import recipient_for_user_profiles
+from zerver.lib.recipient_users import (
+    check_sender_can_access_recipients,
+    recipient_for_user_profiles,
+)
 from zerver.lib.stream_subscription import (
     get_subscriptions_for_send_message,
     num_subscribers_for_stream_id,
@@ -75,13 +82,16 @@ from zerver.lib.streams import (
     get_stream_topics_policy,
     notify_stream_is_recently_active_update,
     subscribed_to_stream,
+    user_has_metadata_access,
 )
 from zerver.lib.string_validation import check_stream_name
 from zerver.lib.thumbnail import manifest_and_get_user_upload_previews, rewrite_thumbnailed_images
 from zerver.lib.timestamp import timestamp_to_datetime
 from zerver.lib.topic import get_topic_display_name, participants_for_topic
-from zerver.lib.topic_link_util import get_stream_link_syntax
+from zerver.lib.topic_link_util import get_message_link_label, get_stream_link_syntax
 from zerver.lib.types import UserProfileChangeDict
+from zerver.lib.url_encoding import message_link_url, stream_message_url
+from zerver.lib.url_preview.preview import get_cached_link_embed_data, get_unavailable_preview_urls
 from zerver.lib.url_preview.types import UrlEmbedData
 from zerver.lib.user_groups import (
     UserGroupMembershipDetails,
@@ -92,19 +102,17 @@ from zerver.lib.user_groups import (
 )
 from zerver.lib.user_message import UserMessageLite, bulk_insert_ums
 from zerver.lib.users import (
+    bulk_get_subscribers_of_target_user_subscriptions,
     check_can_access_user,
-    get_inaccessible_user_ids,
-    get_subscribers_of_target_user_subscriptions,
     get_user_ids_who_can_access_user,
-    get_users_involved_in_dms_with_target_users,
     user_access_restricted_in_realm,
 )
 from zerver.lib.validator import check_widget_content
 from zerver.lib.widget import do_widget_post_save_actions
 from zerver.models import (
     Client,
+    Device,
     Message,
-    PushDevice,
     PushDeviceToken,
     Realm,
     Recipient,
@@ -116,53 +124,19 @@ from zerver.models import (
 )
 from zerver.models.clients import get_client
 from zerver.models.groups import SystemGroups, get_realm_system_groups_name_dict
-from zerver.models.recipients import get_direct_message_group_user_ids
+from zerver.models.recipients import (
+    DirectMessageGroup,
+    get_direct_message_group_hash,
+    get_direct_message_group_user_ids,
+)
 from zerver.models.scheduled_jobs import NotificationTriggers
 from zerver.models.streams import (
     StreamTopicsPolicyEnum,
     get_realm_stream,
     get_stream_by_id_in_realm,
 )
-from zerver.models.users import get_system_bot, get_user_by_delivery_email, is_cross_realm_bot_email
+from zerver.models.users import active_guest_user_ids, get_system_bot, is_cross_realm_bot_email
 from zerver.tornado.django_api import send_event_on_commit
-
-
-def compute_irc_user_fullname(email: str) -> str:
-    return Address(addr_spec=email).username + " (IRC)"
-
-
-def compute_jabber_user_fullname(email: str) -> str:
-    return Address(addr_spec=email).username + " (XMPP)"
-
-
-def get_user_profile_delivery_email_cache_key(
-    realm: Realm, email: str, email_to_fullname: Callable[[str], str]
-) -> str:
-    return user_profile_delivery_email_cache_key(email, realm.id)
-
-
-@cache_with_key(
-    get_user_profile_delivery_email_cache_key,
-    timeout=3600 * 24 * 7,
-)
-def create_mirror_user_if_needed(
-    realm: Realm, email: str, email_to_fullname: Callable[[str], str]
-) -> UserProfile:
-    try:
-        return get_user_by_delivery_email(email, realm)
-    except UserProfile.DoesNotExist:
-        try:
-            # Forge a user for this person
-            return create_user(
-                email=email,
-                password=None,
-                realm=realm,
-                full_name=email_to_fullname(email),
-                active=False,
-                is_mirror_dummy=True,
-            )
-        except IntegrityError:
-            return get_user_by_delivery_email(email, realm)
 
 
 def render_incoming_message(
@@ -193,6 +167,75 @@ def render_incoming_message(
     return rendering_result
 
 
+def render_unsaved_message(
+    sender: UserProfile,
+    content: str,
+    *,
+    url_embed_data: dict[str, UrlEmbedData | None] | None = None,
+) -> MessageRenderingResult:
+    message = Message()
+    message.sender = sender
+    message.realm = sender.realm
+    message.content = content
+    return render_message_markdown(
+        message, content, realm=sender.realm, url_embed_data=url_embed_data
+    )
+
+
+# A job still queued after this long is for a preview the user has most
+# likely moved on from.
+URL_EMBED_DATA_JOB_TIMEOUT_SECONDS = 60 * 10
+
+
+def populate_url_embed_data_for_preview(
+    sender: UserProfile,
+    content: str,
+    links_for_preview: set[str],
+) -> dict[str, UrlEmbedData | None]:
+    content_hash = preview_draft_content_hash(content)
+    cache_set(
+        latest_preview_draft_cache_key(sender.id),
+        content_hash,
+        timeout=URL_EMBED_DATA_JOB_TIMEOUT_SECONDS,
+    )
+    if not links_for_preview:
+        return {}
+
+    url_embed_data = get_cached_link_embed_data(links_for_preview)
+    uncached_urls = [url for url in links_for_preview if url not in url_embed_data]
+    unavailable_urls = get_unavailable_preview_urls(uncached_urls)
+    urls_to_fetch = [url for url in uncached_urls if url not in unavailable_urls]
+    pending_cache_key = pending_preview_draft_cache_key(sender.id, content_hash)
+    if urls_to_fetch and cache_get(pending_cache_key) is None:
+        cache_set(pending_cache_key, True, timeout=URL_EMBED_DATA_JOB_TIMEOUT_SECONDS)
+        queue_event_on_commit(
+            "embed_links",
+            {
+                "type": "url_embed_data",
+                "user_id": sender.id,
+                "content": content,
+                # Needed to render the full draft.
+                "cached_urls": list(url_embed_data),
+                "urls": urls_to_fetch,
+            },
+        )
+    return url_embed_data
+
+
+def is_latest_preview_draft(user_profile_id: int, content_hash: str) -> bool:
+    latest_content_hash = cache_get(latest_preview_draft_cache_key(user_profile_id))
+    return latest_content_hash is not None and latest_content_hash[0] == content_hash
+
+
+def do_send_url_embed_data_event(sender: UserProfile, content: str, rendered_content: str) -> None:
+    event = {
+        "type": "url_embed_data",
+        "content": content,
+        "rendered_content": rendered_content,
+    }
+    send_event_on_commit(sender.realm, event, [sender.id])
+
+
 @dataclass
 class RecipientInfoResult:
     active_user_ids: set[int]
@@ -211,7 +254,7 @@ class RecipientInfoResult:
     um_eligible_user_ids: set[int]
     long_term_idle_user_ids: set[int]
     default_bot_user_ids: set[int]
-    service_bot_tuples: list[tuple[int, int]]
+    message_triggered_bot_tuples: list[tuple[int, int]]
     all_bot_user_ids: set[int]
     topic_participant_user_ids: set[int]
     sender_muted_stream: bool | None
@@ -236,6 +279,8 @@ class UserProfileAnnotations(TypedDict):
 @dataclass
 class SentMessageResult:
     message_id: int
+    message_url: str
+    message_link: str
     automatic_new_visibility_policy: int | None = None
 
 
@@ -248,6 +293,7 @@ def get_recipient_info(
     possibly_mentioned_user_ids: AbstractSet[int] = set(),
     possible_topic_wildcard_mention: bool = True,
     possible_stream_wildcard_mention: bool = True,
+    dm_involved_user_ids: set[int] | None = None,
 ) -> RecipientInfoResult:
     stream_push_user_ids: set[int] = set()
     stream_email_user_ids: set[int] = set()
@@ -261,13 +307,7 @@ def get_recipient_info(
     topic_participant_user_ids: set[int] = set()
     sender_muted_stream: bool | None = None
 
-    if recipient.type == Recipient.PERSONAL:
-        # The sender and recipient may be the same id, so
-        # de-duplicate using a set.
-        message_to_user_id_set = {recipient.type_id, sender_id}
-        assert len(message_to_user_id_set) in [1, 2]
-
-    elif recipient.type == Recipient.STREAM:
+    if recipient.type == Recipient.STREAM:
         # Anybody calling us w/r/t a stream message needs to supply
         # stream_topic.  We may eventually want to have different versions
         # of this function for different message types.
@@ -338,7 +378,18 @@ def get_recipient_info(
 
         user_id_to_visibility_policy = stream_topic.user_id_to_visibility_policy_dict()
 
-        def notification_recipients(setting: str) -> set[int]:
+        def notification_recipients(
+            setting: Literal[
+                "email_notifications", "push_notifications", "wildcard_mentions_notify"
+            ],
+            user_setting: Literal[
+                "user_profile_email_notifications",
+                "user_profile_push_notifications",
+                "user_profile_wildcard_mentions_notify",
+            ],
+            *,
+            channel_specific_setting_overrides_mute: bool = False,
+        ) -> set[int]:
             return {
                 row["user_profile_id"]
                 for row in subscription_rows
@@ -348,14 +399,28 @@ def get_recipient_info(
                         row["user_profile_id"], UserTopic.VisibilityPolicy.INHERIT
                     ),
                     row[setting],
-                    row["user_profile_" + setting],
+                    row[user_setting],
+                    channel_specific_setting_overrides_mute,
                 )
             }
 
-        stream_push_user_ids = notification_recipients("push_notifications")
-        stream_email_user_ids = notification_recipients("email_notifications")
+        stream_push_user_ids = notification_recipients(
+            "push_notifications", "user_profile_push_notifications"
+        )
+        stream_email_user_ids = notification_recipients(
+            "email_notifications", "user_profile_email_notifications"
+        )
 
-        def followed_topic_notification_recipients(setting: str) -> set[int]:
+        def followed_topic_notification_recipients(
+            setting: Literal[
+                "email_notifications", "push_notifications", "wildcard_mentions_notify"
+            ],
+            followed_topic_setting: Literal[
+                "followed_topic_email_notifications",
+                "followed_topic_push_notifications",
+                "followed_topic_wildcard_mentions_notify",
+            ],
+        ) -> set[int]:
             return {
                 row["user_profile_id"]
                 for row in subscription_rows
@@ -363,13 +428,15 @@ def get_recipient_info(
                     row["user_profile_id"], UserTopic.VisibilityPolicy.INHERIT
                 )
                 == UserTopic.VisibilityPolicy.FOLLOWED
-                and row["followed_topic_" + setting]
+                and row[followed_topic_setting]
             }
 
         followed_topic_email_user_ids = followed_topic_notification_recipients(
-            "email_notifications"
+            "email_notifications", "followed_topic_email_notifications"
         )
-        followed_topic_push_user_ids = followed_topic_notification_recipients("push_notifications")
+        followed_topic_push_user_ids = followed_topic_notification_recipients(
+            "push_notifications", "followed_topic_push_notifications"
+        )
 
         if possible_stream_wildcard_mention or possible_topic_wildcard_mention:
             # We calculate `wildcard_mentions_notify_user_ids` and `followed_topic_wildcard_mentions_notify_user_ids`
@@ -377,9 +444,15 @@ def get_recipient_info(
             # This is important so as to avoid unnecessarily sending huge user ID lists with
             # thousands of elements to the event queue (which can happen because these settings
             # are `True` by default for new users.)
-            wildcard_mentions_notify_user_ids = notification_recipients("wildcard_mentions_notify")
+            wildcard_mentions_notify_user_ids = notification_recipients(
+                "wildcard_mentions_notify",
+                "user_profile_wildcard_mentions_notify",
+                channel_specific_setting_overrides_mute=True,
+            )
             followed_topic_wildcard_mentions_notify_user_ids = (
-                followed_topic_notification_recipients("wildcard_mentions_notify")
+                followed_topic_notification_recipients(
+                    "wildcard_mentions_notify", "followed_topic_wildcard_mentions_notify"
+                )
             )
 
         if possible_stream_wildcard_mention:
@@ -399,7 +472,15 @@ def get_recipient_info(
             )
 
     elif recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
-        message_to_user_id_set = set(get_direct_message_group_user_ids(recipient))
+        if dm_involved_user_ids is not None:
+            # For production path when sending a direct message
+            # passing through check_message. This avoids an extra db query.
+            message_to_user_id_set = dm_involved_user_ids
+        else:
+            # Other paths like:
+            # Message edit via update_message_content.
+            # Tests that bypass check_message.
+            message_to_user_id_set = set(get_direct_message_group_user_ids(recipient))
 
     else:
         raise ValueError("Bad recipient type")
@@ -427,12 +508,10 @@ def get_recipient_info(
                 "QuerySet[WithAnnotations[UserProfile, UserProfileAnnotations], ActiveUserDict]",
                 UserProfile.objects.filter(is_active=True)
                 .annotate(
-                    # Uses index "zerver_pushdevice_user_bouncer_device_id_idx"
+                    # Uses index "zerver_device_user_push_token_id_idx"
                     # and "zerver_pushdevicetoken_user_id_015e5dc1".
                     has_push_device_registered=Exists(
-                        PushDevice.objects.filter(
-                            user_id=OuterRef("id"), bouncer_device_id__isnull=False
-                        )
+                        Device.objects.filter(user_id=OuterRef("id"), push_token_id__isnull=False)
                     )
                     | Exists(PushDeviceToken.objects.filter(user_id=OuterRef("id")))
                 )
@@ -513,10 +592,10 @@ def get_recipient_info(
         row["id"] for row in rows if row["is_bot"] and row["bot_type"] == UserProfile.DEFAULT_BOT
     }
 
-    service_bot_tuples = [
+    message_triggered_bot_tuples = [
         (row["id"], row["bot_type"])
         for row in rows
-        if row["is_bot"] and row["bot_type"] in UserProfile.SERVICE_BOT_TYPES
+        if row["is_bot"] and row["bot_type"] in UserProfile.MESSAGE_TRIGGERED_BOT_TYPES
     ]
 
     # We also need the user IDs of all bots, to avoid trying to send push/email
@@ -544,7 +623,7 @@ def get_recipient_info(
         um_eligible_user_ids=um_eligible_user_ids,
         long_term_idle_user_ids=long_term_idle_user_ids,
         default_bot_user_ids=default_bot_user_ids,
-        service_bot_tuples=service_bot_tuples,
+        message_triggered_bot_tuples=message_triggered_bot_tuples,
         all_bot_user_ids=all_bot_user_ids,
         topic_participant_user_ids=topic_participant_user_ids,
         sender_muted_stream=sender_muted_stream,
@@ -552,17 +631,17 @@ def get_recipient_info(
     )
 
 
-def get_service_bot_events(
+def get_message_triggered_bot_events(
     sender: UserProfile,
-    service_bot_tuples: list[tuple[int, int]],
+    message_triggered_bot_tuples: list[tuple[int, int]],
     mentioned_user_ids: set[int],
     active_user_ids: set[int],
     recipient_type: int,
 ) -> dict[str, list[dict[str, Any]]]:
     event_dict: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
-    # Avoid infinite loops by preventing messages sent by bots from generating
-    # Service events.
+    # Avoid infinite loops by preventing messages sent by bots from
+    # generating message-triggered bot events.
     if sender.is_bot:
         return event_dict
 
@@ -573,7 +652,7 @@ def get_service_bot_events(
             queue_name = "embedded_bots"
         else:
             logging.error(
-                "Unexpected bot_type for Service bot id=%s: %s",
+                "Unexpected bot_type for message-triggered bot id=%s: %s",
                 user_profile_id,
                 bot_type,
             )
@@ -581,12 +660,12 @@ def get_service_bot_events(
 
         is_stream = recipient_type == Recipient.STREAM
 
-        # Important note: service_bot_tuples may contain service bots
-        # who were not actually mentioned in the message (e.g. if
-        # mention syntax for that bot appeared in a code block).
-        # Thus, it is important to filter any users who aren't part of
-        # either mentioned_user_ids (the actual mentioned users) or
-        # active_user_ids (the actual recipients).
+        # Important note: message_triggered_bot_tuples may contain
+        # message-triggered bots who were not actually mentioned in the
+        # message (e.g. if mention syntax for that bot appeared in a code
+        # block). Thus, it is important to filter any users who aren't
+        # part of either mentioned_user_ids (the actual mentioned users)
+        # or active_user_ids (the actual recipients).
         #
         # So even though this is implied by the logic below, we filter
         # these not-actually-mentioned users here, to help keep this
@@ -610,7 +689,7 @@ def get_service_bot_events(
             }
         )
 
-    for user_profile_id, bot_type in service_bot_tuples:
+    for user_profile_id, bot_type in message_triggered_bot_tuples:
         maybe_add_event(
             user_profile_id=user_profile_id,
             bot_type=bot_type,
@@ -632,6 +711,9 @@ def build_message_send_dict(
     recipients_for_user_creation_events: dict[UserProfile, set[int]] | None = None,
     acting_user: UserProfile | None = None,
     no_previews: bool = False,
+    user_group_membership_details: UserGroupMembershipDetails | None = None,
+    sender_is_subscribed: bool | None = None,
+    dm_involved_user_ids: set[int] | None = None,
 ) -> SendMessageRequest:
     """Returns a dictionary that can be passed into do_send_messages.  In
     production, this is always called by check_message, but some
@@ -665,6 +747,7 @@ def build_message_send_dict(
         possibly_mentioned_user_ids=mention_data.get_user_ids(),
         possible_topic_wildcard_mention=mention_data.message_has_topic_wildcards(),
         possible_stream_wildcard_mention=mention_data.message_has_stream_wildcards(),
+        dm_involved_user_ids=dm_involved_user_ids,
     )
 
     # Render our message_dicts.
@@ -729,9 +812,31 @@ def build_message_send_dict(
     mentioned_bot_user_ids = default_bot_user_ids & mentioned_user_ids
     info.um_eligible_user_ids |= mentioned_bot_user_ids
 
+    # Whether the sender may see the channel's name, so the response URL
+    # references the channel by name rather than just its ID. Reuses the
+    # subscription and group data already loaded to authorize the send, so
+    # it adds no query; unloaded group memberships (e.g. a bot posting via
+    # its owner) are treated as empty, conservatively omitting the name.
+    sender_has_channel_metadata_access = False
+    if stream is not None:
+        if (
+            user_group_membership_details is None
+            or user_group_membership_details.user_recursive_group_ids is None
+        ):
+            user_group_membership_details = UserGroupMembershipDetails(
+                user_recursive_group_ids=set()
+            )
+        sender_has_channel_metadata_access = user_has_metadata_access(
+            message.sender,
+            stream,
+            user_group_membership_details,
+            is_subscribed=sender_is_subscribed is True,
+        )
+
     message_send_dict = SendMessageRequest(
         stream=stream,
         sender_muted_stream=info.sender_muted_stream,
+        sender_has_channel_metadata_access=sender_has_channel_metadata_access,
         local_id=local_id,
         sender_queue_id=sender_queue_id,
         realm=realm,
@@ -751,7 +856,7 @@ def build_message_send_dict(
         um_eligible_user_ids=info.um_eligible_user_ids,
         long_term_idle_user_ids=info.long_term_idle_user_ids,
         default_bot_user_ids=info.default_bot_user_ids,
-        service_bot_tuples=info.service_bot_tuples,
+        message_triggered_bot_tuples=info.message_triggered_bot_tuples,
         all_bot_user_ids=info.all_bot_user_ids,
         push_device_registered_user_ids=info.push_device_registered_user_ids,
         topic_wildcard_mention_user_ids=topic_wildcard_mention_user_ids,
@@ -764,6 +869,7 @@ def build_message_send_dict(
         disable_external_notifications=disable_external_notifications,
         topic_participant_user_ids=topic_participant_user_ids,
         recipients_for_user_creation_events=recipients_for_user_creation_events,
+        dm_involved_user_ids=dm_involved_user_ids,
     )
 
     return message_send_dict
@@ -791,7 +897,7 @@ def create_user_messages(
     base_flags = 0
     if rendering_result.mentions_stream_wildcard:
         base_flags |= UserMessage.flags.stream_wildcard_mentioned
-    if message.recipient.type in [Recipient.DIRECT_MESSAGE_GROUP, Recipient.PERSONAL]:
+    if message.recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
         base_flags |= UserMessage.flags.is_private
 
     # For long_term_idle (aka soft-deactivated) users, we are allowed
@@ -855,7 +961,7 @@ def filter_presence_idle_user_ids(user_ids: set[int]) -> list[int]:
     # Given a set of user IDs (the recipients of a message), accesses
     # the UserPresence table to determine which of these users are
     # currently idle and should potentially get email notifications
-    # (and push notifications with with
+    # (and push notifications with
     # user_profile.enable_online_push_notifications=False).
 
     if not user_ids:
@@ -897,6 +1003,42 @@ def get_active_presence_idle_user_ids(
             user_ids.add(user_notifications_data.user_id)
 
     return filter_presence_idle_user_ids(user_ids)
+
+
+def get_message_url_and_link(
+    send_request: SendMessageRequest, message_dict: dict[str, Any]
+) -> tuple[str, str]:
+    """Compute the (message_url, message_link) pair for the POST /messages
+    response: the bare URL, and Markdown matching the web app's "Copy link
+    to message".
+
+    The channel name is included only when the sender has metadata access
+    to it (see sender_has_channel_metadata_access), so a write-only bot
+    posting to a channel it cannot read does not learn its name. Direct
+    messages and that restricted case have no standard label, so
+    message_link is just the URL.
+    """
+    realm = send_request.realm
+    stream = send_request.stream
+    if stream is None:
+        url = message_link_url(realm, message_dict)
+        return url, url
+
+    if not send_request.sender_has_channel_metadata_access:
+        url = stream_message_url(realm, message_dict, include_channel_name=False)
+        return url, url
+
+    url = stream_message_url(realm, message_dict)
+    # message_link embeds the absolute url so it stays valid when used
+    # outside Zulip, matching message_url and the web app's "Copy link to
+    # message"; we only borrow the "#channel > topic @ 💬" label here.
+    label = get_message_link_label(
+        stream.name,
+        send_request.message.topic_name(),
+        send_request.message.id,
+    )
+    link = f"[{label}]({url})"
+    return url, link
 
 
 @transaction.atomic(savepoint=False)
@@ -957,8 +1099,6 @@ def do_send_messages(
 
     ums: list[UserMessageLite] = []
     for send_request in send_message_requests:
-        # Service bots (outgoing webhook bots and embedded bots) don't store UserMessage rows;
-        # they will be processed later.
         mentioned_user_ids = send_request.rendering_result.mentions_user_ids
 
         # Extend the set with users who have muted the sender.
@@ -985,9 +1125,9 @@ def do_send_messages(
 
         ums.extend(user_messages)
 
-        send_request.service_queue_events = get_service_bot_events(
+        send_request.message_triggered_bot_queue_events = get_message_triggered_bot_events(
             sender=send_request.message.sender,
-            service_bot_tuples=send_request.service_bot_tuples,
+            message_triggered_bot_tuples=send_request.message_triggered_bot_tuples,
             mentioned_user_ids=mentioned_user_ids,
             active_user_ids=send_request.active_user_ids,
             recipient_type=send_request.message.recipient.type,
@@ -1003,7 +1143,7 @@ def do_send_messages(
     # * Sender automatically follows or unmutes the topic depending on 'automatically_follow_topics_policy'
     #   and 'automatically_unmute_topics_in_muted_streams_policy' user settings.
     # * Notifying clients via send_event_on_commit
-    # * Triggering outgoing webhooks via the service event queue.
+    # * Triggering outgoing webhooks via the message-triggered bot event queue.
     # * Updating the `first_message_id` field for streams without any message history.
     # * Implementing the Welcome Bot reply hack
     # * Adding links to the embed_links queue for open graph processing.
@@ -1013,8 +1153,6 @@ def do_send_messages(
             if send_request.stream is None:
                 stream_id = send_request.message.recipient.type_id
                 send_request.stream = Stream.objects.get(id=stream_id)
-            # assert needed because stubs for django are missing
-            assert send_request.stream is not None
             realm_id = send_request.stream.realm_id
             sender = send_request.message.sender
 
@@ -1094,7 +1232,15 @@ def do_send_messages(
 
         # Deliver events to the real-time push system, as well as
         # enqueuing any additional processing triggered by the message.
-        wide_message_dict = MessageDict.wide_dict(send_request.message, realm_id)
+        wide_message_dict = MessageDict.wide_dict(
+            send_request.message,
+            realm_id,
+            dm_involved_user_ids=send_request.dm_involved_user_ids,
+        )
+
+        send_request.message_url, send_request.message_link = get_message_url_and_link(
+            send_request, wide_message_dict
+        )
 
         user_flags = user_message_flags.get(send_request.message.id, {})
 
@@ -1228,8 +1374,16 @@ def do_send_messages(
             if send_request.stream.is_public():
                 event["realm_id"] = send_request.stream.realm_id
                 event["stream_name"] = send_request.stream.name
+                # Tornado uses these to exclude guest users' clients
+                # registered for all public channels from receiving the
+                # events for unsubscribed non web-public channel
+                # messages, since guests can only access such channels
+                # when subscribed.
+                event["realm_guest_user_ids"] = active_guest_user_ids(send_request.stream.realm_id)
             if send_request.stream.invite_only:
                 event["invite_only"] = True
+            if send_request.stream.is_web_public:
+                event["is_web_public"] = True
             if send_request.stream.first_message_id is None:
                 send_request.stream.first_message_id = send_request.message.id
                 stream_update_fields.append("first_message_id")
@@ -1290,8 +1444,8 @@ def do_send_messages(
 
                 send_welcome_bot_response(send_request)
 
-        assert send_request.service_queue_events is not None
-        for queue_name, events in send_request.service_queue_events.items():
+        assert send_request.message_triggered_bot_queue_events is not None
+        for queue_name, events in send_request.message_triggered_bot_queue_events.items():
             for event in events:
                 queue_event_on_commit(
                     queue_name,
@@ -1302,13 +1456,18 @@ def do_send_messages(
                     },
                 )
 
-    sent_message_results = [
-        SentMessageResult(
-            message_id=send_request.message.id,
-            automatic_new_visibility_policy=send_request.automatic_new_visibility_policy,
+    sent_message_results = []
+    for send_request in send_message_requests:
+        assert send_request.message_url is not None
+        assert send_request.message_link is not None
+        sent_message_results.append(
+            SentMessageResult(
+                message_id=send_request.message.id,
+                message_url=send_request.message_url,
+                message_link=send_request.message_link,
+                automatic_new_visibility_policy=send_request.automatic_new_visibility_policy,
+            )
         )
-        for send_request in send_message_requests
-    ]
     return sent_message_results
 
 
@@ -1522,7 +1681,7 @@ def send_pm_if_empty_stream(
     """If a bot sends a message to a stream that doesn't exist or has no
     subscribers, sends a notification to the bot owner (if not a
     cross-realm bot) so that the owner can correct the issue."""
-    if not sender.is_bot or sender.bot_owner is None:
+    if not sender.is_bot:
         return
 
     if sender.bot_owner is not None:
@@ -1635,37 +1794,13 @@ def check_can_send_direct_message(
     # on the Huddle object whether the conversation already exists, likely in the
     # form of a `first_message_id` field, and be able to save doing this check in the
     # common case that this is not the first message in a conversation.
-    if recipient.type == Recipient.PERSONAL:
-        recipient_user_profile = recipient_users[0]
-        previous_messages_exist = (
-            Message.objects.filter(
-                realm=realm,
-                recipient__type=Recipient.PERSONAL,
-            )
-            .filter(
-                Q(sender=sender, recipient=recipient)
-                | Q(sender=recipient_user_profile, recipient_id=sender.recipient_id)
-            )
-            .exists()
-        )
-    else:
-        assert recipient.type == Recipient.DIRECT_MESSAGE_GROUP
-        previous_messages_exist = Message.objects.filter(
-            realm=realm,
-            recipient=recipient,
-        ).exists()
+    assert recipient.type == Recipient.DIRECT_MESSAGE_GROUP
+    previous_messages_exist = Message.objects.filter(
+        realm=realm,
+        recipient=recipient,
+    ).exists()
     if not previous_messages_exist:
         raise DirectMessageInitiationError
-
-
-def check_sender_can_access_recipients(
-    realm: Realm, sender: UserProfile, user_profiles: Sequence[UserProfile]
-) -> None:
-    recipient_user_ids = [user.id for user in user_profiles]
-    inaccessible_recipients = get_inaccessible_user_ids(recipient_user_ids, sender)
-
-    if inaccessible_recipients:
-        raise JsonableError(_("You do not have permission to access some of the recipients."))
 
 
 def get_recipients_for_user_creation_events(
@@ -1673,14 +1808,14 @@ def get_recipients_for_user_creation_events(
 ) -> dict[UserProfile, set[int]]:
     """
     This function returns a dictionary with data about which users would
-    receive stream creation events due to gaining access to a user.
+    receive user creation events due to gaining access to a user.
     The key of the dictionary is a user object and the value is a set of
     user_ids that would gain access to that user.
     """
     recipients_for_user_creation_events: dict[UserProfile, set[int]] = defaultdict(set)
 
-    # If none of the users in the direct message conversation are
-    # guests, then there is no possible can_access_all_users_group
+    # If none of the direct message recipients are guests,
+    # then there is no possible can_access_all_users_group
     # policy that would mean sending this message changes any user's
     # user access to other users.
     guest_recipients = [user for user in user_profiles if user.is_guest]
@@ -1695,9 +1830,18 @@ def get_recipients_for_user_creation_events(
             recipients_for_user_creation_events[sender].add(user_profiles[0].id)
         return recipients_for_user_creation_events
 
-    users_involved_in_dms = get_users_involved_in_dms_with_target_users(guest_recipients, realm)
-    subscribers_of_guest_recipient_subscriptions = get_subscribers_of_target_user_subscriptions(
-        guest_recipients
+    # Here, we check if all participants have a common DirectMessageGroup
+    # with at least one message, which would mean that every user
+    # already has access to every other user, and no need to proceed.
+    all_participant_ids = list({user.id for user in user_profiles} | {sender.id})
+    if DirectMessageGroup.objects.filter(
+        Exists(Message.objects.filter(realm=realm, recipient_id=OuterRef("recipient_id"))),
+        huddle_hash=get_direct_message_group_hash(all_participant_ids),
+    ).exists():
+        return recipients_for_user_creation_events
+
+    subscribers_of_guest_recipient_subscriptions = (
+        bulk_get_subscribers_of_target_user_subscriptions(guest_recipients)
     )
 
     for recipient_user in guest_recipients:
@@ -1705,15 +1849,11 @@ def get_recipients_for_user_creation_events(
             if user.id == recipient_user.id or user.is_bot:
                 continue
 
-            if (
-                user.id not in users_involved_in_dms[recipient_user.id]
-                and user.id not in subscribers_of_guest_recipient_subscriptions[recipient_user.id]
-            ):
+            if user.id not in subscribers_of_guest_recipient_subscriptions[recipient_user.id]:
                 recipients_for_user_creation_events[user].add(recipient_user.id)
 
         if (
             not sender.is_bot
-            and sender.id not in users_involved_in_dms[recipient_user.id]
             and sender.id not in subscribers_of_guest_recipient_subscriptions[recipient_user.id]
         ):
             recipients_for_user_creation_events[sender].add(recipient_user.id)
@@ -1751,11 +1891,17 @@ def check_message(
     for high-level documentation on this subsystem.
     """
     stream = None
+    user_group_membership_details: UserGroupMembershipDetails | None = None
+    sender_is_subscribed: bool | None = None
 
     message_content = normalize_body(message_content_raw)
 
     if realm is None:
         realm = sender.realm
+
+    # IDs of the DM sender and recipient users, deduplicated.
+    # None for stream message.
+    dm_involved_user_ids: set[int] | None = None
 
     recipients_for_user_creation_events = None
     if addressee.is_stream():
@@ -1791,7 +1937,7 @@ def check_message(
         user_group_membership_details = UserGroupMembershipDetails(user_recursive_group_ids=None)
         system_groups_name_dict = get_realm_system_groups_name_dict(stream.realm_id)
         if not skip_stream_access_check:
-            access_stream_for_send_message(
+            stream_access_result = access_stream_for_send_message(
                 sender=sender,
                 stream=stream,
                 forwarder_user_profile=forwarder_user_profile,
@@ -1799,6 +1945,7 @@ def check_message(
                 user_group_membership_details=user_group_membership_details,
                 system_groups_name_dict=system_groups_name_dict,
             )
+            sender_is_subscribed = stream_access_result["is_subscribed"]
         else:
             # Defensive assertion - the only currently supported use case
             # for this option is for outgoing webhook bots and since this
@@ -1823,32 +1970,25 @@ def check_message(
             raise TopicsNotAllowedError(empty_topic_display_name)
 
     elif addressee.is_private():
-        user_profiles = addressee.user_profiles()
-        mirror_message = client.name in [
-            "irc_mirror",
-            "jabber_mirror",
-            "JabberMirror",
-        ]
+        recipient_users = addressee.user_profiles()
 
-        check_sender_can_access_recipients(realm, sender, user_profiles)
+        dm_involved_user_ids = {user.id for user in recipient_users} | {sender.id}
+
+        check_sender_can_access_recipients(sender, recipient_users)
 
         recipients_for_user_creation_events = get_recipients_for_user_creation_events(
-            realm, sender, user_profiles
+            realm, sender, recipient_users
         )
 
-        # API super-users who set the `forged` flag are allowed to
-        # forge messages sent by any user, so we disable the
-        # `forwarded_mirror_message` security check in that case.
-        forwarded_mirror_message = mirror_message and not forged
         try:
             recipient = recipient_for_user_profiles(
-                user_profiles, forwarded_mirror_message, forwarder_user_profile, sender
+                recipient_users, forwarder_user_profile, sender, forged=forged
             )
         except ValidationError as e:
             assert isinstance(e.messages[0], str)
             raise JsonableError(e.messages[0])
 
-        check_can_send_direct_message(realm, sender, user_profiles, recipient)
+        check_can_send_direct_message(realm, sender, recipient_users, recipient)
     else:
         # This is defensive code--Addressee already validates
         # the message type.
@@ -1905,6 +2045,9 @@ def check_message(
         recipients_for_user_creation_events=recipients_for_user_creation_events,
         acting_user=acting_user,
         no_previews=no_previews,
+        user_group_membership_details=user_group_membership_details,
+        sender_is_subscribed=sender_is_subscribed,
+        dm_involved_user_ids=dm_involved_user_ids,
     )
 
     if (
@@ -2226,7 +2369,10 @@ def send_user_profile_update_notification(
     acting_user: UserProfile | None,
     changes: list[UserProfileChangeDict],
 ) -> None:
-    if not user_profile.is_active or user_profile.is_bot:
+    if not user_profile.is_active:
+        return
+
+    if user_profile.is_bot:
         return
 
     if acting_user is not None and acting_user.id == user_profile.id:

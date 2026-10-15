@@ -10,11 +10,13 @@ const {
     stub_buddy_list_elements,
 } = require("./lib/buddy_list.cjs");
 const {make_realm} = require("./lib/example_realm.cjs");
+const {make_stream} = require("./lib/example_stream.cjs");
+const {make_user} = require("./lib/example_user.cjs");
 const {make_message_list} = require("./lib/message_list.cjs");
 const {mock_esm, set_global, zrequire} = require("./lib/namespace.cjs");
 const {run_test, noop} = require("./lib/test.cjs");
 const blueslip = require("./lib/zblueslip.cjs");
-const $ = require("./lib/zjquery.cjs");
+const {$} = require("./lib/zjquery.cjs");
 
 const _document = {
     hasFocus() {
@@ -55,57 +57,61 @@ set_realm(realm);
 const user_settings = {};
 initialize_user_settings({user_settings});
 
-const me = {
+const me = make_user({
     email: "me@zulip.com",
     user_id: 999,
     full_name: "Me Myself",
-};
+});
 
-const alice = {
+const alice = make_user({
     email: "alice@zulip.com",
     user_id: 1,
     full_name: "Alice Smith",
-};
-const fred = {
+});
+const fred = make_user({
     email: "fred@zulip.com",
     user_id: 2,
     full_name: "Fred Flintstone",
-};
-const jill = {
+});
+const jill = make_user({
     email: "jill@zulip.com",
     user_id: 3,
     full_name: "Jill Hill",
-};
-const mark = {
+});
+const mark = make_user({
     email: "mark@zulip.com",
     user_id: 4,
     full_name: "Marky Mark",
-};
-const norbert = {
+});
+const norbert = make_user({
     email: "norbert@zulip.com",
     user_id: 5,
     full_name: "Norbert Oswald",
-};
+});
 
-const zoe = {
+const zoe = make_user({
     email: "zoe@example.com",
     user_id: 6,
     full_name: "Zoe Yang",
-};
+});
 
-people.add_active_user(alice);
-people.add_active_user(fred);
-people.add_active_user(jill);
-people.add_active_user(mark);
-people.add_active_user(norbert);
-people.add_active_user(zoe);
-people.add_active_user(me);
+people.add_active_user(alice, "server_events");
+people.add_active_user(fred, "server_events");
+people.add_active_user(jill, "server_events");
+people.add_active_user(mark, "server_events");
+people.add_active_user(norbert, "server_events");
+people.add_active_user(zoe, "server_events");
+people.add_active_user(me, "server_events");
 people.initialize_current_user(me.user_id);
 
 const $alice_stub = $.create("alice stub");
 const $fred_stub = $.create("fred stub");
 
-const rome_sub = {name: "Rome", subscribed: true, stream_id: 1001};
+const rome_sub = make_stream({
+    name: "Rome",
+    subscribed: true,
+    stream_id: 1001,
+});
 function add_sub_and_set_as_current_narrow(sub) {
     stream_data.add_sub_for_tests(sub);
     const filter_terms = [{operator: "stream", operand: String(sub.stream_id)}];
@@ -233,8 +239,8 @@ test("handlers", ({override, override_rewire}) => {
 
     let narrowed;
 
-    function narrow_by_email(email) {
-        assert.equal(email, "alice@zulip.com");
+    function narrow_by_user_id(user_id) {
+        assert.equal(user_id, alice.user_id);
         narrowed = true;
     }
 
@@ -245,7 +251,7 @@ test("handlers", ({override, override_rewire}) => {
         buddy_list.start_scroll_handler = noop;
         override_rewire(util, "call_function_periodically", noop);
         override_rewire(activity, "send_presence_to_server", noop);
-        activity_ui.initialize({narrow_by_email});
+        activity_ui.initialize({narrow_by_user_id});
 
         buddy_list.populate({
             all_user_ids: [me.user_id, alice.user_id, fred.user_id],
@@ -404,7 +410,7 @@ test("insert_one_user_into_empty_list", ({override}) => {
             },
             should_add_guest_user_indicator: false,
         });
-        num_calls = num_calls + 1;
+        num_calls += 1;
 
         return "<presence-row>";
     });
@@ -424,29 +430,29 @@ test("insert_one_user_into_empty_list", ({override}) => {
 });
 
 test("insert_alice_then_fred", ({override}) => {
-    let $other_users_appended;
-    override(buddy_list.$other_users_list, "append", ($element) => {
-        $other_users_appended = $element;
+    let other_users_appended;
+    override(buddy_list.$other_users_list[0], "append", (element) => {
+        other_users_appended = element;
     });
     override(padded_widget, "update_padding", noop);
     override(buddy_list_presence, "update_indicators", noop);
 
     activity_ui.redraw_user(alice.user_id);
-    assert.ok($other_users_appended.selector.includes('data-user-id="1"'));
-    assert.ok($other_users_appended.selector.includes("user-circle-active"));
+    assert.ok(other_users_appended.innerHTML.includes('data-user-id="1"'));
+    assert.ok(other_users_appended.innerHTML.includes("user-circle-active"));
 
     activity_ui.redraw_user(fred.user_id);
-    assert.ok($other_users_appended.selector.includes('data-user-id="2"'));
-    assert.ok($other_users_appended.selector.includes("user-circle-active"));
+    assert.ok(other_users_appended.innerHTML.includes('data-user-id="2"'));
+    assert.ok(other_users_appended.innerHTML.includes("user-circle-active"));
 });
 
 test("insert_fred_then_alice_then_rename, both as users matching view", ({override}) => {
     add_sub_and_set_as_current_narrow(rome_sub);
     peer_data.set_subscribers(rome_sub.stream_id, [alice.user_id, fred.user_id]);
 
-    let $users_matching_view_appended;
-    override(buddy_list.$users_matching_view_list, "append", ($element) => {
-        $users_matching_view_appended = $element;
+    let users_matching_view_appended;
+    override(buddy_list.$users_matching_view_list[0], "append", (element) => {
+        users_matching_view_appended = element;
     });
     override(padded_widget, "update_padding", noop);
     override(buddy_list_presence, "update_indicators", noop);
@@ -454,22 +460,22 @@ test("insert_fred_then_alice_then_rename, both as users matching view", ({overri
     buddy_list_add_user_matching_view(fred.user_id, $fred_stub);
 
     activity_ui.redraw_user(fred.user_id);
-    assert.ok($users_matching_view_appended.selector.includes('data-user-id="2"'));
-    assert.ok($users_matching_view_appended.selector.includes("user-circle-active"));
+    assert.ok(users_matching_view_appended.innerHTML.includes('data-user-id="2"'));
+    assert.ok(users_matching_view_appended.innerHTML.includes("user-circle-active"));
 
-    let $inserted;
-    $fred_stub.before = ($element) => {
-        $inserted = $element;
+    let inserted;
+    $fred_stub[0].before = (element) => {
+        inserted = element;
     };
 
     let fred_removed;
-    $fred_stub.remove = () => {
+    $fred_stub[0].remove = () => {
         fred_removed = true;
     };
 
     activity_ui.redraw_user(alice.user_id);
-    assert.ok($inserted.selector.includes('data-user-id="1"'));
-    assert.ok($inserted.selector.includes("user-circle-active"));
+    assert.ok(inserted.innerHTML.includes('data-user-id="1"'));
+    assert.ok(inserted.innerHTML.includes("user-circle-active"));
 
     // Next rename fred to Aaron.
     const fred_with_new_name = {
@@ -479,13 +485,13 @@ test("insert_fred_then_alice_then_rename, both as users matching view", ({overri
     };
     people.add_active_user(fred_with_new_name);
 
-    $alice_stub.before = ($element) => {
-        $inserted = $element;
+    $alice_stub[0].before = (element) => {
+        inserted = element;
     };
 
     activity_ui.redraw_user(fred_with_new_name.user_id);
     assert.ok(fred_removed);
-    assert.ok($users_matching_view_appended.selector.includes('data-user-id="2"'));
+    assert.ok(users_matching_view_appended.innerHTML.includes('data-user-id="2"'));
 
     // restore old Fred data
     people.add_active_user(fred);
@@ -495,9 +501,9 @@ test("insert_fred_then_alice_then_rename, both as other users", ({override}) => 
     add_sub_and_set_as_current_narrow(rome_sub);
     peer_data.set_subscribers(rome_sub.stream_id, []);
 
-    let $other_users_appended;
-    override(buddy_list.$other_users_list, "append", ($element) => {
-        $other_users_appended = $element;
+    let other_users_appended;
+    override(buddy_list.$other_users_list[0], "append", (element) => {
+        other_users_appended = element;
     });
     override(padded_widget, "update_padding", noop);
     override(buddy_list_presence, "update_indicators", noop);
@@ -506,22 +512,22 @@ test("insert_fred_then_alice_then_rename, both as other users", ({override}) => 
     buddy_list_add_other_user(fred.user_id, $fred_stub);
 
     activity_ui.redraw_user(fred.user_id);
-    assert.ok($other_users_appended.selector.includes('data-user-id="2"'));
-    assert.ok($other_users_appended.selector.includes("user-circle-active"));
+    assert.ok(other_users_appended.innerHTML.includes('data-user-id="2"'));
+    assert.ok(other_users_appended.innerHTML.includes("user-circle-active"));
 
-    let $inserted;
-    $fred_stub.before = ($element) => {
-        $inserted = $element;
+    let inserted;
+    $fred_stub[0].before = (element) => {
+        inserted = element;
     };
 
     let fred_removed;
-    $fred_stub.remove = () => {
+    $fred_stub[0].remove = () => {
         fred_removed = true;
     };
 
     activity_ui.redraw_user(alice.user_id);
-    assert.ok($inserted.selector.includes('data-user-id="1"'));
-    assert.ok($inserted.selector.includes("user-circle-active"));
+    assert.ok(inserted.innerHTML.includes('data-user-id="1"'));
+    assert.ok(inserted.innerHTML.includes("user-circle-active"));
 
     // Next rename fred to Aaron.
     const fred_with_new_name = {
@@ -531,25 +537,47 @@ test("insert_fred_then_alice_then_rename, both as other users", ({override}) => 
     };
     people.add_active_user(fred_with_new_name);
 
-    $alice_stub.before = ($element) => {
-        $inserted = $element;
+    $alice_stub[0].before = (element) => {
+        inserted = element;
     };
 
     activity_ui.redraw_user(fred_with_new_name.user_id);
     assert.ok(fred_removed);
-    assert.ok($other_users_appended.selector.includes('data-user-id="2"'));
+    assert.ok(other_users_appended.innerHTML.includes('data-user-id="2"'));
 
     // restore old Fred data
     people.add_active_user(fred);
 });
 
-test("insert_unfiltered_user_with_filter", () => {
-    // This test only tests that we do not explode when
-    // try to insert Fred into a list where he does not
-    // match the search filter.
+test("redraw_user_not_matching_filter", ({override}) => {
+    add_sub_and_set_as_current_narrow(rome_sub);
+    peer_data.set_subscribers(rome_sub.stream_id, []);
+
+    let other_users_appended;
+    override(buddy_list.$other_users_list[0], "append", (element) => {
+        other_users_appended = element;
+    });
+    override(padded_widget, "update_padding", noop);
+    override(buddy_list_presence, "update_indicators", noop);
+
+    buddy_list_add_other_user(fred.user_id, $fred_stub);
+    let fred_removed = false;
+    override($fred_stub[0], "remove", () => {
+        fred_removed = true;
+    });
+
     const $user_filter = $("input.user-list-filter");
+    $user_filter.val("fre");
+    activity_ui.redraw_user(fred.user_id);
+    assert.ok(other_users_appended.innerHTML.includes(`data-user-id="${fred.user_id}"`));
+    assert.ok(buddy_list.all_user_ids.includes(fred.user_id));
+
+    other_users_appended = undefined;
     $user_filter.val("do-not-match-filter");
     activity_ui.redraw_user(fred.user_id);
+    assert.ok(fred_removed);
+    assert.equal(other_users_appended, undefined);
+    assert.ok(!buddy_list.all_user_ids.includes(fred.user_id));
 });
 
 test("realm_presence_disabled", ({override}) => {
@@ -559,9 +587,78 @@ test("realm_presence_disabled", ({override}) => {
     activity_ui.build_user_sidebar();
 });
 
-test("redraw_muted_user", () => {
+test("redraw_muted_user", ({override}) => {
+    override(buddy_list_presence, "update_indicators", noop);
+
     muted_users.add_muted_user(mark.user_id);
     activity_ui.redraw_user(mark.user_id);
+    assert.ok(!buddy_list.all_user_ids.includes(mark.user_id));
+});
+
+function insert_mark_then_check_removed_when_ineligible(override, make_mark_ineligible) {
+    add_sub_and_set_as_current_narrow(rome_sub);
+    peer_data.set_subscribers(rome_sub.stream_id, []);
+
+    let other_users_appended;
+    override(buddy_list.$other_users_list[0], "append", (element) => {
+        other_users_appended = element;
+    });
+    override(padded_widget, "update_padding", noop);
+
+    const $mark_stub = $.create("mark stub");
+    buddy_list_add_other_user(mark.user_id, $mark_stub);
+    let mark_removed = false;
+    $mark_stub[0].remove = () => {
+        mark_removed = true;
+    };
+
+    buddy_list.insert_or_move([mark.user_id], "");
+    assert.ok(other_users_appended.innerHTML.includes(`data-user-id="${mark.user_id}"`));
+    assert.ok(buddy_list.all_user_ids.includes(mark.user_id));
+
+    other_users_appended = undefined;
+    make_mark_ineligible();
+    buddy_list.insert_or_move([mark.user_id], "");
+    assert.ok(mark_removed);
+    assert.equal(other_users_appended, undefined);
+    assert.ok(!buddy_list.all_user_ids.includes(mark.user_id));
+}
+
+test("insert_or_move_deactivated_user", ({override}) => {
+    insert_mark_then_check_removed_when_ineligible(override, () => {
+        people.deactivate(mark);
+    });
+    people.add_active_user(mark);
+});
+
+test("insert_or_move_muted_user", ({override}) => {
+    insert_mark_then_check_removed_when_ineligible(override, () => {
+        muted_users.add_muted_user(mark.user_id);
+    });
+});
+
+test("insert_or_move_user_not_matching_filter", () => {
+    add_sub_and_set_as_current_narrow(rome_sub);
+    peer_data.set_subscribers(rome_sub.stream_id, []);
+
+    buddy_list.insert_or_move([mark.user_id], "do-not-match-filter");
+    assert.ok(!buddy_list.all_user_ids.includes(mark.user_id));
+});
+
+test("insert_or_move_bot", () => {
+    add_sub_and_set_as_current_narrow(rome_sub);
+    peer_data.set_subscribers(rome_sub.stream_id, []);
+
+    const bot = make_user({
+        email: "bot@zulip.com",
+        user_id: 8,
+        full_name: "Bot",
+        is_bot: true,
+    });
+    people.add_active_user(bot);
+
+    buddy_list.insert_or_move([bot.user_id], "");
+    assert.ok(!buddy_list.all_user_ids.includes(bot.user_id));
 });
 
 test("update_presence_info", ({override}) => {

@@ -83,6 +83,33 @@ public statement will need to be made. In such cases, the identities of all
 victims and reporters will remain confidential unless those individuals
 instruct us otherwise.
 
+## AI policy
+
+::: note
+
+If you are looking for information about using LLMs for coding in Zulip, see
+our **[AI use policy and guidelines][contributing-ai-policy] for code
+contributors**.
+
+:::
+
+We want to maintain a space of authentic dialogue between humans. To that
+end:
+
+- **Do not post AI-generated messages as your own**. We want to read your own
+  genuine expression of your thoughts. It’s fine to use whatever tools you
+  like for help with spelling, grammar, or translation.
+
+- **Clarity and succinctness** are much more important than perfect grammar.
+  If you ask an LLM to clean up your writing, be sure it does not make it
+  longer in the process. A concise message is much more likely to be read and
+  replied to!
+
+- **Distinguish LLM output from your own thoughts**. If you do have something
+  from an LLM that you want to share with the Zulip community, use Markdown
+  [blockquote](https://zulip.com/help/format-a-quote) formatting in your
+  message content, keeping in mind the point above about brevity.
+
 ## Scope
 
 We expect all community participants (contributors, paid or otherwise,
@@ -132,18 +159,18 @@ Here are some guidelines for how you can help:
     guideline](https://zulip.com/development-community/):
 
     > Don’t ask the same question in multiple places. Moderators read every
-    > public stream, and make sure every question gets a reply.
+    > public channel, and make sure every question gets a reply.
 
     I’ve gone ahead and moved the other copy of this message to this thread.
 
   - If asked a question in a direct message that is better discussed in a public
-    stream:
+    channel:
     > Hi @user! Please start by reviewing
     > https://zulip.com/development-community/#community-norms to learn how to
     > get help in this community.
 
 - Users sometimes think chat.zulip.org is a testing instance. When this happens,
-  kindly direct them to use the **#test here** stream.
+  kindly direct them to use the **#test here** channel.
 
 - If you see a message that’s posted in the wrong place, go ahead and move it if
   you have permissions to do so, even if you don’t plan to respond to it.
@@ -154,10 +181,12 @@ Here are some guidelines for how you can help:
   reply, so that the mention serves as a notification of the new location for
   their conversation.
 
-- If a user is posting spam, please report it to an administrator. They will:
+- If a user is posting spam, please [report
+  it](https://zulip.com/help/report-a-message) to community moderators. They
+  will:
 
   - Change the user's name to `<name> (spammer)` and deactivate them.
-  - Delete any spam messages they posted in public streams.
+  - Delete any spam messages they posted in public channels.
 
 - We care very much about maintaining a respectful tone in our community. If you
   see someone being mean or rude, point out that their tone is inappropriate,
@@ -171,3 +200,5 @@ Here are some guidelines for how you can help:
   Everyone has bad days and stressful situations that can result in them
   behaving not their best, and while we should be firm about our community
   rules, we should also enforce them with kindness.
+
+[contributing-ai-policy]: https://zulip.readthedocs.io/en/stable/contributing/contributing.html#ai-use-policy-and-guidelines

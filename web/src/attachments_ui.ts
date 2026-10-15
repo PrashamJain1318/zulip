@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import type * as z from "zod/mini";
 
 import render_confirm_delete_attachment from "../templates/confirm_dialog/confirm_delete_attachment.hbs";
@@ -68,10 +68,7 @@ export function percentage_used_space(uploads_size: number): string | null {
 }
 
 function set_upload_space_stats(): void {
-    if (realm.realm_upload_quota_mib === null) {
-        return;
-    }
-    if (current_user.is_guest) {
+    if (realm.realm_upload_quota_mib === null || current_user.is_guest) {
         return;
     }
 
@@ -116,12 +113,13 @@ function set_upload_space_stats(): void {
 }
 
 function delete_attachments(attachment: string, file_name: string): void {
-    const html_body = render_confirm_delete_attachment({file_name});
+    const modal_content_html = render_confirm_delete_attachment({file_name});
 
     dialog_widget.launch({
-        html_heading: $t_html({defaultMessage: "Delete file?"}),
-        html_body,
-        html_submit_button: $t_html({defaultMessage: "Delete"}),
+        modal_title_html: $t_html({defaultMessage: "Delete file?"}),
+        modal_content_html,
+        modal_submit_button_text: $t({defaultMessage: "Delete"}),
+        is_compact: true,
         focus_submit_on_open: true,
         on_click() {
             dialog_widget.submit_api_request(channel.del, "/json/attachments/" + attachment, {});
@@ -131,19 +129,20 @@ function delete_attachments(attachment: string, file_name: string): void {
 }
 
 function sort_mentioned_in(a: Attachment, b: Attachment): number {
-    const a_m = a.messages[0];
-    const b_m = b.messages[0];
+    const a_id = a.message_ids[0];
+    const b_id = b.message_ids[0];
 
-    if (!a_m) {
+    if (a_id === undefined) {
         return 1;
     }
-    if (!b_m) {
+    if (b_id === undefined) {
         return -1;
     }
 
-    if (a_m.id > b_m.id) {
+    if (a_id > b_id) {
         return 1;
-    } else if (a_m.id === b_m.id) {
+    }
+    if (a_id === b_id) {
         return 0;
     }
 
@@ -249,7 +248,7 @@ export function set_up_attachments(): void {
 }
 
 export function suggest_delete_detached_attachments(attachments_list: ServerAttachment[]): void {
-    const html_body = render_confirm_delete_detached_attachments_modal({
+    const modal_content_html = render_confirm_delete_detached_attachments_modal({
         attachments_list,
         realm_message_edit_history_is_visible:
             realm.realm_message_edit_history_visibility_policy !==
@@ -266,7 +265,7 @@ export function suggest_delete_detached_attachments(attachments_list: ServerAtta
 
     function do_delete_attachments(): void {
         dialog_widget.show_dialog_spinner();
-        for (const [id, attachment] of attachments_map.entries()) {
+        for (const [id, attachment] of attachments_map) {
             void channel.del({
                 url: "/json/attachments/" + attachment.id,
                 success() {
@@ -295,10 +294,10 @@ export function suggest_delete_detached_attachments(attachments_list: ServerAtta
 
     dialog_widget.launch({
         id: "confirm_delete_attachments_modal",
-        html_heading: $t_html({defaultMessage: "Delete uploaded files?"}),
-        html_body,
-        html_submit_button: $t_html({defaultMessage: "Delete"}),
-        html_exit_button: $t_html({defaultMessage: "Don't delete"}),
+        modal_title_html: $t_html({defaultMessage: "Delete uploaded files?"}),
+        modal_content_html,
+        modal_submit_button_text: $t({defaultMessage: "Delete"}),
+        modal_exit_button_text: $t({defaultMessage: "Don't delete"}),
         loading_spinner: true,
         on_click: do_delete_attachments,
     });

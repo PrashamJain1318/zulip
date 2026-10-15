@@ -1,4 +1,5 @@
-import $ from "jquery";
+import ClipboardJS from "clipboard";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -13,6 +14,7 @@ import * as avatar from "./avatar.ts";
 import * as bot_helper from "./bot_helper.ts";
 import * as channel from "./channel.ts";
 import * as common from "./common.ts";
+import {show_copied_confirmation} from "./copied_tooltip.ts";
 import {csrf_token} from "./csrf.ts";
 import * as custom_profile_fields_ui from "./custom_profile_fields_ui.ts";
 import type {CustomProfileFieldData, PillUpdateField} from "./custom_profile_fields_ui.ts";
@@ -30,6 +32,7 @@ import * as settings_data from "./settings_data.ts";
 import * as settings_org from "./settings_org.ts";
 import * as settings_ui from "./settings_ui.ts";
 import {current_user, realm} from "./state_data.ts";
+import * as timerender from "./timerender.ts";
 import * as ui_report from "./ui_report.ts";
 import * as ui_util from "./ui_util.ts";
 import * as user_deactivation_ui from "./user_deactivation_ui.ts";
@@ -40,8 +43,7 @@ import {user_settings} from "./user_settings.ts";
 import * as util from "./util.ts";
 
 let password_quality:
-    | ((password: string, $bar: JQuery | undefined, $password_field: JQuery) => boolean)
-    | undefined; // Loaded asynchronously
+    ((password: string, $bar: JQuery | undefined, $password_field: JQuery) => boolean) | undefined; // Loaded asynchronously
 let user_avatar_widget_created = false;
 let user_timezone_dropdown_widget: dropdown_widget.DropdownWidget | undefined;
 
@@ -130,6 +132,7 @@ function upload_avatar(file: File): void {
                 $("#user-avatar-source").show();
             }
             ui_report.error($t_html({defaultMessage: "Failed"}), xhr, $("#dialog_error"));
+            dialog_widget.hide_dialog_spinner();
         },
     });
 }
@@ -306,9 +309,10 @@ export function update_privacy_settings_box(property: PrivacySettingName): void 
 }
 
 export function render_user_timezone_dropdown_widget(): void {
-    const timezone_items = timezones.timezones.map((tz: {name: string; utc_offset: string}) => ({
-        name: `${tz.name} (${tz.utc_offset})`,
-        unique_id: tz.name,
+    const now = new Date();
+    const timezone_items = timezones.timezones.map((tz) => ({
+        name: `${tz} (${timerender.get_utc_offset_string(tz, now)})`,
+        unique_id: tz,
     }));
 
     const opts: dropdown_widget.DropdownWidgetOptions = {
@@ -385,7 +389,7 @@ export function set_up(): void {
         $("#api_key_buttons").hide();
         common.setup_password_visibility_toggle(
             "#get_api_key_password",
-            "#get_api_key_password + .password_visibility_toggle",
+            "#get_api_key_password ~ .password_visibility_toggle",
             {tippy_tooltips: true},
         );
 
@@ -453,8 +457,18 @@ export function set_up(): void {
         $("#api_key_modal [data-micromodal-close]").on("click", () => {
             common.reset_password_toggle_icons(
                 "#get_api_key_password",
-                "#get_api_key_password + .password_visibility_toggle",
+                "#get_api_key_password ~ .password_visibility_toggle",
             );
+        });
+        new ClipboardJS("#show_api_key .copy-button", {
+            text() {
+                return $("#api_key_value").text();
+            },
+        }).on("success", (e) => {
+            assert(e.trigger instanceof HTMLElement);
+            show_copied_confirmation(e.trigger, {
+                show_check_icon: true,
+            });
         });
     };
 
@@ -477,11 +491,11 @@ export function set_up(): void {
         // for an XSS attacker to find.
         common.reset_password_toggle_icons(
             "#old_password",
-            "#old_password + .password_visibility_toggle",
+            "#old_password ~ .password_visibility_toggle",
         );
         common.reset_password_toggle_icons(
             "#new_password",
-            "#new_password + .password_visibility_toggle",
+            "#new_password ~ .password_visibility_toggle",
         );
         $("#old_password, #new_password").val("");
         password_quality?.("", $("#pw_strength .bar"), $("#new_password"));
@@ -495,12 +509,12 @@ export function set_up(): void {
             });
         common.setup_password_visibility_toggle(
             "#old_password",
-            "#old_password + .password_visibility_toggle",
+            "#old_password ~ .password_visibility_toggle",
             {tippy_tooltips: true},
         );
         common.setup_password_visibility_toggle(
             "#new_password",
-            "#new_password + .password_visibility_toggle",
+            "#new_password ~ .password_visibility_toggle",
             {tippy_tooltips: true},
         );
         clear_password_change();
@@ -548,13 +562,13 @@ export function set_up(): void {
         }
 
         dialog_widget.launch({
-            html_heading: $t_html({defaultMessage: "Change password"}),
-            html_body: render_dialog_change_password({
+            modal_title_html: $t_html({defaultMessage: "Change password"}),
+            modal_content_html: render_dialog_change_password({
                 password_min_length: realm.password_min_length,
                 password_max_length: realm.password_max_length,
                 password_min_guesses: realm.password_min_guesses,
             }),
-            html_submit_button: $t_html({defaultMessage: "Change"}),
+            modal_submit_button_text: $t({defaultMessage: "Change"}),
             loading_spinner: true,
             id: "change_password_modal",
             form_id: "change_password_container",
@@ -601,7 +615,8 @@ export function set_up(): void {
                         "Sorry for the trouble!",
                 );
                 return;
-            } else if (!password_quality(new_pw, undefined, $new_pw_field)) {
+            }
+            if (!password_quality(new_pw, undefined, $new_pw_field)) {
                 settings_change_error($t_html({defaultMessage: "New password is too weak!"}));
                 return;
             }
@@ -686,9 +701,11 @@ export function set_up(): void {
         e.stopPropagation();
         if (settings_data.user_can_change_email()) {
             dialog_widget.launch({
-                html_heading: $t_html({defaultMessage: "Change email"}),
-                html_body: render_change_email_modal({delivery_email: current_user.delivery_email}),
-                html_submit_button: $t_html({defaultMessage: "Change"}),
+                modal_title_html: $t_html({defaultMessage: "Change email"}),
+                modal_content_html: render_change_email_modal({
+                    delivery_email: current_user.delivery_email,
+                }),
+                modal_submit_button_text: $t({defaultMessage: "Change"}),
                 loading_spinner: true,
                 id: "change_email_modal",
                 form_id: "change_email_form",
@@ -776,14 +793,14 @@ export function set_up(): void {
             current_user.delivery_email === ""
         ) {
             dialog_widget.launch({
-                html_heading: $t_html({defaultMessage: "Add email"}),
-                html_body: render_demo_organization_add_email_modal({
+                modal_title_html: $t_html({defaultMessage: "Add email"}),
+                modal_content_html: render_demo_organization_add_email_modal({
                     delivery_email: current_user.delivery_email,
                     full_name: current_user.full_name,
                     email_address_visibility_values:
                         settings_config.email_address_visibility_values,
                 }),
-                html_submit_button: $t_html({defaultMessage: "Add"}),
+                modal_submit_button_text: $t({defaultMessage: "Add"}),
                 loading_spinner: true,
                 id: "demo_organization_add_email_modal",
                 form_id: "demo_organization_add_email_form",
@@ -848,7 +865,7 @@ export function set_up(): void {
                 success() {
                     dialog_widget.hide_dialog_spinner();
                     dialog_widget.close();
-                    window.location.href = "/login/";
+                    window.location.assign("/login/");
                 },
                 error(xhr) {
                     const error_last_owner = $t_html({
@@ -900,8 +917,7 @@ export function set_up(): void {
         e.stopPropagation();
         e.preventDefault();
 
-        const user = people.get_by_user_id(people.my_current_user_id());
-        user_profile.show_user_profile(user);
+        user_profile.show_user_profile(people.my_current_user_id());
     });
 
     // When the personal settings overlay is opened, we reset

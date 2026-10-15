@@ -7,6 +7,24 @@ import * as stream_list_sort from "./stream_list_sort.ts";
 import * as stream_topic_history from "./stream_topic_history.ts";
 import * as unread from "./unread.ts";
 import * as user_topics from "./user_topics.ts";
+import * as util from "./util.ts";
+
+// If there are any unreads in the current topic,
+// user likely wants to avoid reading them right now.
+// So, we add them to `topics_kept_unread_by_user`
+// which we will navigate to later.
+//
+// Why first unread message ID?
+// User wants to start reading from that message later,
+// and can follow `moved` breadcrumbs to read further if
+// the later messages in the topic were moved.
+//
+// Contains the first unread message in the topic.
+let topics_kept_unread_by_user = new Set<number>();
+
+export function reset_topics_kept_unread_by_user(): void {
+    topics_kept_unread_by_user.clear();
+}
 
 export function next_topic(
     sorted_channels_info: {
@@ -22,13 +40,21 @@ export function next_topic(
         ? sorted_channels_info.findIndex(({channel_id}) => channel_id === curr_stream_id)
         : -1;
 
-    // 1. Find any unreads in the current channel after the current topic.
     if (curr_stream_index >= 0) {
         const {channel_id} = sorted_channels_info[curr_stream_index]!;
         const topics = get_topics(channel_id);
         const curr_topic_index = curr_topic !== undefined ? topics.indexOf(curr_topic) : -1; // -1 if not found
 
+        // 1. Find any unreads in the current channel after the current topic.
         for (let i = curr_topic_index + 1; i < topics.length; i += 1) {
+            const topic = topics[i]!;
+            if (has_unread_messages(channel_id, topic)) {
+                return {stream_id: channel_id, topic};
+            }
+        }
+
+        // 2. Find any unreads in the current channel before the current topic.
+        for (let i = 0; i < curr_topic_index; i += 1) {
             const topic = topics[i]!;
             if (has_unread_messages(channel_id, topic)) {
                 return {stream_id: channel_id, topic};
@@ -36,7 +62,7 @@ export function next_topic(
         }
     }
 
-    // 2. Find any unreads after the current channel in uncollapsed folders.
+    // 3. Find any unreads after the current channel in uncollapsed folders.
     for (let i = curr_stream_index + 1; i < sorted_channels_info.length; i += 1) {
         const channel_info = sorted_channels_info[i]!;
         if (channel_info.is_collapsed) {
@@ -51,8 +77,8 @@ export function next_topic(
 
     // `sorted_channels_info`: First has uncollapsed channels,
     //                         then collapsed ones.
-    // 3. Find any unreads before the current channel:topic.
-    // 4. Find any unreads in collapsed channels.
+    // 4. Find any unreads before the current channel:topic.
+    // 5. Find any unreads in collapsed channels.
     let reached_current_narrow_state = false;
     for (const channel_info of sorted_channels_info) {
         if (reached_current_narrow_state && !channel_info.is_collapsed) {
@@ -82,8 +108,33 @@ export function next_topic(
         }
     }
 
-    // 5. No unread topic found.
+    // 6. No unread topic found.
     return undefined;
+}
+
+function get_unmuted_topics(stream_id: number, topics: string[]): string[] {
+    const narrowed_steam_id = narrow_state.stream_id();
+    const narrowed_topic = narrow_state.topic();
+    if (
+        narrowed_steam_id !== undefined &&
+        narrowed_topic !== undefined &&
+        narrowed_steam_id === stream_id &&
+        _.isEqual(narrow_state.filter()?.sorted_term_types(), ["stream", "topic"]) &&
+        !user_topics.is_topic_unmuted_or_followed(stream_id, narrowed_topic)
+    ) {
+        // Here we're using N within a muted stream starting from
+        // a muted topic; advance to the next not-explicitly-muted
+        // unread topic in the stream, to allow using N within
+        // muted streams. We'll jump back into the normal mode if
+        // we land in a followed/unmuted topic, but that's OK.
+
+        /* istanbul ignore next */
+        return topics.filter((topic) => !user_topics.is_topic_muted(stream_id, topic));
+    }
+    if (stream_data.is_muted(stream_id)) {
+        return topics.filter((topic) => user_topics.is_topic_unmuted_or_followed(stream_id, topic));
+    }
+    return topics.filter((topic) => !user_topics.is_topic_muted(stream_id, topic));
 }
 
 export function get_next_topic(
@@ -114,44 +165,47 @@ export function get_next_topic(
         return topics.some((topic) => user_topics.is_topic_unmuted_or_followed(channel_id, topic));
     });
 
-    function get_unmuted_topics(stream_id: number): string[] {
-        const narrowed_steam_id = narrow_state.stream_id();
-        const topics = stream_topic_history.get_recent_topic_names(stream_id);
-        const narrowed_topic = narrow_state.topic();
-        if (
-            narrowed_steam_id !== undefined &&
-            narrowed_topic !== undefined &&
-            narrowed_steam_id === stream_id &&
-            _.isEqual(narrow_state.filter()?.sorted_term_types(), ["stream", "topic"]) &&
-            !user_topics.is_topic_unmuted_or_followed(stream_id, narrowed_topic)
-        ) {
-            // Here we're using N within a muted stream starting from
-            // a muted topic; advance to the next not-explicitly-muted
-            // unread topic in the stream, to allow using N within
-            // muted streams. We'll jump back into the normal mode if
-            // we land in a followed/unmuted topic, but that's OK.
-
-            /* istanbul ignore next */
-            return topics.filter((topic) => !user_topics.is_topic_muted(stream_id, topic));
-        } else if (stream_data.is_muted(stream_id)) {
-            return topics.filter((topic) =>
-                user_topics.is_topic_unmuted_or_followed(stream_id, topic),
-            );
-        }
-        return topics.filter((topic) => !user_topics.is_topic_muted(stream_id, topic));
-    }
-
     function get_followed_topics(stream_id: number): string[] {
         let topics = stream_topic_history.get_recent_topic_names(stream_id);
         topics = topics.filter((topic) => user_topics.is_topic_followed(stream_id, topic));
         return topics;
     }
 
+    // Remember that user chose to keep some messages unread in the current topic.
+    if (
+        narrow_state.narrowed_by_topic_reply() &&
+        curr_stream_id !== undefined &&
+        curr_topic !== undefined
+    ) {
+        const topic_unread_msg_ids = unread.get_msg_ids_for_topic(curr_stream_id, curr_topic);
+        if (topic_unread_msg_ids.length > 0) {
+            topics_kept_unread_by_user.add(topic_unread_msg_ids[0]!);
+        }
+    }
+
+    function has_unread_messages(channel_id: number, topic: string): boolean {
+        const topic_unread_msg_ids = unread.get_msg_ids_for_topic(channel_id, topic);
+        if (topic_unread_msg_ids.length > 0) {
+            // If user chose to keep some messages unread in this topic,
+            // skip it for now and come back to it later.
+            if (topic_unread_msg_ids.some((msg_id) => topics_kept_unread_by_user.has(msg_id))) {
+                // Remove these msg_ids from the set so that
+                // we don't skip this topic next time.
+                topics_kept_unread_by_user = topics_kept_unread_by_user.difference(
+                    new Set(topic_unread_msg_ids),
+                );
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
     if (only_followed_topics) {
         return next_topic(
             sorted_channels_info,
             get_followed_topics,
-            unread.topic_has_any_unread,
+            has_unread_messages,
             curr_stream_id,
             curr_topic,
         );
@@ -159,10 +213,35 @@ export function get_next_topic(
 
     return next_topic(
         sorted_channels_info,
-        get_unmuted_topics,
-        unread.topic_has_any_unread,
+        (stream_id) =>
+            get_unmuted_topics(stream_id, stream_topic_history.get_recent_topic_names(stream_id)),
+        has_unread_messages,
         curr_stream_id,
         curr_topic,
+    );
+}
+
+// Whether get_next_topic has a topic other than the current one to
+// go to, without its side effects or sorting every channel's topics.
+// A topic the user left unread counts, although get_next_topic skips
+// it once.
+export function has_next_unread_topic(
+    curr_stream_id: number | undefined,
+    curr_topic: string | undefined,
+    channels_info: {channel_id: number}[],
+): boolean {
+    function is_current_topic(channel_id: number, topic: string): boolean {
+        return (
+            channel_id === curr_stream_id &&
+            curr_topic !== undefined &&
+            util.lower_same(topic, curr_topic)
+        );
+    }
+
+    return channels_info.some(({channel_id}) =>
+        get_unmuted_topics(channel_id, unread.get_topics_with_unreads(channel_id)).some(
+            (topic) => !is_current_topic(channel_id, topic),
+        ),
     );
 }
 

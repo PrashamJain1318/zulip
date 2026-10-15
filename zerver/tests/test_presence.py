@@ -615,7 +615,7 @@ class UserPresenceTests(ZulipTestCase):
 
         # Ensure date_joined was used as the fallback.
         self.assertEqual(
-            result_dict["presence"]["website"]["timestamp"],
+            result_dict["presence"]["active_timestamp"],
             datetime_to_timestamp(othello.date_joined),
         )
 
@@ -681,6 +681,50 @@ class SingleUserPresenceTests(ZulipTestCase):
         result = self.client_get("/json/users/email@zulip.com/presence")
         self.assert_json_error(result, "No presence data for email@zulip.com")
 
+    def test_email_access_after_email_address_visibility_change(self) -> None:
+        self.login("hamlet")
+
+        othello = self.example_user("othello")
+        self.api_post(othello, "/api/v1/users/me/presence", {"status": "active"})
+        do_change_user_setting(
+            othello,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            acting_user=None,
+        )
+        real_email = othello.delivery_email
+        self.assertEqual(othello.email, real_email)
+
+        # This caches the lookup of othello by the real email address.
+        result = self.client_get(f"/json/users/{real_email}/presence")
+        self.assert_json_success(result)
+
+        do_change_user_setting(
+            othello,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_ADMINS,
+            acting_user=None,
+        )
+        dummy_email = othello.email
+        self.assertNotEqual(dummy_email, real_email)
+
+        result = self.client_get(f"/json/users/{real_email}/presence")
+        self.assert_json_error(result, "No such user")
+        result = self.client_get(f"/json/users/{dummy_email}/presence")
+        self.assert_json_success(result)
+
+        do_change_user_setting(
+            othello,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            acting_user=None,
+        )
+
+        result = self.client_get(f"/json/users/{dummy_email}/presence")
+        self.assert_json_error(result, "No such user")
+        result = self.client_get(f"/json/users/{real_email}/presence")
+        self.assert_json_success(result)
+
     def test_single_user_get(self) -> None:
         reset_email_visibility_to_everyone_in_zulip_realm()
 
@@ -735,21 +779,32 @@ class SingleUserPresenceTests(ZulipTestCase):
             result = self.client_get(f"/json/users/{othello.id}/presence")
         self.assert_json_error(result, "Insufficient permission")
 
+        expected_keys = {"active_timestamp", "idle_timestamp", "website", "aggregated"}
+
         result = self.client_get(f"/json/users/{othello.id}/presence")
         result_dict = self.assert_json_success(result)
-        self.assertEqual(set(result_dict["presence"].keys()), {"website", "aggregated"})
+        self.assertEqual(set(result_dict["presence"].keys()), expected_keys)
+        self.assertIsInstance(result_dict["presence"]["active_timestamp"], int)
+        self.assertIsInstance(result_dict["presence"]["idle_timestamp"], int)
+        self.assertIsInstance(result_dict["server_timestamp"], float)
         self.assertEqual(set(result_dict["presence"]["website"].keys()), {"status", "timestamp"})
 
         # Then, we check everything works
         self.login("hamlet")
         result = self.client_get("/json/users/othello@zulip.com/presence")
         result_dict = self.assert_json_success(result)
-        self.assertEqual(set(result_dict["presence"].keys()), {"website", "aggregated"})
+        self.assertEqual(set(result_dict["presence"].keys()), expected_keys)
+        self.assertIsInstance(result_dict["presence"]["active_timestamp"], int)
+        self.assertIsInstance(result_dict["presence"]["idle_timestamp"], int)
+        self.assertIsInstance(result_dict["server_timestamp"], float)
         self.assertEqual(set(result_dict["presence"]["website"].keys()), {"status", "timestamp"})
 
         result = self.client_get(f"/json/users/{othello.id}/presence")
         result_dict = self.assert_json_success(result)
-        self.assertEqual(set(result_dict["presence"].keys()), {"website", "aggregated"})
+        self.assertEqual(set(result_dict["presence"].keys()), expected_keys)
+        self.assertIsInstance(result_dict["presence"]["active_timestamp"], int)
+        self.assertIsInstance(result_dict["presence"]["idle_timestamp"], int)
+        self.assertIsInstance(result_dict["server_timestamp"], float)
         self.assertEqual(set(result_dict["presence"]["website"].keys()), {"status", "timestamp"})
 
     def test_ping_only(self) -> None:
@@ -875,7 +930,7 @@ class UserPresenceAggregationTests(ZulipTestCase):
         user = self.example_user("othello")
         self.login_user(user)
         validate_time = timezone_now()
-        result_dict = self._send_presence_for_aggregated_tests(user, "idle", validate_time)
+        self._send_presence_for_aggregated_tests(user, "idle", validate_time)
 
         with time_machine.travel(
             (validate_time + timedelta(seconds=settings.OFFLINE_THRESHOLD_SECS + 1)),

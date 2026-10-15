@@ -1,10 +1,10 @@
-import $ from "jquery";
+import {$} from "jquery";
 import * as tippy from "tippy.js";
 
+import * as blueslip from "./blueslip.ts";
 import {$t} from "./i18n.ts";
-import * as util from "./util.ts";
 
-export const status_classes = "alert-error alert-success alert-info alert-warning alert-loading";
+export const status_classes = "alert-error alert-success alert-info alert-warning";
 
 export function phrase_match(query: string, phrase: string): boolean {
     // match "tes" to "test" and "stream test" but not "hostess"
@@ -23,7 +23,6 @@ const keys_map = new Map([
 // Any changes to this function should be followed by a check for changes needed
 // to adjust_mac_kbd_tags of starlight_help/src/scripts/adjust_mac_kbd_tags.ts.
 export function has_mac_keyboard(): boolean {
-    // eslint-disable-next-line @typescript-eslint/no-deprecated
     return /mac/i.test(navigator.platform);
 }
 
@@ -120,7 +119,13 @@ function set_password_toggle_label(
 ): void {
     $(password_selector).attr("aria-label", label);
     if (tippy_tooltips) {
-        const element: tippy.ReferenceElement = util.the($(password_selector));
+        const element: tippy.ReferenceElement | undefined = $(password_selector)[0];
+        if (element === undefined) {
+            // Report the missing toggle without throwing, so that
+            // callers still run cleanup like clearing password inputs.
+            blueslip.error("Password visibility toggle not found", {password_selector});
+            return;
+        }
         const tippy_instance = element._tippy ?? tippy.default(element);
         tippy_instance.setContent(label);
     } else {
@@ -138,11 +143,11 @@ function toggle_password_visibility(
 
     if ($password_field.attr("type") === "password") {
         $password_field.attr("type", "text");
-        $(password_selector).removeClass("fa-eye-slash").addClass("fa-eye");
+        $(password_selector).removeClass("zulip-icon-hide").addClass("zulip-icon-show");
         label = $t({defaultMessage: "Hide password"});
     } else {
         $password_field.attr("type", "password");
-        $(password_selector).removeClass("fa-eye").addClass("fa-eye-slash");
+        $(password_selector).removeClass("zulip-icon-show").addClass("zulip-icon-hide");
         label = $t({defaultMessage: "Show password"});
     }
     set_password_toggle_label(password_selector, label, tippy_tooltips);
@@ -153,7 +158,7 @@ export function reset_password_toggle_icons(
     password_selector: string,
 ): void {
     $(password_field).attr("type", "password");
-    $(password_selector).removeClass("fa-eye").addClass("fa-eye-slash");
+    $(password_selector).removeClass("zulip-icon-show").addClass("zulip-icon-hide");
     const label = $t({defaultMessage: "Show password"});
     set_password_toggle_label(password_selector, label, true);
 }

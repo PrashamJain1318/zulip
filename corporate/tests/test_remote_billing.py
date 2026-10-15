@@ -187,7 +187,9 @@ class SelfHostedBillingEndpointBasicTest(RemoteRealmBillingTestCase):
             "/self-hosted-billing/not-configured/",
         ]:
             result = self.client_get(url)
-            self.assert_json_error(result, "Must be an organization owner")
+            self.assert_json_error(
+                result, "You do not have permission to manage plans and billing."
+            )
 
         # Login as an organization owner to gain access.
         self.login("desdemona")
@@ -356,8 +358,10 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         self.assertEqual(
             mock_log.output,
             [
-                f"WARNING:zilencer.auth:Remote server {self.server.hostname} {str(self.server.uuid)[:12]} exceeded "
-                "rate limits on domain sends_email_by_remote_server"
+                (
+                    f"WARNING:zilencer.auth:Remote server {self.server.hostname} {str(self.server.uuid)[:12]} exceeded "
+                    "rate limits on domain sends_email_by_remote_server"
+                )
             ],
         )
 
@@ -713,8 +717,10 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         self.assertEqual(
             mock_logger.output,
             [
-                "INFO:corporate.stripe:Matching RemoteRealmBillingUser already exists for "
-                f"PreregistrationRemoteRealmBillingUser {second_prereg_user.id}"
+                (
+                    "INFO:corporate.stripe:Matching RemoteRealmBillingUser already exists for "
+                    f"PreregistrationRemoteRealmBillingUser {second_prereg_user.id}"
+                )
             ],
         )
 
@@ -897,8 +903,10 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         self.assertEqual(
             mock_warn.output,
             [
-                f"WARNING:zilencer.views:Failed to migrate customer from server (id: {remote_realm.server.id}) to realm (id: {remote_realm.id}): "
-                "RemoteRealm customer already exists and plans can't be migrated automatically."
+                (
+                    f"WARNING:zilencer.views:Failed to migrate customer from server (id: {remote_realm.server.id}) to realm (id: {remote_realm.id}): "
+                    "RemoteRealm customer already exists and plans can't be migrated automatically."
+                )
             ],
         )
         self.assert_json_error(
@@ -922,8 +930,10 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         self.assertEqual(
             mock_warn.output,
             [
-                f"WARNING:zilencer.views:Failed to migrate customer from server (id: {remote_realm.server.id}) to realm (id: {remote_realm.id}): "
-                "RemoteRealm customer already exists and plans can't be migrated automatically."
+                (
+                    f"WARNING:zilencer.views:Failed to migrate customer from server (id: {remote_realm.server.id}) to realm (id: {remote_realm.id}): "
+                    "RemoteRealm customer already exists and plans can't be migrated automatically."
+                )
             ],
         )
         self.assert_json_error(
@@ -947,8 +957,10 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         self.assertEqual(
             mock_warn.output,
             [
-                f"WARNING:zilencer.views:Failed to migrate customer from server (id: {remote_realm.server.id}) to realm (id: {remote_realm.id}): "
-                "RemoteRealm customer already exists and plans can't be migrated automatically."
+                (
+                    f"WARNING:zilencer.views:Failed to migrate customer from server (id: {remote_realm.server.id}) to realm (id: {remote_realm.id}): "
+                    "RemoteRealm customer already exists and plans can't be migrated automatically."
+                )
             ],
         )
         self.assert_json_error(
@@ -1001,7 +1013,6 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         # Add server to business plan.
         server_billing_session = RemoteServerBillingSession(self.server)
         server_customer = server_billing_session.update_or_create_customer(stripe_customer_id=None)
-        assert server_customer is not None
 
         # Just create a temporary plan and check if gets transferred or not.
         server_plan = CustomerPlan.objects.create(
@@ -1017,8 +1028,8 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
             plan=server_plan,
             is_renewal=True,
             event_time=timezone_now(),
-            licenses=initial_license_count,
-            licenses_at_next_renewal=initial_license_count,
+            workplace_licenses=initial_license_count,
+            workplace_licenses_at_next_renewal=initial_license_count,
         )
         self.server.plan_type = RemoteZulipServer.PLAN_TYPE_BUSINESS
         self.server.save(update_fields=["plan_type"])
@@ -1102,8 +1113,8 @@ class RemoteBillingAuthenticationTest(RemoteRealmBillingTestCase):
         billable_licenses = billing_session.get_billable_licenses_for_customer(customer, plan.tier)
         assert license_ledger is not None
         self.assertNotEqual(initial_license_count, billable_licenses)
-        self.assertEqual(license_ledger.licenses, initial_license_count)
-        self.assertEqual(license_ledger.licenses_at_next_renewal, billable_licenses)
+        self.assertEqual(license_ledger.workplace_licenses, initial_license_count)
+        self.assertEqual(license_ledger.workplace_licenses_at_next_renewal, billable_licenses)
         self.assertFalse(license_ledger.is_renewal)
 
     @responses.activate
@@ -1367,8 +1378,10 @@ class LegacyServerLoginTest(RemoteServerTestCase):
         self.assertEqual(
             mock_log.output,
             [
-                f"WARNING:zilencer.auth:Remote server {self.server.hostname} {str(self.server.uuid)[:12]} exceeded "
-                "rate limits on domain sends_email_by_remote_server"
+                (
+                    f"WARNING:zilencer.auth:Remote server {self.server.hostname} {str(self.server.uuid)[:12]} exceeded "
+                    "rate limits on domain sends_email_by_remote_server"
+                )
             ],
         )
 

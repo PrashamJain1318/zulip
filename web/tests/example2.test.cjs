@@ -46,9 +46,11 @@ const messages = {
         sender_id: isaac.user_id,
         stream_id: denmark_stream.stream_id,
         type: "stream",
+        content: "",
         flags: ["has_alert_word"],
         subject: "copenhagen",
         reactions: [],
+        submessages: [],
         // note we don't have every field that a "real" message
         // would have, and that can be fine
     },

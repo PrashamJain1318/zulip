@@ -15,6 +15,7 @@ from zerver.actions.streams import (
     do_set_stream_property,
 )
 from zerver.actions.user_groups import check_add_user_group
+from zerver.lib.event_types import StreamUpdateEvent
 from zerver.lib.message import has_message_access
 from zerver.lib.streams import (
     can_access_stream_metadata_user_ids,
@@ -26,6 +27,7 @@ from zerver.lib.topic import RESOLVED_TOPIC_PREFIX
 from zerver.lib.types import UserGroupMembersData
 from zerver.lib.url_encoding import stream_message_url
 from zerver.lib.user_groups import UserGroupMembershipDetails
+from zerver.lib.utils import assert_is_not_none
 from zerver.models import Message, NamedUserGroup, Stream, UserMessage, UserProfile
 from zerver.models.groups import SystemGroups
 from zerver.models.realms import get_realm
@@ -158,6 +160,34 @@ class MessageMoveStreamTest(ZulipTestCase):
         messages = get_topic_messages(user_profile, new_stream, "test")
         self.assert_length(messages, 0)
 
+    def test_move_message_to_same_channel_is_not_a_move(self) -> None:
+        user_profile = self.example_user("hamlet")
+        self.login_user(user_profile)
+        channel = get_stream("Denmark", user_profile.realm)
+
+        # Request moving message to the channel it's already in.
+        msg_id = self.send_stream_message(user_profile, channel.name, topic_name="topic1")
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {"stream_id": channel.id},
+        )
+        self.assert_json_error(result, "Nothing to change")
+
+        # Alongside a topic change, it is a plain topic edit; the edit
+        # history must not claim the channel changed.
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {"stream_id": channel.id, "topic": "topic2", "propagate_mode": "change_all"},
+        )
+        self.assert_json_success(result)
+        [edit_history_entry] = orjson.loads(
+            assert_is_not_none(Message.objects.get(id=msg_id).edit_history)
+        )
+        self.assertEqual(edit_history_entry["prev_topic"], "topic1")
+        self.assertEqual(edit_history_entry["topic"], "topic2")
+        self.assertNotIn("prev_stream", edit_history_entry)
+        self.assertNotIn("stream", edit_history_entry)
+
     def test_change_all_propagate_mode_for_moving_old_messages(self) -> None:
         user_profile = self.example_user("hamlet")
         realm = user_profile.realm
@@ -222,6 +252,26 @@ class MessageMoveStreamTest(ZulipTestCase):
                 result,
                 "You only have permission to move the 3/5 most recent messages in this topic.",
             )
+            # Check message count in old topic and/or stream.
+            messages = get_topic_messages(user_profile, old_stream, old_topic_name)
+            self.assert_length(messages, 5)
+
+            # Check message count in new topic and/or stream.
+            messages = get_topic_messages(user_profile, new_stream, new_topic_name)
+            self.assert_length(messages, 0)
+
+            # Using an older message (id2) for the request still reports
+            # how many recent messages can be moved, rather than rejecting
+            # outright.
+            result = self.client_patch(
+                f"/json/messages/{id2}",
+                params_dict,
+            )
+            self.assert_json_error(
+                result,
+                "You only have permission to move the 3/5 most recent messages in this topic.",
+            )
+
             # Check message count in old topic and/or stream.
             messages = get_topic_messages(user_profile, old_stream, old_topic_name)
             self.assert_length(messages, 5)
@@ -1021,6 +1071,7 @@ class MessageMoveStreamTest(ZulipTestCase):
             user: UserProfile,
             old_stream: Stream,
             new_stream: Stream,
+            propagate_mode: str = "change_all",
             *,
             expect_error_message: str | None = None,
         ) -> None:
@@ -1029,7 +1080,7 @@ class MessageMoveStreamTest(ZulipTestCase):
                 "/json/messages/" + str(msg_id),
                 {
                     "stream_id": new_stream.id,
-                    "propagate_mode": "change_all",
+                    "propagate_mode": propagate_mode,
                     "send_notification_to_new_thread": orjson.dumps(False).decode(),
                 },
             )
@@ -1056,6 +1107,14 @@ class MessageMoveStreamTest(ZulipTestCase):
             cordelia,
             test_stream_1,
             test_stream_2,
+            expect_error_message="You only have permission to move the 2/3 most recent messages in this topic.",
+        )
+
+        check_move_message_to_stream(
+            cordelia,
+            test_stream_1,
+            test_stream_2,
+            propagate_mode="change_one",
             expect_error_message="The time limit for editing this message's channel has passed",
         )
 
@@ -1563,7 +1622,7 @@ class MessageMoveStreamTest(ZulipTestCase):
             "iago", "test move stream", "new stream", "test"
         )
 
-        with self.assert_database_query_count(60), self.assert_memcached_count(17):
+        with self.assert_database_query_count(59), self.assert_memcached_count(19):
             result = self.client_patch(
                 f"/json/messages/{msg_id}",
                 {
@@ -2377,9 +2436,7 @@ class MessageMoveStreamTest(ZulipTestCase):
                 m.call_args.args,
                 (
                     new_stream.realm,
-                    dict(
-                        type="stream",
-                        op="update",
+                    StreamUpdateEvent(
                         property="is_recently_active",
                         value=False,
                         stream_id=new_stream.id,
@@ -2431,9 +2488,7 @@ class MessageMoveStreamTest(ZulipTestCase):
                 m.call_args.args,
                 (
                     new_stream.realm,
-                    dict(
-                        type="stream",
-                        op="update",
+                    StreamUpdateEvent(
                         property="is_recently_active",
                         value=False,
                         stream_id=new_stream.id,

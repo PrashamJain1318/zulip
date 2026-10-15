@@ -1,11 +1,15 @@
+import encodings.aliases
 import logging
 import re
 import secrets
+import sys
 from email.headerregistry import Address, AddressHeader
 from email.message import EmailMessage
+from email.utils import parseaddr
 from re import Match
 
 from django.conf import settings
+from django.db.models import Q
 from django.utils.translation import gettext as _
 from typing_extensions import override
 
@@ -22,9 +26,9 @@ from zerver.lib.email_mirror_helpers import (
     decode_email_address,
     get_email_gateway_message_string_from_address,
 )
-from zerver.lib.email_notifications import convert_html_to_markdown
 from zerver.lib.exceptions import JsonableError, RateLimitedError
 from zerver.lib.markdown import get_markdown_link_for_url
+from zerver.lib.markdown.from_html import convert_html_to_markdown
 from zerver.lib.message import normalize_body, truncate_content, truncate_topic
 from zerver.lib.rate_limiter import RateLimitedObject
 from zerver.lib.send_email import FromAddress
@@ -41,9 +45,19 @@ from zerver.models import (
     UserProfile,
 )
 from zerver.models.clients import get_client
+from zerver.models.constants import MAX_TOPIC_NAME_LENGTH
 from zerver.models.streams import StreamTopicsPolicyEnum, get_stream_by_id_in_realm
-from zerver.models.users import get_system_bot, get_user_profile_by_id
+from zerver.models.users import get_system_bot
 from zproject.backends import is_user_active
+
+if sys.version_info < (3, 14):  # nocoverage
+    # https://github.com/python/cpython/issues/62824
+    encodings.aliases.aliases.update(
+        {
+            "iso_8859_8_i": "iso8859_8",
+            "iso_8859_8_e": "iso8859_8",
+        }
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +139,6 @@ def get_usable_missed_message_address(address: str) -> MissedMessageEmailAddress
             "message",
             "message__sender",
             "message__recipient",
-            "message__sender__recipient",
         ).get(email_token=token)
     except MissedMessageEmailAddress.DoesNotExist:
         raise ZulipEmailForwardError("Zulip notification reply address is invalid.")
@@ -231,25 +244,23 @@ def send_mm_reply_to_stream(
 
 
 def get_message_part_by_type(message: EmailMessage, content_type: str) -> str | None:
-    charsets = message.get_charsets()
-
-    for idx, part in enumerate(message.walk()):
+    for part in message.walk():
         if part.get_content_type() == content_type:
             content = part.get_payload(decode=True)
             assert isinstance(content, bytes)
-            charset = charsets[idx]
-            if charset is not None:
-                try:
-                    return content.decode(charset, errors="ignore")
-                except LookupError:
-                    # The RFCs do not define how to handle unknown
-                    # charsets, but treating as US-ASCII seems
-                    # reasonable; fall through to below.
-                    pass
 
-            # If no charset has been specified in the header, assume us-ascii,
-            # by RFC6657: https://tools.ietf.org/html/rfc6657
-            return content.decode("us-ascii", errors="ignore")
+            charset = part.get_content_charset()
+            if charset is None:
+                # If no charset has been specified in the header, assume us-ascii,
+                # by RFC6657: https://tools.ietf.org/html/rfc6657
+                charset = "us-ascii"
+
+            try:
+                return content.decode(charset, errors="ignore")
+            except LookupError:
+                # The RFCs do not define how to handle unknown charsets,
+                # but treating as US-ASCII seems reasonable.
+                return content.decode("us-ascii", errors="ignore")
 
     return None
 
@@ -284,11 +295,11 @@ talon_initialized = False
 
 
 def extract_plaintext_body(message: EmailMessage, include_quotes: bool = False) -> str | None:
-    import talon_core
+    import talon
 
     global talon_initialized
     if not talon_initialized:
-        talon_core.init()
+        talon.init()
         talon_initialized = True
 
     plaintext_content = get_message_part_by_type(message, "text/plain")
@@ -296,17 +307,17 @@ def extract_plaintext_body(message: EmailMessage, include_quotes: bool = False) 
         if include_quotes:
             return plaintext_content
         else:
-            return talon_core.quotations.extract_from_plain(plaintext_content)
+            return talon.quotations.extract_from_plain(plaintext_content)
     else:
         return None
 
 
 def extract_html_body(message: EmailMessage, include_quotes: bool = False) -> str | None:
-    import talon_core
+    import talon
 
     global talon_initialized
     if not talon_initialized:  # nocoverage
-        talon_core.init()
+        talon.init()
         talon_initialized = True
 
     html_content = get_message_part_by_type(message, "text/html")
@@ -314,7 +325,7 @@ def extract_html_body(message: EmailMessage, include_quotes: bool = False) -> st
         if include_quotes:
             return convert_html_to_markdown(html_content)
         else:
-            return convert_html_to_markdown(talon_core.quotations.extract_from_html(html_content))
+            return convert_html_to_markdown(talon.quotations.extract_from_html(html_content))
     else:
         return None
 
@@ -392,7 +403,7 @@ def find_emailgateway_recipient(message: EmailMessage) -> str:
             if isinstance(header_value, AddressHeader):
                 emails = [addr.addr_spec for addr in header_value.addresses]
             else:
-                emails = [str(header_value)]
+                emails = [parseaddr(str(header_value))[1]]
 
             for email in emails:
                 if match_email_re.match(email):
@@ -428,6 +439,9 @@ def check_access_for_channel_email_address(channel_email_address: ChannelEmailAd
     else:
         user_for_access_check = sender
 
+    if not is_user_active(user_for_access_check):
+        raise JsonableError(_("Sending user is not active. Ignoring this channel message email."))
+
     # Raises JsonableError on permission denied
     access_stream_for_send_message(user_for_access_check, channel, forwarder_user_profile=None)
 
@@ -461,6 +475,9 @@ def process_stream_message(to: str, message: EmailMessage) -> None:
     else:
         topic = subject
 
+    if len(subject) > MAX_TOPIC_NAME_LENGTH:
+        options["subject_in_body"] = True
+
     body = construct_zulip_body(message, subject, realm, sender=sender, **options)
     send_zulip(sender, channel, topic, body)
     logger.info(
@@ -481,12 +498,7 @@ def process_missed_message(to: str, message: EmailMessage) -> None:
 
     user_profile = mm_address.user_profile
     topic_name = mm_address.message.topic_name()
-
-    if mm_address.message.recipient.type == Recipient.PERSONAL:
-        # We need to reply to the sender so look up their personal recipient_id
-        recipient = mm_address.message.sender.recipient
-    else:
-        recipient = mm_address.message.recipient
+    recipient = mm_address.message.recipient
 
     if not is_user_active(user_profile):
         logger.warning("Sending user is not active. Ignoring this message notification email.")
@@ -494,19 +506,31 @@ def process_missed_message(to: str, message: EmailMessage) -> None:
 
     body = construct_zulip_body(message, topic_name, user_profile.realm, sender=user_profile)
 
-    assert recipient is not None
     if recipient.type == Recipient.STREAM:
         stream = get_stream_by_id_in_realm(recipient.type_id, user_profile.realm)
         send_mm_reply_to_stream(user_profile, stream, topic_name, body)
         recipient_str = stream.name
-    elif recipient.type == Recipient.PERSONAL:
-        recipient_user_id = recipient.type_id
-        recipient_user = get_user_profile_by_id(recipient_user_id)
-        recipient_str = recipient_user.email
-        internal_send_private_message(user_profile, recipient_user, body)
     elif recipient.type == Recipient.DIRECT_MESSAGE_GROUP:
         display_recipient = get_display_recipient(recipient)
-        emails = [user_dict["email"] for user_dict in display_recipient]
+        # Drop members who have been deactivated, matching the check in
+        # validate_recipient_user_profiles. The web app blocks composing
+        # to such a group entirely, but the email gateway can receive
+        # replies to notification emails that predate the deactivation.
+        user_ids = [user_dict["id"] for user_dict in display_recipient]
+        emails = list(
+            UserProfile.objects.filter(id__in=user_ids)
+            .filter(Q(is_active=True) | Q(is_mirror_dummy=True))
+            .values_list("email", flat=True)
+        )
+        if len(emails) <= 1:
+            # Everyone but the sender (whom we verified active above)
+            # has been deactivated; there is nobody left to receive
+            # the reply.
+            logger.info(
+                "Dropping message notification email reply from user %s to a group direct message with no active recipients",
+                user_profile.id,
+            )
+            return
         recipient_str = ", ".join(emails)
         internal_send_group_direct_message(user_profile.realm, user_profile, body, emails=emails)
     else:
@@ -542,6 +566,10 @@ def process_message(message: EmailMessage, rcpt_to: str | None = None) -> None:
 def validate_to_address(address: str, rate_limit: bool = True) -> None:
     if is_missed_message_address(address):
         mm_address = get_usable_missed_message_address(address)
+        if not is_user_active(mm_address.user_profile):
+            raise JsonableError(
+                _("Sending user is not active. Ignoring this message notification email.")
+            )
         if mm_address.message.recipient.type == Recipient.STREAM:
             # ACL's on DMs are harder to apply simply, so we
             # just check channel messages.

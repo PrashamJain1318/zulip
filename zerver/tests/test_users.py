@@ -15,6 +15,7 @@ from django.utils.timezone import now as timezone_now
 from confirmation.models import Confirmation
 from corporate.lib.stripe import get_latest_seat_count
 from zerver.actions.create_user import do_create_user, do_reactivate_user
+from zerver.actions.custom_profile_fields import do_update_user_custom_profile_data_if_changed
 from zerver.actions.invites import do_create_multiuse_invite_link, do_invite_users
 from zerver.actions.message_send import RecipientInfoResult, get_recipient_info
 from zerver.actions.muted_users import do_mute_user
@@ -24,6 +25,7 @@ from zerver.actions.realm_settings import (
 )
 from zerver.actions.user_settings import (
     bulk_regenerate_api_keys,
+    do_change_avatar_fields,
     do_change_full_name,
     do_change_user_setting,
 )
@@ -50,16 +52,21 @@ from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import (
     get_subscription,
     get_test_image_file,
+    get_user_sent_message_ids,
     most_recent_message,
     reset_email_visibility_to_everyone_in_zulip_realm,
     simulated_empty_cache,
 )
+from zerver.lib.types import Invitee
 from zerver.lib.upload import upload_avatar_image
 from zerver.lib.user_groups import get_system_user_group_for_user
 from zerver.lib.users import (
     Account,
     access_user_by_id,
     access_user_by_id_including_cross_realm,
+    bulk_get_subscribers_of_target_user_subscriptions,
+    check_can_access_user,
+    get_accessible_user_ids,
     get_accounts_for_email,
     get_cross_realm_dicts,
     get_inaccessible_user_ids,
@@ -232,8 +239,8 @@ class PermissionTest(ZulipTestCase):
             "Your organization does not have enough Zulip licenses to change a guest user's role.",
         )
 
-        ledger.licenses = get_latest_seat_count(desdemona.realm) + 1
-        ledger.save(update_fields=["licenses"])
+        ledger.workplace_licenses = get_latest_seat_count(desdemona.realm) + 1
+        ledger.save(update_fields=["workplace_licenses"])
         with self.settings(BILLING_ENABLED=True):
             result = self.client_patch(f"/json/users/{polonius.id}", req)
         self.assert_json_error(
@@ -241,8 +248,8 @@ class PermissionTest(ZulipTestCase):
             "Your organization does not have enough Zulip licenses to change a guest user's role.",
         )
 
-        ledger.licenses_at_next_renewal = get_latest_seat_count(desdemona.realm) + 1
-        ledger.save(update_fields=["licenses_at_next_renewal"])
+        ledger.workplace_licenses_at_next_renewal = get_latest_seat_count(desdemona.realm) + 1
+        ledger.save(update_fields=["workplace_licenses_at_next_renewal"])
         with self.settings(BILLING_ENABLED=True):
             result = self.client_patch(f"/json/users/{polonius.id}", req)
         self.assert_json_success(result)
@@ -360,6 +367,9 @@ class PermissionTest(ZulipTestCase):
         admin = self.example_user("iago")
         self.login_user(user)
 
+        do_change_avatar_fields(user, UserProfile.AVATAR_FROM_GRAVATAR, acting_user=None)
+        self.assertEqual(user.avatar_source, UserProfile.AVATAR_FROM_GRAVATAR)
+
         # First, verify client_gravatar works normally
         result = self.client_get("/json/users", {"client_gravatar": "true"})
         members = self.assert_json_success(result)["members"]
@@ -392,7 +402,8 @@ class PermissionTest(ZulipTestCase):
         hamlet = find_dict(members, "user_id", user.id)
         self.assertEqual(hamlet["email"], f"user{user.id}@zulip.testserver")
         self.assertEqual(
-            hamlet["avatar_url"], get_gravatar_url(user.delivery_email, 1, get_realm("zulip").id)
+            hamlet["avatar_url"],
+            get_gravatar_url(user.delivery_email, user.avatar_version, get_realm("zulip").id),
         )
 
         # client_gravatar is still turned off for admins.  In theory,
@@ -407,7 +418,8 @@ class PermissionTest(ZulipTestCase):
         hamlet = find_dict(members, "user_id", user.id)
         self.assertEqual(hamlet["email"], f"user{user.id}@zulip.testserver")
         self.assertEqual(
-            hamlet["avatar_url"], get_gravatar_url(user.delivery_email, 1, get_realm("zulip").id)
+            hamlet["avatar_url"],
+            get_gravatar_url(user.delivery_email, user.avatar_version, get_realm("zulip").id),
         )
         self.assertEqual(hamlet["delivery_email"], self.example_email("hamlet"))
 
@@ -431,7 +443,12 @@ class PermissionTest(ZulipTestCase):
 
         # Check that notification was sent
         message = most_recent_message(hamlet)
-        self.assertEqual(message.recipient.type_id, hamlet.id)
+        self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+
+        notification_bot = get_system_bot(settings.NOTIFICATION_BOT, hamlet.realm.id)
+        dm_group_recipient = self.get_dm_group_recipient(notification_bot, hamlet)
+        self.assertEqual(message.recipient, dm_group_recipient)
+
         self.assertIn(
             f"{silent_mention_syntax_for_user(iago)} has made the following changes to your account.",
             message.content,
@@ -467,6 +484,11 @@ class PermissionTest(ZulipTestCase):
         new_name = "iago|72"
         self.login("iago")
         req = dict(full_name=new_name)
+        result = self.client_patch("/json/users/{}".format(self.example_user("hamlet").id), req)
+        self.assert_json_error(result, "Invalid format!")
+
+        # Trailing whitespace should not bypass the pipe-digit check
+        req = dict(full_name="iago|72 ")
         result = self.client_patch("/json/users/{}".format(self.example_user("hamlet").id), req)
         self.assert_json_error(result, "Invalid format!")
 
@@ -545,14 +567,14 @@ class PermissionTest(ZulipTestCase):
 
         # Must be a valid user ID in the realm
         with self.assertRaises(JsonableError):
-            access_user_by_id(iago, 1234, for_admin=False)
+            access_user_by_id(iago, 1234, allow_bots=False, for_admin=False)
         with self.assertRaises(JsonableError):
-            access_user_by_id_including_cross_realm(iago, 1234, for_admin=False)
+            access_user_by_id_including_cross_realm(iago, 1234, allow_bots=False, for_admin=False)
         with self.assertRaises(JsonableError):
-            access_user_by_id(iago, self.mit_user("sipbtest").id, for_admin=False)
+            access_user_by_id(iago, self.mit_user("sipbtest").id, allow_bots=False, for_admin=False)
         with self.assertRaises(JsonableError):
             access_user_by_id_including_cross_realm(
-                iago, self.mit_user("sipbtest").id, for_admin=False
+                iago, self.mit_user("sipbtest").id, allow_bots=False, for_admin=False
             )
 
         # Can only access bot users if allow_bots is passed
@@ -560,9 +582,9 @@ class PermissionTest(ZulipTestCase):
         access_user_by_id(iago, bot.id, allow_bots=True, for_admin=True)
         access_user_by_id_including_cross_realm(iago, bot.id, allow_bots=True, for_admin=True)
         with self.assertRaises(JsonableError):
-            access_user_by_id(iago, bot.id, for_admin=True)
+            access_user_by_id(iago, bot.id, allow_bots=False, for_admin=True)
         with self.assertRaises(JsonableError):
-            access_user_by_id_including_cross_realm(iago, bot.id, for_admin=True)
+            access_user_by_id_including_cross_realm(iago, bot.id, allow_bots=False, for_admin=True)
 
         # Only the including_cross_realm variant works for system bots.
         system_bot = get_system_bot(settings.WELCOME_BOT, internal_realm.id)
@@ -573,52 +595,66 @@ class PermissionTest(ZulipTestCase):
         )
         # And even then, only if `allow_bots` was passed.
         with self.assertRaises(JsonableError):
-            access_user_by_id(iago, system_bot.id, for_admin=False)
+            access_user_by_id(iago, system_bot.id, allow_bots=False, for_admin=False)
         with self.assertRaises(JsonableError):
-            access_user_by_id_including_cross_realm(iago, system_bot.id, for_admin=False)
+            access_user_by_id_including_cross_realm(
+                iago, system_bot.id, allow_bots=False, for_admin=False
+            )
 
         # Can only access deactivated users if allow_deactivated is passed
         hamlet = self.example_user("hamlet")
         do_deactivate_user(hamlet, acting_user=None)
         with self.assertRaises(JsonableError):
-            access_user_by_id(iago, hamlet.id, for_admin=False)
+            access_user_by_id(iago, hamlet.id, allow_bots=False, for_admin=False)
         with self.assertRaises(JsonableError):
-            access_user_by_id_including_cross_realm(iago, hamlet.id, for_admin=False)
+            access_user_by_id_including_cross_realm(
+                iago, hamlet.id, allow_bots=False, for_admin=False
+            )
 
         with self.assertRaises(JsonableError):
-            access_user_by_id(iago, hamlet.id, for_admin=True)
+            access_user_by_id(iago, hamlet.id, allow_bots=False, for_admin=True)
         with self.assertRaises(JsonableError):
-            access_user_by_id_including_cross_realm(iago, hamlet.id, for_admin=True)
-        access_user_by_id(iago, hamlet.id, allow_deactivated=True, for_admin=True)
+            access_user_by_id_including_cross_realm(
+                iago, hamlet.id, allow_bots=False, for_admin=True
+            )
+        access_user_by_id(iago, hamlet.id, allow_bots=False, allow_deactivated=True, for_admin=True)
         access_user_by_id_including_cross_realm(
-            iago, hamlet.id, allow_deactivated=True, for_admin=True
+            iago, hamlet.id, allow_bots=False, allow_deactivated=True, for_admin=True
         )
 
         # Non-admin user can't admin another user
         with self.assertRaises(JsonableError):
             access_user_by_id(
-                self.example_user("cordelia"), self.example_user("aaron").id, for_admin=True
+                self.example_user("cordelia"),
+                self.example_user("aaron").id,
+                allow_bots=False,
+                for_admin=True,
             )
         with self.assertRaises(JsonableError):
             access_user_by_id_including_cross_realm(
-                self.example_user("cordelia"), self.example_user("aaron").id, for_admin=True
+                self.example_user("cordelia"),
+                self.example_user("aaron").id,
+                allow_bots=False,
+                for_admin=True,
             )
 
         # But does have read-only access to it.
         access_user_by_id(
-            self.example_user("cordelia"), self.example_user("aaron").id, for_admin=False
+            self.example_user("cordelia"),
+            self.example_user("aaron").id,
+            allow_bots=False,
+            for_admin=False,
         )
         access_user_by_id_including_cross_realm(
-            self.example_user("cordelia"), self.example_user("aaron").id, for_admin=False
+            self.example_user("cordelia"),
+            self.example_user("aaron").id,
+            allow_bots=False,
+            for_admin=False,
         )
 
-    def test_access_user_by_id_when_personal_recipient_is_none(self) -> None:
+    def test_access_user_by_id_with_null_recipient(self) -> None:
         self.set_up_db_for_testing_user_access()
         polonius = self.example_user("polonius")
-
-        # Removing the personal recipient to ensure a new direct message group is used for 1:1 dms.
-        polonius.recipient = None
-        polonius.save()
 
         # Restricting the "Members" system group to not allow access to all users.
         realm = get_realm("zulip")
@@ -628,12 +664,12 @@ class PermissionTest(ZulipTestCase):
         )
 
         aaron = self.example_user("aaron")
-        target_user = access_user_by_id(polonius, aaron.id, for_admin=False)
+        target_user = access_user_by_id(polonius, aaron.id, allow_bots=False, for_admin=False)
         self.assertEqual(target_user, aaron)
 
         othello = self.example_user("othello")
         with self.assertRaises(JsonableError):
-            access_user_by_id(polonius, othello.id, for_admin=False)
+            access_user_by_id(polonius, othello.id, allow_bots=False, for_admin=False)
 
     def check_property_for_role(self, user_profile: UserProfile, role: int) -> bool:
         if role == UserProfile.ROLE_REALM_ADMINISTRATOR:
@@ -745,7 +781,12 @@ class PermissionTest(ZulipTestCase):
 
         # Test notification is sent
         message = most_recent_message(user_profile)
-        self.assertEqual(message.recipient.type_id, user_profile.id)
+        self.assertEqual(message.recipient.type, Recipient.DIRECT_MESSAGE_GROUP)
+
+        notification_bot = get_system_bot(settings.NOTIFICATION_BOT, user_profile.realm_id)
+        dm_group_recipient = self.get_dm_group_recipient(notification_bot, user_profile)
+        self.assertEqual(message.recipient, dm_group_recipient)
+
         self.assertIn(
             f"{silent_mention_syntax_for_user(admin)} has made the following changes to your account.",
             message.content,
@@ -965,7 +1006,7 @@ class PermissionTest(ZulipTestCase):
         empty_profile_data = []
         for field_name in fields:
             field = CustomProfileField.objects.get(name=field_name, realm=realm)
-            value: str | None | list[Any] = ""
+            value: str | list[Any] | None = ""
             if field.field_type == CustomProfileField.USER:
                 value = []
             empty_profile_data.append(
@@ -1076,7 +1117,7 @@ class PermissionTest(ZulipTestCase):
 
 
 class QueryCountTest(ZulipTestCase):
-    def test_create_user_with_multiple_streams(self) -> None:
+    def test_create_user_with_multiple_streams_with_direct_message_group(self) -> None:
         # add_new_user_history needs messages to be current
         Message.objects.all().update(date_sent=timezone_now())
 
@@ -1104,7 +1145,7 @@ class QueryCountTest(ZulipTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             do_invite_users(
                 user_profile=self.example_user("hamlet"),
-                invitee_emails=["fred@zulip.com"],
+                invitees=[Invitee(email="fred@zulip.com")],
                 streams=streams,
                 include_realm_default_subscriptions=False,
                 invite_expires_in_minutes=invite_expires_in_minutes,
@@ -1113,8 +1154,8 @@ class QueryCountTest(ZulipTestCase):
         prereg_user = PreregistrationUser.objects.get(email="fred@zulip.com")
 
         with (
-            self.assert_database_query_count(86),
-            self.assert_memcached_count(23),
+            self.assert_database_query_count(95),
+            self.assert_memcached_count(24),
             self.capture_send_event_calls(expected_num_events=11) as events,
         ):
             fred = do_create_user(
@@ -1436,11 +1477,6 @@ class AdminCreateUserTest(ZulipTestCase):
         # Make sure the new user got the realm's default language
         self.assertEqual(new_user.default_language, "ja")
 
-        # Make sure the recipient field is set correctly.
-        self.assertEqual(
-            new_user.recipient, Recipient.objects.get(type=Recipient.PERSONAL, type_id=new_user.id)
-        )
-
         # we can't create the same user twice.
         result = self.client_post("/json/users", valid_params)
         self.assert_json_error(result, "Email is already in use.")
@@ -1472,6 +1508,24 @@ class AdminCreateUserTest(ZulipTestCase):
 
         valid_params["email"] = "iago+label@zulip.com"
         result = self.client_post("/json/users", valid_params)
+        self.assert_json_success(result)
+
+        # Test require_unique_names.
+        do_set_realm_property(realm, "require_unique_names", True, acting_user=None)
+        params = dict(
+            email="same-name@zulip.net",
+            password="xxxx",
+            full_name=admin.full_name,
+        )
+        result = self.client_post("/json/users", params)
+        self.assert_json_error(result, "Unique names required in this organization.")
+
+        params["full_name"] = self.example_user("iago").full_name
+        result = self.client_post("/json/users", params)
+        self.assert_json_error(result, "Unique names required in this organization.")
+
+        params["full_name"] = "Iago new"
+        result = self.client_post("/json/users", params)
         self.assert_json_success(result)
 
 
@@ -1682,7 +1736,7 @@ class UserProfileTest(ZulipTestCase):
 
         # Upload cordelia's avatar
         with get_test_image_file("img.png") as image_file:
-            upload_avatar_image(image_file, cordelia, future=False)
+            upload_avatar_image(image_file, cordelia, content_type="image/png", future=False)
 
         OnboardingStep.objects.filter(user=cordelia).delete()
         OnboardingStep.objects.filter(user=iago).delete()
@@ -1690,7 +1744,7 @@ class UserProfileTest(ZulipTestCase):
         for onboarding_step in onboarding_steps_completed:
             OnboardingStep.objects.create(user=cordelia, onboarding_step=onboarding_step)
 
-        # Check that we didn't send an realm_user update events to
+        # Check that we didn't send any realm_user update events to
         # users; this work is happening before the user account is
         # created, so any changes will be reflected in the "add" event
         # introducing the user to clients.
@@ -1748,7 +1802,7 @@ class UserProfileTest(ZulipTestCase):
         realm_user_default.enter_sends = True
         realm_user_default.save()
 
-        # Check that we didn't send an realm_user update events to
+        # Check that we didn't send any realm_user update events to
         # users; this work is happening before the user account is
         # created, so any changes will be reflected in the "add" event
         # introducing the user to clients.
@@ -1774,7 +1828,7 @@ class UserProfileTest(ZulipTestCase):
         self.assertEqual(cross_realm_bot.email, bot.email)
         self.assertEqual(cross_realm_bot.id, bot.id)
 
-        # Pass in the ID of a cross-realm bot but with a invalid realm,
+        # Pass in the ID of a cross-realm bot but with an invalid realm,
         # note that the realm should be irrelevant here
         cross_realm_bot = get_user_by_id_in_realm_including_cross_realm(bot.id, None)
         self.assertEqual(cross_realm_bot.email, bot.email)
@@ -1955,7 +2009,7 @@ class UserProfileTest(ZulipTestCase):
         # Test case when guest cannot access all users in the realm.
         self.set_up_db_for_testing_user_access()
         cordelia = self.example_user("cordelia")
-        with self.assert_database_query_count(7):
+        with self.assert_database_query_count(6):
             result = self.api_get(polonius, f"/api/v1/users/{cordelia.id}/channels")
         self.assert_json_error(result, "Insufficient permission")
 
@@ -2169,7 +2223,7 @@ class ActivateTest(ZulipTestCase):
         desdemona.is_mirror_dummy = True
         desdemona.save(update_fields=["is_mirror_dummy"])
 
-        # Cannot deactivate a user which is marked as "mirror dummy" from importing
+        # Cannot reactivate a user which is marked as "mirror dummy" from importing
         result = self.client_post(f"/json/users/{desdemona.id}/reactivate")
         self.assert_json_error(
             result, "Cannot activate a placeholder account; ask the user to sign up, instead."
@@ -2202,7 +2256,7 @@ class ActivateTest(ZulipTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             do_invite_users(
                 iago,
-                ["new1@zulip.com", "new2@zulip.com"],
+                [Invitee(email="new1@zulip.com"), Invitee(email="new2@zulip.com")],
                 [],
                 include_realm_default_subscriptions=False,
                 invite_expires_in_minutes=invite_expires_in_minutes,
@@ -2210,7 +2264,7 @@ class ActivateTest(ZulipTestCase):
             )
             do_invite_users(
                 desdemona,
-                ["new3@zulip.com", "new4@zulip.com"],
+                [Invitee(email="new3@zulip.com"), Invitee(email="new4@zulip.com")],
                 [],
                 include_realm_default_subscriptions=False,
                 invite_expires_in_minutes=invite_expires_in_minutes,
@@ -2219,7 +2273,7 @@ class ActivateTest(ZulipTestCase):
 
             do_invite_users(
                 iago,
-                ["new5@zulip.com"],
+                [Invitee(email="new5@zulip.com")],
                 [],
                 include_realm_default_subscriptions=False,
                 invite_expires_in_minutes=None,
@@ -2227,7 +2281,7 @@ class ActivateTest(ZulipTestCase):
             )
             do_invite_users(
                 desdemona,
-                ["new6@zulip.com"],
+                [Invitee(email="new6@zulip.com")],
                 [],
                 include_realm_default_subscriptions=False,
                 invite_expires_in_minutes=None,
@@ -2379,7 +2433,7 @@ class ActivateTest(ZulipTestCase):
             ScheduledEmail.objects.filter(users__in=[hamlet, iago]).distinct().count(), 1
         )
         email = ScheduledEmail.objects.all().first()
-        assert email is not None and email.users is not None
+        assert email is not None
         self.assertEqual(email.users.count(), 2)
 
     def test_clear_schedule_emails(self) -> None:
@@ -2452,12 +2506,374 @@ class ActivateTest(ZulipTestCase):
         self.assertEqual(
             info_log.output,
             [
-                f"WARNING:zulip.send_email:ScheduledEmail {email_id} at {scheduled_at} "
-                "had empty users and address attributes: "
-                "{'template_prefix': 'zerver/emails/onboarding_zulip_topics', 'from_name': None, "
-                "'from_address': None, 'language': None, 'context': {}}"
+                (
+                    f"WARNING:zulip.send_email:ScheduledEmail {email_id} at {scheduled_at} "
+                    "had empty users and address attributes: "
+                    "{'template_prefix': 'zerver/emails/onboarding_zulip_topics', 'from_name': None, "
+                    "'from_address': None, 'language': None, 'context': {}}"
+                )
             ],
         )
+
+    def test_no_exception_for_profile_update_notification_to_deactivated_user(self) -> None:
+        hamlet = self.example_user("hamlet")
+        do_deactivate_user(hamlet, acting_user=None)
+        self.assertFalse(hamlet.is_active)
+
+        new_name = "spammer"
+        self.login("iago")
+        hamlet = self.example_user("hamlet")
+        req = dict(full_name=new_name)
+        result = self.client_patch(f"/json/users/{hamlet.id}", req)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.full_name, new_name)
+
+
+class DeactivateActionsTest(ZulipTestCase):
+    # Helper for setting up various types of messages.
+    def setup_user_with_messages(
+        self, user: UserProfile, admin: UserProfile
+    ) -> tuple[list[int], list[int], list[int]]:
+        msg_id_1 = self.send_personal_message(user, admin, content="private message 1")
+        # Sending dm to a different user.
+        msg_id_2 = self.send_personal_message(
+            user, self.example_user("aaron"), content="private message 2"
+        )
+        # Me message
+        msg_id_3 = self.send_personal_message(user, user, content="private message 3")
+        personal_msg_ids = [msg_id_1, msg_id_2, msg_id_3]
+
+        msg_id_1 = self.send_stream_message(
+            user, "Verona", topic_name="topic1", content="channel message 1"
+        )
+        msg_id_2 = self.send_stream_message(
+            user, "Verona", topic_name="topic1", content="channel message 2"
+        )
+        msg_id_3 = self.send_stream_message(user, "Verona", topic_name="topic2")
+        msg_id_4 = self.send_stream_message(user, "Verona")
+        public_channel_msg_ids = [msg_id_1, msg_id_2, msg_id_3, msg_id_4]
+
+        private_channel = self.make_stream("private_channel", invite_only=True)
+        self.subscribe(user, private_channel.name)
+        msg_id_1 = self.send_stream_message(
+            user, private_channel.name, topic_name="topic1", content="private channel message 1"
+        )
+        msg_id_2 = self.send_stream_message(
+            user, private_channel.name, topic_name="topic2", content="private channel message 2"
+        )
+        private_channel_msg_ids = [msg_id_1, msg_id_2]
+
+        return (personal_msg_ids, public_channel_msg_ids, private_channel_msg_ids)
+
+    def test_permission_to_delete_messages_when_deactivating_user(self) -> None:
+        admin = self.example_user("iago")
+        owner = self.example_user("desdemona")
+        cordelia = self.example_user("cordelia")
+        aaron = self.example_user("aaron")
+
+        owner_group = NamedUserGroup.objects.get(
+            name=SystemGroups.OWNERS, realm=admin.realm, is_system_group=True
+        )
+
+        do_change_realm_permission_group_setting(
+            admin.realm, "can_delete_any_message_group", owner_group, acting_user=None
+        )
+
+        # Non-owner users do not have permission to delete anyone's messages.
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{cordelia.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_public_channel_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_error(result, "User is not allowed to delete other user's messages.")
+
+        # Admin can still delete the deactivated user's profile.
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{cordelia.id}",
+            {
+                "actions": orjson.dumps({"delete_profile": True}).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        cordelia.refresh_from_db()
+        self.assertFalse(cordelia.is_active)
+
+        # Owner have permission to delete anyone's messages.
+        result = self.api_delete(
+            owner,
+            f"/api/v1/users/{aaron.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_public_channel_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        aaron.refresh_from_db()
+        self.assertFalse(aaron.is_active)
+
+    def test_deactivation_without_deleting_messages(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        self.setup_user_with_messages(user, admin)
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+        # Test with all actions explicitly set to False
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_public_channel_messages": False,
+                        "delete_private_channel_messages": False,
+                        "delete_direct_messages": False,
+                    }
+                ).decode(),
+            },
+        )
+
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+        do_reactivate_user(user, acting_user=admin)
+
+        result = self.api_delete(admin, f"/api/v1/users/{user.id}")
+
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+    def test_deactivation_with_deleting_public_channel_messages(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        (dm_msg_ids, _, private_channel_msg_ids) = self.setup_user_with_messages(user, admin)
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_public_channel_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        # 4 public channel messages were deleted; 2 private channel messages the 3 DMs remain.
+        self.assert_length(user_message_ids, 5)
+        self.assertCountEqual(user_message_ids, [*dm_msg_ids, *private_channel_msg_ids])
+
+    def test_deactivation_with_deleting_private_channel_messages(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        (dm_msg_ids, public_channel_msg_ids, _) = self.setup_user_with_messages(user, admin)
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_private_channel_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        # 2 private channel messages deleted out of 9 messages.
+        self.assert_length(user_message_ids, 7)
+        self.assertCountEqual(user_message_ids, [*public_channel_msg_ids, *dm_msg_ids])
+
+    def test_deactivation_with_deleting_direct_messages(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        hamlet = self.example_user("hamlet")
+
+        (_, public_channel_msg_ids, private_channel_msg_ids) = self.setup_user_with_messages(
+            user, admin
+        )
+
+        self.send_group_direct_message(user, [admin, hamlet], content="group dm message 1")
+        self.send_group_direct_message(user, [admin, hamlet], content="group dm message 2")
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 11)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_direct_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 6)
+        self.assertCountEqual(user_message_ids, [*public_channel_msg_ids, *private_channel_msg_ids])
+
+    def test_deactivation_with_deleting_all_channel_messages(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        (dm_msg_ids, _, _) = self.setup_user_with_messages(user, admin)
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_public_channel_messages": True,
+                        "delete_private_channel_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        # Only 3 direct messages remain out of 9 messages.
+        self.assert_length(user_message_ids, 3)
+        self.assertCountEqual(user_message_ids, dm_msg_ids)
+
+    def test_deactivation_with_deleting_all_messages(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        self.setup_user_with_messages(user, admin)
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 9)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_public_channel_messages": True,
+                        "delete_private_channel_messages": True,
+                        "delete_direct_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 0)
+
+    def test_deactivation_with_no_messages_to_delete(self) -> None:
+        """Test that deactivation works when there are no messages matching the deletion criteria."""
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+
+        self.send_stream_message(user, "Verona", content="channel message only")
+
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 1)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps(
+                    {
+                        "delete_direct_messages": True,
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        user_message_ids = get_user_sent_message_ids(user)
+        self.assert_length(user_message_ids, 1)
+
+    def test_name_and_avatar_change_on_deactiation(self) -> None:
+        admin = self.example_user("iago")
+        user = self.example_user("cordelia")
+        self.assertNotEqual(user.full_name, "Deleted user")
+
+        user.avatar_source = UserProfile.AVATAR_FROM_USER
+        user.save(update_fields=["avatar_source"])
+        self.assertEqual(user.avatar_source, UserProfile.AVATAR_FROM_USER)
+
+        bot = do_create_user(
+            email="bot@zulip.com",
+            password="",
+            realm=user.realm,
+            full_name="Bot 1",
+            bot_type=UserProfile.DEFAULT_BOT,
+            bot_owner=user,
+            acting_user=user,
+        )
+        self.assertNotEqual(bot.full_name, "Deactivated bot")
+
+        bot.avatar_source = UserProfile.AVATAR_FROM_USER
+        bot.save(update_fields=["avatar_source"])
+        self.assertEqual(bot.avatar_source, UserProfile.AVATAR_FROM_USER)
+
+        result = self.api_delete(
+            admin,
+            f"/api/v1/users/{user.id}",
+            {
+                "actions": orjson.dumps({"delete_profile": True}).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        user.refresh_from_db()
+        bot.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertFalse(bot.is_active)
+
+        self.assertEqual(user.full_name, "Deleted user")
+        self.assertEqual(user.avatar_source, UserProfile.AVATAR_FROM_GRAVATAR)
+        self.assertGreater(user.avatar_version, 0)
+
+        self.assertEqual(bot.full_name, "Deactivated bot")
+        self.assertEqual(bot.avatar_source, UserProfile.AVATAR_FROM_GRAVATAR)
+        self.assertGreater(bot.avatar_version, 0)
 
 
 class RecipientInfoTest(ZulipTestCase):
@@ -2519,7 +2935,7 @@ class RecipientInfoTest(ZulipTestCase):
             um_eligible_user_ids=all_user_ids,
             long_term_idle_user_ids=set(),
             default_bot_user_ids=set(),
-            service_bot_tuples=[],
+            message_triggered_bot_tuples=[],
             all_bot_user_ids=set(),
             topic_participant_user_ids=set(),
             sender_muted_stream=False,
@@ -2742,9 +3158,9 @@ class RecipientInfoTest(ZulipTestCase):
         self.assertEqual(info.stream_push_user_ids, set())
         self.assertEqual(info.stream_wildcard_mention_user_ids, {othello.id})
 
-        # Add a service bot.
-        service_bot = do_create_user(
-            email="service-bot@zulip.com",
+        # Add a message-triggered bot.
+        message_triggered_bot = do_create_user(
+            email="message-triggered-bot@zulip.com",
             password="",
             realm=realm,
             full_name="",
@@ -2757,12 +3173,12 @@ class RecipientInfoTest(ZulipTestCase):
             recipient=recipient,
             sender_id=hamlet.id,
             stream_topic=stream_topic,
-            possibly_mentioned_user_ids={service_bot.id},
+            possibly_mentioned_user_ids={message_triggered_bot.id},
         )
         self.assertEqual(
-            info.service_bot_tuples,
+            info.message_triggered_bot_tuples,
             [
-                (service_bot.id, UserProfile.EMBEDDED_BOT),
+                (message_triggered_bot.id, UserProfile.EMBEDDED_BOT),
             ],
         )
 
@@ -2781,10 +3197,10 @@ class RecipientInfoTest(ZulipTestCase):
             recipient=recipient,
             sender_id=hamlet.id,
             stream_topic=stream_topic,
-            possibly_mentioned_user_ids={service_bot.id, normal_bot.id},
+            possibly_mentioned_user_ids={message_triggered_bot.id, normal_bot.id},
         )
         self.assertEqual(info.default_bot_user_ids, {normal_bot.id})
-        self.assertEqual(info.all_bot_user_ids, {normal_bot.id, service_bot.id})
+        self.assertEqual(info.all_bot_user_ids, {normal_bot.id, message_triggered_bot.id})
 
         # Now Hamlet follows the topic with the 'followed_topic_email_notifications',
         # 'followed_topic_push_notifications' and 'followed_topic_wildcard_mention_notify'
@@ -2865,6 +3281,8 @@ class BulkUsersTest(ZulipTestCase):
         self.login("cordelia")
 
         hamlet = self.example_user("hamlet")
+        do_change_avatar_fields(hamlet, UserProfile.AVATAR_FROM_GRAVATAR, acting_user=None)
+        self.assertEqual(hamlet.avatar_source, UserProfile.AVATAR_FROM_GRAVATAR)
 
         def get_hamlet_avatar(client_gravatar: bool) -> str | None:
             data = dict(client_gravatar=orjson.dumps(client_gravatar).decode())
@@ -2903,6 +3321,41 @@ class GetProfileTest(ZulipTestCase):
 
         self.assert_length(cache_queries, 1)
         self.assertEqual(user_profile.email, email)
+
+    def test_cache_behavior_after_email_address_visibility_change(self) -> None:
+        hamlet = self.example_user("hamlet")
+        realm = hamlet.realm
+        do_change_user_setting(
+            hamlet,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            acting_user=None,
+        )
+        real_email = hamlet.delivery_email
+        self.assertEqual(hamlet.email, real_email)
+        self.assertEqual(get_user(real_email, realm), hamlet)
+
+        do_change_user_setting(
+            hamlet,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_ADMINS,
+            acting_user=None,
+        )
+        dummy_email = hamlet.email
+        self.assertNotEqual(dummy_email, real_email)
+        with self.assertRaises(UserProfile.DoesNotExist):
+            get_user(real_email, realm)
+        self.assertEqual(get_user(dummy_email, realm), hamlet)
+
+        do_change_user_setting(
+            hamlet,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            acting_user=None,
+        )
+        with self.assertRaises(UserProfile.DoesNotExist):
+            get_user(dummy_email, realm)
+        self.assertEqual(get_user(real_email, realm), hamlet)
 
     def test_get_user_profile(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -3179,7 +3632,7 @@ class GetProfileTest(ZulipTestCase):
         self.set_up_db_for_testing_user_access()
 
         self.login("polonius")
-        with self.assert_database_query_count(9):
+        with self.assert_database_query_count(6):
             result = orjson.loads(self.client_get("/json/users").content)
         accessible_users = result["members"]
         # The user can access 3 bot users and 7 human users.
@@ -3215,6 +3668,44 @@ class GetProfileTest(ZulipTestCase):
             accessible_user_ids, {polonius.id, iago.id, prospero.id, aaron.id, zoe.id, shiva.id}
         )
 
+    def test_get_accessible_user_ids(self) -> None:
+        iago = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
+        prospero = self.example_user("prospero")
+        aaron = self.example_user("aaron")
+        zoe = self.example_user("ZOE")
+        shiva = self.example_user("shiva")
+        polonius = self.example_user("polonius")
+
+        self.set_up_db_for_testing_user_access()
+
+        # Polonius can access:
+        # - hamlet and iago, common stream.
+        # - prospero and shiva, 1:1 Direct message with polonius.
+        # - aaron and zoe, common Direct message group.
+        self.assertEqual(
+            get_accessible_user_ids(polonius),
+            {polonius.id, prospero.id, zoe.id, shiva.id, aaron.id, hamlet.id, iago.id},
+        )
+
+        do_deactivate_user(shiva, acting_user=None)
+        do_deactivate_user(aaron, acting_user=None)
+        do_deactivate_user(hamlet, acting_user=None)
+
+        # By default, all deactivated partners are
+        # excluded. Active users remain accessible.
+        self.assertEqual(
+            get_accessible_user_ids(polonius),
+            {polonius.id, prospero.id, zoe.id, iago.id},
+        )
+
+        # The deactivated Direct message partners can be
+        # accessible using include_deactivated_users flag.
+        self.assertEqual(
+            get_accessible_user_ids(polonius, include_deactivated_users=True),
+            {polonius.id, prospero.id, zoe.id, shiva.id, aaron.id, iago.id},
+        )
+
     def test_get_user_dicts_with_ids(self) -> None:
         cordelia = self.example_user("cordelia")
         desdemona = self.example_user("desdemona")
@@ -3234,7 +3725,7 @@ class GetProfileTest(ZulipTestCase):
         accessible_user_ids_subset = [hamlet.id, iago.id, aaron.id, zoe.id, webhook_bot.id]
         inaccessible_user_ids_subset = [cordelia.id, desdemona.id]
         user_ids_to_fetch = accessible_user_ids_subset + inaccessible_user_ids_subset
-        with self.assert_database_query_count(9):
+        with self.assert_database_query_count(6):
             result = orjson.loads(
                 self.client_get(
                     "/json/users", {"user_ids": orjson.dumps(user_ids_to_fetch).decode()}
@@ -3303,7 +3794,7 @@ class GetProfileTest(ZulipTestCase):
             result = self.client_get(f"/json/users/{user.id}")
             self.assert_json_error(result, "Insufficient permission")
 
-        with self.settings(PARTIAL_USERS=True), self.assert_database_query_count(9):
+        with self.settings(PARTIAL_USERS=True), self.assert_database_query_count(6):
             result = self.client_get("/json/users")
         self.assert_json_success(result)
 
@@ -3321,6 +3812,7 @@ class GetProfileTest(ZulipTestCase):
         shiva = self.example_user("shiva")
         hamlet = self.example_user("hamlet")
         prospero = self.example_user("prospero")
+        aaron = self.example_user("aaron")
 
         inaccessible_user_ids = get_inaccessible_user_ids(
             [bot.id, hamlet.id, othello.id, shiva.id, prospero.id], polonius
@@ -3344,12 +3836,20 @@ class GetProfileTest(ZulipTestCase):
         )
         self.assertEqual(inaccessible_user_ids, {othello.id})
 
-    def test_get_inaccessible_user_ids_when_personal_recipient_is_none(self) -> None:
-        polonius = self.example_user("polonius")
+        # A deactivated user remains accessible through a shared direct
+        # message group (prospero, a 1:1 DM partner and aaron, a group DM
+        # partner), but a deactivated user only sharing a stream (hamlet)
+        # becomes inaccessible.
+        do_deactivate_user(prospero, acting_user=None)
+        do_deactivate_user(hamlet, acting_user=None)
+        do_deactivate_user(aaron, acting_user=None)
+        inaccessible_user_ids = get_inaccessible_user_ids(
+            [hamlet.id, prospero.id, aaron.id], polonius
+        )
+        self.assertEqual(inaccessible_user_ids, {hamlet.id})
 
-        # Removing the personal recipient to ensure we use direct message group.
-        polonius.recipient = None
-        polonius.save()
+    def test_get_inaccessible_user_ids_with_null_recipient(self) -> None:
+        polonius = self.example_user("polonius")
 
         bot = self.example_user("default_bot")
         hamlet = self.example_user("hamlet")
@@ -3363,6 +3863,135 @@ class GetProfileTest(ZulipTestCase):
 
         inaccessible_user_ids = get_inaccessible_user_ids([bot.id, hamlet.id, othello.id], polonius)
         self.assertEqual(inaccessible_user_ids, {othello.id})
+
+    def test_check_can_access_user_with_personal_message_history(self) -> None:
+        self.set_up_db_for_testing_user_access()
+
+        polonius = self.example_user("polonius")
+        prospero = self.example_user("prospero")
+        desdemona = self.example_user("desdemona")
+        aaron = self.example_user("aaron")
+        hamlet = self.example_user("hamlet")
+
+        # prospero and polonius had personal messages history
+        self.assertTrue(check_can_access_user(prospero, polonius))
+
+        # polonius and aaron shared a group direct message
+        self.assertTrue(check_can_access_user(aaron, polonius))
+
+        # no personal messages history between desdemona and polonius
+        self.assertFalse(check_can_access_user(desdemona, polonius))
+
+        # A guest keeps access to a deactivated user they share a direct
+        # message group with (prospero and aaron), but loses access to a
+        # deactivated user they only shared a stream with (hamlet).
+        do_deactivate_user(prospero, acting_user=None)
+        do_deactivate_user(hamlet, acting_user=None)
+        do_deactivate_user(aaron, acting_user=None)
+        self.assertTrue(check_can_access_user(prospero, polonius))
+        self.assertTrue(check_can_access_user(aaron, polonius))
+        self.assertFalse(check_can_access_user(hamlet, polonius))
+
+    def test_check_can_access_user_for_a_guest_with_themself(self) -> None:
+        """
+        Test that the behaviour and query count are the same
+        for both cases, a normal guest and a guest with limited user access,
+        when calling check_can_access_user() for a user on themself.
+        """
+        # A guest is not limited by default.
+        polonius = self.example_user("polonius")
+        with self.assert_database_query_count(0):
+            self.assertTrue(check_can_access_user(polonius, polonius))
+
+        # Give guests limited user access.
+        self.set_up_db_for_testing_user_access()
+        polonius = self.example_user("polonius")
+
+        # When guest has limited user access,
+        # query count should not increase.
+        with self.assert_database_query_count(0):
+            self.assertTrue(check_can_access_user(polonius, polonius))
+
+    def test_check_can_access_user_for_a_spectator(self) -> None:
+        # A spectator can always access users since spectators
+        # already have very limited access to users.
+        hamlet = self.example_user("hamlet")
+        self.assertTrue(check_can_access_user(hamlet, None))
+
+    def test_bulk_get_subscribers_of_target_user_subscriptions(self) -> None:
+        hamlet = self.example_user("hamlet")
+        aaron = self.example_user("aaron")
+        desdemona = self.example_user("desdemona")
+        iago = self.example_user("iago")
+        prospero = self.example_user("prospero")
+        shiva = self.example_user("shiva")
+        zoe = self.example_user("ZOE")
+        othello = self.example_user("othello")
+        cordelia = self.example_user("cordelia")
+        polonius = self.example_user("polonius")
+        imported_user = self.example_user("imported_user")
+
+        # Unsubscribe cordelia and polonius from their
+        # ONLY stream subscription, so we can be sure
+        # they are included/excluded only because of DM interactions.
+        self.unsubscribe(cordelia, "Verona")
+        self.unsubscribe(polonius, "Verona")
+
+        self.send_group_direct_message(hamlet, [cordelia, polonius, othello])
+        self.send_personal_message(aaron, cordelia)
+
+        do_deactivate_user(cordelia, acting_user=None)
+        do_deactivate_user(zoe, acting_user=None)
+
+        subscribers_dict = bulk_get_subscribers_of_target_user_subscriptions([hamlet, aaron])
+
+        # polonius shares a DirectMessage group with hamlet.
+        # The rest share a stream with hamlet.
+        hamlet_subscribers = {
+            polonius.id,
+            aaron.id,
+            hamlet.id,
+            othello.id,
+            desdemona.id,
+            iago.id,
+            prospero.id,
+            shiva.id,
+            imported_user.id,
+        }
+
+        # polonius does NOT share any subscription with aaron.
+        # The rest share a stream with aaron.
+        aaron_subscribers = {
+            aaron.id,
+            hamlet.id,
+            othello.id,
+            desdemona.id,
+            iago.id,
+            prospero.id,
+            shiva.id,
+        }
+
+        # By default, all deactivated subscribers, cordelia and zoe,
+        # are excluded.
+
+        self.assertEqual(hamlet_subscribers, subscribers_dict[hamlet.id])
+        self.assertEqual(aaron_subscribers, subscribers_dict[aaron.id])
+
+        # We use the flag to also include deactivated subscribers
+        # who share a DirectMessage (1:1 or group) subscription.
+        subscribers_dict = bulk_get_subscribers_of_target_user_subscriptions(
+            [hamlet, aaron], include_deactivated_users_for_dm_groups=True
+        )
+
+        # Same subscribers as above BUT with cordelia,
+        # who shares a DirectMessage with hamlet and aaron,
+        # now included, since the flag is scoped to DM interaction.
+        # Deactivated stream subscribers (zoe) are still excluded.
+        hamlet_subscribers.add(cordelia.id)
+        aaron_subscribers.add(cordelia.id)
+
+        self.assertEqual(hamlet_subscribers, subscribers_dict[hamlet.id])
+        self.assertEqual(aaron_subscribers, subscribers_dict[aaron.id])
 
     def test_get_users_for_spectators(self) -> None:
         # Checks that spectators can fetch users data.
@@ -3411,6 +4040,38 @@ class GetProfileTest(ZulipTestCase):
             UserProfile.objects.filter(realm=hamlet.realm, is_bot=True).count(),
         )
 
+    def test_spectators_cannot_fetch_custom_profile_fields(self) -> None:
+        # Custom profile fields can hold personal information (phone
+        # numbers, birthdays, etc.), so spectators must never receive
+        # them, even if they pass include_custom_profile_fields=true.
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        phone_field = CustomProfileField.objects.get(name="Phone number", realm=realm)
+        sentinel_value = "spectator-must-not-see-this"
+        do_update_user_custom_profile_data_if_changed(
+            hamlet,
+            [{"id": phone_field.id, "value": sentinel_value}],
+            acting_user=None,
+            notify=False,
+        )
+
+        # A spectator passing the flag must not trigger the extra query
+        # for custom profile field values, and the response must not
+        # contain profile_data for any user.
+        with self.assert_database_query_count(4):
+            result = self.client_get("/json/users", {"include_custom_profile_fields": "true"})
+        self.assert_json_success(result)
+        self.assertNotIn(sentinel_value, result.content.decode())
+        for user in orjson.loads(result.content)["members"]:
+            self.assertNotIn("profile_data", user)
+
+        # Sanity check that authenticated users still receive the data,
+        # confirming the fix didn't break the intended behavior.
+        self.login("othello")
+        result = self.client_get("/json/users", {"include_custom_profile_fields": "true"})
+        self.assert_json_success(result)
+        self.assertIn(sentinel_value, result.content.decode())
+
 
 class DeleteUserTest(ZulipTestCase):
     def test_do_delete_user(self) -> None:
@@ -3418,7 +4079,7 @@ class DeleteUserTest(ZulipTestCase):
         cordelia = self.example_user("cordelia")
         othello = self.example_user("othello")
         hamlet = self.example_user("hamlet")
-        hamlet_personal_recipient = hamlet.recipient
+        hamlet_and_cordelia_recipient = self.get_dm_group_recipient(hamlet, cordelia)
         hamlet_user_id = hamlet.id
         hamlet_date_joined = hamlet.date_joined
 
@@ -3430,7 +4091,7 @@ class DeleteUserTest(ZulipTestCase):
         self.send_personal_message(hamlet, cordelia)
 
         personal_message_ids_to_hamlet = Message.objects.filter(
-            realm_id=realm.id, recipient=hamlet_personal_recipient
+            realm_id=realm.id, recipient=hamlet_and_cordelia_recipient
         ).values_list("id", flat=True)
         personal_message_ids_to_hamlet_original_count = len(personal_message_ids_to_hamlet)
         self.assertGreater(personal_message_ids_to_hamlet_original_count, 0)
@@ -3470,18 +4131,13 @@ class DeleteUserTest(ZulipTestCase):
 
         self.assertEqual(hamlet.delivery_email, f"deleteduser{hamlet_user_id}@zulip.testserver")
         self.assertEqual(hamlet.is_mirror_dummy, True)
+        self.assertEqual(hamlet.is_deleted, True)
         self.assertEqual(hamlet.is_active, False)
         self.assertEqual(hamlet.date_joined, hamlet_date_joined)
 
-        # Messages that were sent TO the user are preserved. They'll just appear
-        # to the senders as sent to a deleted dummy user.
-        self.assertEqual(
-            Message.objects.filter(id__in=personal_message_ids_to_hamlet).count(),
-            personal_message_ids_to_hamlet_original_count,
-        )
-
         # Group direct messages from hamlet should have been deleted, but messages of other
         # participants should be kept.
+        self.assertEqual(Message.objects.filter(id__in=personal_message_ids_to_hamlet).count(), 1)
         self.assertEqual(
             Message.objects.filter(id__in=group_direct_message_ids_from_hamlet).count(), 0
         )
@@ -3515,6 +4171,21 @@ class DeleteUserTest(ZulipTestCase):
 
         self.assertEqual(ScheduledEmail.objects.count(), 0)
 
+        # Verify is_deleted is exposed in the API.
+        self.login("iago")
+        result = orjson.loads(self.client_get(f"/json/users/{hamlet_user_id}").content)
+        self.assertEqual(result["user"]["is_deleted"], True)
+
+    def test_reactivate_deleted_user(self) -> None:
+        hamlet = self.example_user("hamlet")
+        do_delete_user(hamlet, acting_user=None)
+        hamlet.refresh_from_db()
+        self.assertTrue(hamlet.is_deleted)
+
+        self.login("iago")
+        result = self.client_post(f"/json/users/{hamlet.id}/reactivate")
+        self.assert_json_error(result, "Cannot reactivate a deleted user")
+
     def test_do_delete_user_preserving_messages(self) -> None:
         """
         Since do_delete_user and do_delete_user_preserving_messages share the same
@@ -3528,14 +4199,14 @@ class DeleteUserTest(ZulipTestCase):
         cordelia = self.example_user("cordelia")
         othello = self.example_user("othello")
         hamlet = self.example_user("hamlet")
-        hamlet_personal_recipient = hamlet.recipient
+        hamlet_and_cordelia_recipient = self.get_dm_group_recipient(hamlet, cordelia)
         hamlet_user_id = hamlet.id
 
         self.send_personal_message(cordelia, hamlet)
         self.send_personal_message(hamlet, cordelia)
 
         personal_message_ids_to_hamlet = Message.objects.filter(
-            realm_id=realm.id, recipient=hamlet_personal_recipient
+            realm_id=realm.id, recipient=hamlet_and_cordelia_recipient
         ).values_list("id", flat=True)
         self.assertGreater(len(personal_message_ids_to_hamlet), 0)
         self.assertTrue(Message.objects.filter(realm_id=realm.id, sender=hamlet).exists())

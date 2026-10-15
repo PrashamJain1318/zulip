@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import type * as tippy from "tippy.js";
 
@@ -19,6 +19,7 @@ import * as pm_list from "./pm_list.ts";
 import * as popovers from "./popovers.ts";
 import * as popup_banners from "./popup_banners.ts";
 import * as resize from "./resize.ts";
+import * as scroll_to_bottom_button from "./scroll_to_bottom_button.ts";
 import * as sidebar_ui from "./sidebar_ui.ts";
 import * as stream_list from "./stream_list.ts";
 import * as unread_ui from "./unread_ui.ts";
@@ -90,6 +91,7 @@ export function show(opts: {
     is_visible: () => boolean;
     set_visible: (value: boolean) => void;
     complete_rerender: (coming_from_other_views?: boolean) => void;
+    update_participants_column_class?: () => void;
     is_recent_view?: boolean;
 }): void {
     if (opts.is_visible()) {
@@ -109,10 +111,24 @@ export function show(opts: {
     opts.highlight_view_in_left_sidebar();
 
     unread_ui.hide_unread_banner();
+    scroll_to_bottom_button.update();
     opts.update_compose();
     narrow_title.update_narrow_title(narrow_state.filter());
     message_view_header.render_title_area();
     compose_recipient.handle_middle_pane_transition();
+
+    // Call before complete_rerender to ensure
+    // that any size changes are taken into account.
+    if (opts.is_recent_view) {
+        resize.set_recent_view_participants_rerender(() => {
+            opts.complete_rerender(false);
+        });
+        resize.set_recent_view_participants_column_class_update(() => {
+            opts.update_participants_column_class?.();
+        });
+        resize.update_recent_view();
+    }
+
     opts.complete_rerender(true);
     compose_actions.on_show_navigation_view();
     popup_banners.close_found_missing_unreads_banner();
@@ -120,11 +136,6 @@ export function show(opts: {
     // This has to happen after resetting the current narrow filter, so
     // that the buddy list is rendered with the correct narrow state.
     activity_ui.build_user_sidebar();
-
-    // Misc.
-    if (opts.is_recent_view) {
-        resize.update_recent_view();
-    }
 }
 
 export function hide(opts: {$view: JQuery; set_visible: (value: boolean) => void}): void {
@@ -155,18 +166,18 @@ export function is_in_focus(): boolean {
     let can_current_view_steal_focus = true;
     const focused_element = document.activeElement;
     if (
+        // `document.body` is the active element when nothing is focused;
+        // in that case the view may take focus normally (e.g., so a
+        // hotkey can move focus into the conversations table).
+        focused_element !== document.body &&
         focused_element instanceof HTMLElement &&
-        // Pill input elements.
-        (focused_element.isContentEditable ||
-            // `<input>` elements.
-            focused_element.classList.contains("input-element")) &&
-        // The input element is outside the current view.
-        // We already check for compose box via compose_state.composing().
+        // Focus is outside the current view (e.g., in the left or right
+        // sidebar, or on a navbar/search element). The user is navigating
+        // elsewhere, so the current view shouldn't steal focus from them.
+        // The compose box lives inside the view, so it's handled
+        // separately below via compose_state.composing().
         focused_element.closest(".app .column-middle") === null
     ) {
-        // If the user is focused on an input element
-        // and it is not handled by current view,
-        // then we should not steal focus from them.
         can_current_view_steal_focus = false;
     }
 
@@ -176,23 +187,42 @@ export function is_in_focus(): boolean {
         !sidebar_ui.any_sidebar_expanded_as_overlay() &&
         !overlays.any_active() &&
         !modals.any_active_or_animating() &&
-        can_current_view_steal_focus &&
-        !$(".navbar-item").is(":focus")
+        can_current_view_steal_focus
     );
+}
+
+export function find_first_row_index_at_or_below(rows: Element[], y: number): number | undefined {
+    // Returns the index of the first row whose bottom edge is below
+    // the viewport coordinate `y` (the row containing `y`, or else the
+    // first row below it), or undefined if there is none. Assumes
+    // `rows` are in top-to-bottom order and don't overlap.
+    const index = rows.findIndex((row) => row.getBoundingClientRect().bottom > y);
+    return index === -1 ? undefined : index;
+}
+
+// We allocate `--max-unmaximized-compose-height` in empty space
+// below the last rendered row in recent view.
+function get_scroll_height_without_bottom_padding(): number {
+    const compose_max_height = $(":root").css("--max-unmaximized-compose-height");
+    assert(typeof compose_max_height === "string");
+    return document.body.scrollHeight - Number.parseInt(compose_max_height, 10);
 }
 
 export function is_scroll_position_for_render(): boolean {
     const scroll_position = window.scrollY;
     const window_height = window.innerHeight;
-    // We allocate `--max-unmaximized-compose-height` in empty space
-    // below the last rendered row in recent view.
-    //
-    // We don't want user to see this empty space until there are no
-    // new rows to render when the user is scrolling to the bottom of
-    // the view. So, we render new rows when user has scrolled 2 / 3
-    // of (the total scrollable height - the empty space).
-    const compose_max_height = $(":root").css("--max-unmaximized-compose-height");
-    assert(typeof compose_max_height === "string");
-    const scroll_max = document.body.scrollHeight - Number.parseInt(compose_max_height, 10);
+    // We don't want user to see the empty space below the last rendered
+    // row until there are no new rows to render when the user is
+    // scrolling to the bottom of the view. So, we render new rows when
+    // user has scrolled 2 / 3 of (the total scrollable height - the
+    // empty space).
+    const scroll_max = get_scroll_height_without_bottom_padding();
     return scroll_position + window_height >= (2 / 3) * scroll_max;
+}
+
+export let is_bottom_padding_in_view = (): boolean =>
+    window.scrollY + window.innerHeight >= get_scroll_height_without_bottom_padding();
+
+export function rewire_is_bottom_padding_in_view(value: typeof is_bottom_padding_in_view): void {
+    is_bottom_padding_in_view = value;
 }

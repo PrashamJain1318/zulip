@@ -1,7 +1,8 @@
-from typing import Any
+from typing import Literal, cast
 
 from zerver.actions.user_topics import do_set_user_topic_visibility_policy
 from zerver.lib.emoji import check_emoji_request, get_emoji_data
+from zerver.lib.event_types import BaseEvent, ReactionAddEvent, ReactionRemoveEvent, ReactionType
 from zerver.lib.exceptions import ReactionExistsError
 from zerver.lib.message import (
     access_message_and_usermessage,
@@ -18,27 +19,31 @@ from zerver.tornado.django_api import send_event_on_commit
 
 
 def notify_reaction_update(
-    user_profile: UserProfile, message: Message, reaction: Reaction, op: str
+    user_profile: UserProfile,
+    message: Message,
+    reaction: Reaction,
+    op: Literal["add", "remove"],
 ) -> None:
-    user_dict = {
-        "user_id": user_profile.id,
-        "email": user_profile.email,
-        "full_name": user_profile.full_name,
-    }
-
-    event: dict[str, Any] = {
-        "type": "reaction",
-        "op": op,
-        "user_id": user_profile.id,
-        # TODO: We plan to remove this redundant user_dict object once
-        # clients are updated to support accessing use user_id.  See
-        # https://github.com/zulip/zulip/pull/14711 for details.
-        "user": user_dict,
-        "message_id": message.id,
-        "emoji_name": reaction.emoji_name,
-        "emoji_code": reaction.emoji_code,
-        "reaction_type": reaction.reaction_type,
-    }
+    # The reaction_type column is a CharField restricted to these
+    # values via choices, so the cast is safe.
+    reaction_type = cast(ReactionType, reaction.reaction_type)
+    event: BaseEvent
+    if op == "add":
+        event = ReactionAddEvent(
+            user_id=user_profile.id,
+            message_id=message.id,
+            emoji_name=reaction.emoji_name,
+            emoji_code=reaction.emoji_code,
+            reaction_type=reaction_type,
+        )
+    else:
+        event = ReactionRemoveEvent(
+            user_id=user_profile.id,
+            message_id=message.id,
+            emoji_name=reaction.emoji_name,
+            emoji_code=reaction.emoji_code,
+            reaction_type=reaction_type,
+        )
 
     # Update the cached message since new reaction is added.
     update_message_cache([message])
@@ -79,7 +84,6 @@ def do_add_reaction(
     ]:
         stream_id = message.recipient.type_id
         (stream, sub) = access_stream_by_id(user_profile, stream_id)
-        assert stream is not None
         if sub:
             new_visibility_policy = visibility_policy_for_participation(user_profile, sub.is_muted)
             if new_visibility_policy and should_change_visibility_policy(

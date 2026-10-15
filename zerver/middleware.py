@@ -227,7 +227,7 @@ def write_log_line(
     if settings.PROFILE_ALL_REQUESTS:
         log_data["prof"].disable()
         with tempfile.NamedTemporaryFile(
-            prefix="profile.data.{}.{}.".format(path.split("/")[-1], int(time_delta * 1000)),
+            prefix="profile.data.{}.{}.".format(path.rsplit("/", 1)[-1], int(time_delta * 1000)),
             delete=False,
         ) as stats_file:
             log_data["prof"].dump_stats(stats_file.name)
@@ -299,8 +299,8 @@ class LogRequests(MiddlewareMixin):
 
         try:
             request_notes.client_name, request_notes.client_version = parse_client(request)
-        except JsonableError as e:
-            logging.exception(e)
+        except JsonableError:
+            logging.exception("Error while parsing client from request")
             request_notes.client_name = "Unparsable"
             request_notes.client_version = None
 
@@ -494,7 +494,6 @@ class LocaleMiddleware(DjangoLocaleMiddleware):
         i18n_patterns_used, _ = is_language_prefix_patterns_used(urlconf)
         if not (i18n_patterns_used and language_from_path):
             patch_vary_headers(response, ("Accept-Language",))
-        assert language is not None
         response.setdefault("Content-Language", language)
 
         # An additional responsibility of our override of this middleware is to save the user's language
@@ -697,6 +696,7 @@ class DetectProxyMisconfiguration(MiddlewareMixin):
                 "x_forwarded_for": request.headers.get("X-Forwarded-For"),
                 "x_forwarded_proto": request.headers.get("X-Forwarded-Proto"),
                 "remote_addr": request.META["REMOTE_ADDR"],
+                "helm_config": settings.RUNNING_IN_HELM,
                 "docker_config": settings.RUNNING_IN_DOCKER
                 and os.environ.get("MANUAL_CONFIGURATION") != "True",
                 "all_headers": list(request.headers.items()),

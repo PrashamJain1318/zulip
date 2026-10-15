@@ -1,10 +1,9 @@
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
 import render_confirm_mark_messages_as_read from "../templates/confirm_dialog/confirm_mark_all_as_read.hbs";
-import render_confirm_mark_as_unread_from_here from "../templates/confirm_dialog/confirm_mark_as_unread_from_here.hbs";
 import render_skipped_marking_unread from "../templates/skipped_marking_unread.hbs";
 
 import * as blueslip from "./blueslip.ts";
@@ -15,25 +14,25 @@ import * as dialog_widget from "./dialog_widget.ts";
 import * as feedback_widget from "./feedback_widget.ts";
 import {Filter} from "./filter.ts";
 import {$t, $t_html} from "./i18n.ts";
-import * as loading from "./loading.ts";
 import * as message_flags from "./message_flags.ts";
 import * as message_lists from "./message_lists.ts";
 import type {Message} from "./message_store.ts";
 import * as message_store from "./message_store.ts";
 import * as message_viewport from "./message_viewport.ts";
 import * as modals from "./modals.ts";
-import * as overlays from "./overlays.ts";
 import * as people from "./people.ts";
+import * as popup_banners from "./popup_banners.ts";
 import * as recent_view_ui from "./recent_view_ui.ts";
+import * as recent_view_util from "./recent_view_util.ts";
+import {get_retry_backoff_seconds} from "./retry_backoff.ts";
 import type {MessageDetails} from "./server_event_types.ts";
 import type {NarrowTerm} from "./state_data.ts";
 import * as sub_store from "./sub_store.ts";
-import * as ui_report from "./ui_report.ts";
 import * as unread from "./unread.ts";
 import * as unread_ui from "./unread_ui.ts";
 import * as watchdog from "./watchdog.ts";
 
-let loading_indicator_displayed = false;
+let update_read_flag_banner_displayed = false;
 let unsubscribed_ignored_channels: number[] = [];
 
 // We might want to use a slightly smaller batch for the first
@@ -52,9 +51,10 @@ const MIN_MARK_AS_UNREAD_COUNT_KNOWN = 50;
 const MIN_MARK_AS_UNREAD_COUNT_LOWER_BOUND = 10;
 const UNREAD_COUNT_STEP_SIZE = 25;
 
-// When you start Zulip, window_focused should be true, but it might not be the
-// case after a server-initiated reload.
-let window_focused = document.hasFocus();
+// How many times to retry a mark-as-read/unread request that fails with
+// a transient server (5xx) or network error before giving up and
+// reporting the failure.
+const MAX_UPDATE_READ_FLAGS_RETRIES = 5;
 
 // Since there's a database index on is:unread, it's a fast
 // search query and thus worth including here as an optimization.),
@@ -62,16 +62,12 @@ const all_unread_messages_narrow: NarrowTerm[] = [
     {operator: "is", operand: "unread", negated: false},
 ];
 
-export function is_window_focused(): boolean {
-    return window_focused;
-}
-
 export function confirm_mark_messages_as_read(): void {
-    const html_body = render_confirm_mark_messages_as_read();
+    const modal_content_html = render_confirm_mark_messages_as_read();
 
     const modal_id = confirm_dialog.launch({
-        html_heading: $t_html({defaultMessage: "Choose messages to mark as read"}),
-        html_body,
+        modal_title_html: $t_html({defaultMessage: "Choose messages to mark as read"}),
+        modal_content_html,
         on_click() {
             handle_mark_messages_as_read(modal_id);
         },
@@ -155,6 +151,32 @@ export function get_message_count_text(count: number): string {
     );
 }
 
+function show_read_flag_update_progress_banner(
+    operation: "read" | "unread",
+    messages_updated: number,
+): void {
+    // We show the read flag update progress banner only
+    // when the operation requires multiple batches. Otherwise,
+    // we don't bother distracting the user with the banner
+    // since the success is obvious through the updating UI.
+    popup_banners.open_update_read_flags_for_narrow_banner(operation, messages_updated);
+    update_read_flag_banner_displayed = true;
+}
+
+function show_read_flag_update_success_banner(
+    operation: "read" | "unread",
+    messages_updated: number,
+): void {
+    if (!update_read_flag_banner_displayed) {
+        // If the operation completed in a single batch,
+        // and we never showed the progress banner,
+        // we skip showing the success banner as well.
+        return;
+    }
+    popup_banners.open_update_read_flags_for_narrow_banner(operation, messages_updated, true);
+    update_read_flag_banner_displayed = false;
+}
+
 function bulk_update_read_flags_for_narrow(
     narrow: NarrowTerm[],
     op: "add" | "remove",
@@ -166,14 +188,15 @@ function bulk_update_read_flags_for_narrow(
         anchor = "oldest",
         messages_read_till_now = 0,
         num_after = INITIAL_BATCH_SIZE,
+        attempt = 0,
     }: {
         anchor?: "newest" | "oldest" | "first_unread" | number;
         messages_read_till_now?: number;
         num_after?: number;
+        attempt?: number;
     } = {},
     caller_modal_id?: string,
 ): void {
-    let response_html;
     const terms_with_integer_channel_id = narrow.map((term) => {
         if (term.operator === "channel") {
             return {
@@ -202,36 +225,11 @@ function bulk_update_read_flags_for_narrow(
         success(raw_data) {
             const data = update_flags_for_narrow_response_schema.parse(raw_data);
             messages_read_till_now += data.updated_count;
+            const operation = op === "add" ? "read" : "unread";
 
             if (!data.found_newest) {
                 assert(data.last_processed_id !== null);
-                // If we weren't able to make everything as read in a
-                // single API request, then show a loading indicator.
-                if (op === "add") {
-                    response_html = $t_html(
-                        {
-                            defaultMessage:
-                                "{N, plural, one {Working… {N} message marked as read so far.} other {Working… {N} messages marked as read so far.}}",
-                        },
-                        {N: messages_read_till_now},
-                    );
-                } else {
-                    response_html = $t_html(
-                        {
-                            defaultMessage:
-                                "{N, plural, one {Working… {N} message marked as unread so far.} other {Working… {N} messages marked as unread so far.}}",
-                        },
-                        {N: messages_read_till_now},
-                    );
-                }
-                ui_report.loading(response_html, $("#request-progress-status-banner"));
-                if (!loading_indicator_displayed) {
-                    loading.make_indicator(
-                        $("#request-progress-status-banner .loading-indicator"),
-                        {abs_positioned: true},
-                    );
-                    loading_indicator_displayed = true;
-                }
+                show_read_flag_update_progress_banner(operation, messages_read_till_now);
 
                 bulk_update_read_flags_for_narrow(
                     narrow,
@@ -244,28 +242,7 @@ function bulk_update_read_flags_for_narrow(
                     caller_modal_id,
                 );
             } else {
-                if (loading_indicator_displayed) {
-                    // Only show the success message if a progress banner was displayed.
-                    if (op === "add") {
-                        response_html = $t_html(
-                            {
-                                defaultMessage:
-                                    "{N, plural, one {Done! {N} message marked as read.} other {Done! {N} messages marked as read.}}",
-                            },
-                            {N: messages_read_till_now},
-                        );
-                    } else {
-                        response_html = $t_html(
-                            {
-                                defaultMessage:
-                                    "{N, plural, one {Done! {N} message marked as unread.} other {Done! {N} messages marked as unread.}}",
-                            },
-                            {N: messages_read_till_now},
-                        );
-                    }
-                    ui_report.loading(response_html, $("#request-progress-status-banner"), true);
-                    loading_indicator_displayed = false;
-                }
+                show_read_flag_update_success_banner(operation, messages_read_till_now);
 
                 if (_.isEqual(narrow, all_unread_messages_narrow) && unread.old_unreads_missing) {
                     // In the rare case that the user had more than
@@ -318,6 +295,9 @@ function bulk_update_read_flags_for_narrow(
         },
         error(xhr) {
             let parsed;
+            // Network drop (status 0) and gateway/server errors deserve some
+            // retries with exponential backoff.
+            const is_transient_error = xhr.status === 0 || xhr.status >= 500;
             if (xhr.readyState === 0) {
                 // client cancelled the request
             } else if (
@@ -325,7 +305,9 @@ function bulk_update_read_flags_for_narrow(
                     .object({code: z.literal("RATE_LIMIT_HIT"), ["retry-after"]: z.number()})
                     .safeParse(xhr.responseJSON)).success
             ) {
-                // If we hit the rate limit, just continue without showing any error.
+                // If we hit the rate limit, just retry after the server-specified delay.
+                // This is self-resolving, so we retry indefinitely and don't count it
+                // against the transient-error retry budget.
                 const milliseconds_to_wait = 1000 * parsed.data["retry-after"];
                 setTimeout(() => {
                     bulk_update_read_flags_for_narrow(
@@ -339,14 +321,41 @@ function bulk_update_read_flags_for_narrow(
                         caller_modal_id,
                     );
                 }, milliseconds_to_wait);
+            } else if (is_transient_error && attempt < MAX_UPDATE_READ_FLAGS_RETRIES) {
+                const delay_secs = get_retry_backoff_seconds(xhr, attempt);
+                setTimeout(() => {
+                    bulk_update_read_flags_for_narrow(
+                        narrow,
+                        op,
+                        {
+                            anchor,
+                            messages_read_till_now,
+                            num_after,
+                            attempt: attempt + 1,
+                        },
+                        caller_modal_id,
+                    );
+                }, delay_secs * 1000);
             } else {
-                // TODO: Ideally this would be a ui_report.error();
-                // the user needs to know that our operation failed.
                 const operation = op === "add" ? "read" : "unread";
-                blueslip.error(`Failed to mark messages as ${operation}`, {
-                    status: xhr.status,
-                    body: xhr.responseText,
-                });
+                if (is_transient_error) {
+                    // The transient failure persisted past our retry budget,
+                    // so the server is likely having a real problem.
+                    blueslip.error(`Failed to mark messages as ${operation} after retries`, {
+                        status: xhr.status,
+                        body: xhr.responseText,
+                    });
+                } else {
+                    // Any other error -- a 4xx bad request (e.g. a malformed
+                    // narrow), or an unexpected/unparsable response -- is a
+                    // client-side problem that retrying won't fix.
+                    blueslip.error(`Failed to mark messages as ${operation}`, {
+                        status: xhr.status,
+                        body: xhr.responseText,
+                    });
+                }
+                // TODO: Ideally we would show an error to the user so they know
+                // the operation failed.
                 if (caller_modal_id && modals.is_active(caller_modal_id)) {
                     dialog_widget.hide_dialog_spinner();
                 }
@@ -384,8 +393,7 @@ function process_newly_read_message(
     for (const msg_list of message_lists.all_rendered_message_lists()) {
         msg_list.view.show_message_as_read(message, options);
     }
-    desktop_notifications.close_notification(message);
-    recent_view_ui.update_topic_unread_count(message);
+    desktop_notifications.close_notification(message.id);
 }
 
 export function mark_as_unread_from_here(message_id: number): void {
@@ -446,7 +454,8 @@ export function mark_as_unread_from_here(message_id: number): void {
             do_mark_unread(undefined);
         }
         return;
-    } else if (prefer_local_ids) {
+    }
+    if (prefer_local_ids) {
         // Since we have the anchor message ID and the newest
         // messages, we know exactly which messages to mark as unread.
         if (locally_available_matching_message_ids.length < MIN_MARK_AS_UNREAD_COUNT_KNOWN) {
@@ -457,41 +466,45 @@ export function mark_as_unread_from_here(message_id: number): void {
         }
 
         display_count = locally_available_message_count.toString();
-    } else if (locally_available_message_count < UNREAD_COUNT_STEP_SIZE) {
-        // TODO: This logic should have a case for where we're
-        // offline, and skip the prompt in interleaved views in that
-        // case.
-        display_count = locally_available_message_count.toString();
     } else {
-        // Otherwise, we round down to the nearest
-        // UNREAD_COUNT_STEP_SIZE and display as, e.g., `25+`.
-        const rounded_count =
-            Math.floor(locally_available_message_count / UNREAD_COUNT_STEP_SIZE) *
-            UNREAD_COUNT_STEP_SIZE;
-        display_count = `${rounded_count}+`;
+        // We don't have all the newest messages, so there are likely more
+        // available messages that will be marked as unread.
+        if (locally_available_message_count < UNREAD_COUNT_STEP_SIZE) {
+            display_count = `${locally_available_message_count.toString()}+`;
+        } else {
+            // Otherwise, we round down to the nearest
+            // UNREAD_COUNT_STEP_SIZE and display as, e.g., `25+`.
+            const rounded_count =
+                Math.floor(locally_available_message_count / UNREAD_COUNT_STEP_SIZE) *
+                UNREAD_COUNT_STEP_SIZE;
+            display_count = `${rounded_count}+`;
+        }
     }
 
-    const context = {
-        // If we don't know how many messages will be affected, but
-        // can't prove the number is more than 10, we avoid showing a
-        // count, since it just seems weird to say "3+ messages will
-        // be marked as read".
-        //
-        // It's not obvious this case is worth having special strings
-        // for, given how unlikely it is. A sample scenario is that
-        // we're be that we're near the fetched bottom of a /near/1
-        // search view where can_apply_locally is false, which will
-        // have triggered a request for the next batch of messages
-        // from the server, but that request has not returned. But it
-        // may happen more offline if the client is intermittantly
-        // offline.
-        show_message_count: locally_available_message_count >= MIN_MARK_AS_UNREAD_COUNT_LOWER_BOUND,
-        count: display_count,
-    };
+    // If we don't know how many messages will be affected, but
+    // can't prove the number is more than 10, we avoid showing a
+    // count, since it just seems weird to say "3+ messages will
+    // be marked as read".
+    //
+    // It's not obvious this case is worth having special strings
+    // for, given how unlikely it is. A sample scenario is that
+    // we're be that we're near the fetched bottom of a /near/1
+    // search view where can_apply_locally is false, which will
+    // have triggered a request for the next batch of messages
+    // from the server, but that request has not returned. But it
+    // may happen more offline if the client is intermittantly
+    // offline.
+    const show_message_count =
+        locally_available_message_count >= MIN_MARK_AS_UNREAD_COUNT_LOWER_BOUND;
 
     confirm_dialog.launch({
-        html_heading: $t_html({defaultMessage: "Mark messages as unread?"}),
-        html_body: render_confirm_mark_as_unread_from_here(context),
+        modal_title_html: show_message_count
+            ? $t_html({defaultMessage: "Mark {display_count} messages as unread?"}, {display_count})
+            : $t_html({defaultMessage: "Mark messages as unread?"}),
+        modal_content_html: $t_html({
+            defaultMessage: "Messages in multiple conversations may be affected.",
+        }),
+        is_compact: true,
         on_click() {
             if (prefer_local_ids) {
                 do_mark_unread(locally_available_matching_message_ids);
@@ -508,6 +521,7 @@ function do_mark_unread_by_narrow(
     messages_marked_unread_till_now = 0,
     num_after = INITIAL_BATCH_SIZE - 1,
     narrow: string,
+    attempt = 0,
 ): void {
     const opts = {
         anchor: message_id,
@@ -532,25 +546,8 @@ function do_mark_unread_by_narrow(
             ];
             if (!data.found_newest) {
                 assert(data.last_processed_id !== null);
-                // If we weren't able to complete the request fully in
-                // the current batch, show a progress indicator.
-                ui_report.loading(
-                    $t_html(
-                        {
-                            defaultMessage:
-                                "{N, plural, one {Working… {N} message marked as unread so far.} other {Working… {N} messages marked as unread so far.}}",
-                        },
-                        {N: messages_marked_unread_till_now},
-                    ),
-                    $("#request-progress-status-banner"),
-                );
-                if (!loading_indicator_displayed) {
-                    loading.make_indicator(
-                        $("#request-progress-status-banner .loading-indicator"),
-                        {abs_positioned: true},
-                    );
-                    loading_indicator_displayed = true;
-                }
+                show_read_flag_update_progress_banner("unread", messages_marked_unread_till_now);
+
                 do_mark_unread_by_narrow(
                     data.last_processed_id,
                     false,
@@ -559,9 +556,7 @@ function do_mark_unread_by_narrow(
                     narrow,
                 );
             } else {
-                if (loading_indicator_displayed) {
-                    finish_loading(messages_marked_unread_till_now);
-                }
+                show_read_flag_update_success_banner("unread", messages_marked_unread_till_now);
                 if (unsubscribed_ignored_channels.length > 0) {
                     handle_skipped_unsubscribed_streams(unsubscribed_ignored_channels);
                     unsubscribed_ignored_channels = [];
@@ -570,29 +565,30 @@ function do_mark_unread_by_narrow(
         },
         error(xhr) {
             handle_mark_unread_from_here_error(xhr, {
-                retry() {
+                retry(next_attempt) {
                     do_mark_unread_by_narrow(
                         message_id,
                         include_anchor,
                         messages_marked_unread_till_now,
                         num_after,
                         narrow,
+                        next_attempt,
                     );
                 },
+                attempt,
             });
         },
     });
 }
 
-function do_mark_unread_by_ids(message_ids_to_update: number[]): void {
+function do_mark_unread_by_ids(message_ids_to_update: number[], attempt = 0): void {
     // TODO: Add support for locally echoing when we're offline.
     void channel.post({
         url: "/json/messages/flags",
         data: {messages: JSON.stringify(message_ids_to_update), op: "remove", flag: "read"},
         success(raw_data) {
-            if (loading_indicator_displayed) {
-                finish_loading(message_ids_to_update.length);
-            }
+            show_read_flag_update_success_banner("unread", message_ids_to_update.length);
+
             const data = update_flags_for_response_schema.parse(raw_data);
             const ignored_because_not_subscribed_channels =
                 data.ignored_because_not_subscribed_channels;
@@ -602,39 +598,23 @@ function do_mark_unread_by_ids(message_ids_to_update: number[]): void {
         },
         error(xhr) {
             handle_mark_unread_from_here_error(xhr, {
-                retry() {
-                    do_mark_unread_by_ids(message_ids_to_update);
+                retry(next_attempt) {
+                    do_mark_unread_by_ids(message_ids_to_update, next_attempt);
                 },
+                attempt,
             });
         },
     });
 }
 
-function finish_loading(messages_marked_unread_till_now: number): void {
-    // If we were showing a loading indicator, then
-    // display that we finished. For the common case where
-    // the operation succeeds in a single batch, we don't
-    // bother distracting the user with the indication;
-    // the success will be obvious from the UI updating.
-    loading_indicator_displayed = false;
-    ui_report.loading(
-        $t_html(
-            {
-                defaultMessage:
-                    "{N, plural, one {Done! {N} message marked as unread.} other {Done! {N} messages marked as unread.}}",
-            },
-            {N: messages_marked_unread_till_now},
-        ),
-        $("#request-progress-status-banner"),
-        true,
-    );
-}
-
 function handle_mark_unread_from_here_error(
     xhr: JQuery.jqXHR<unknown>,
-    {retry}: {retry: () => void},
+    {retry, attempt}: {retry: (attempt: number) => void; attempt: number},
 ): void {
     let parsed;
+    // Network drop (status 0) and gateway/server errors deserve some
+    // retries with exponential backoff.
+    const is_transient_error = xhr.status === 0 || xhr.status >= 500;
     if (xhr.readyState === 0) {
         // client cancelled the request
     } else if (
@@ -642,13 +622,31 @@ function handle_mark_unread_from_here_error(
             .object({code: z.literal("RATE_LIMIT_HIT"), ["retry-after"]: z.number()})
             .safeParse(xhr.responseJSON)).success
     ) {
-        // If we hit the rate limit, just continue without showing any error.
+        // If we hit the rate limit, just retry after the server-specified
+        // delay. This is self-resolving, so we retry indefinitely and
+        // don't count it against the transient-error retry budget.
         const milliseconds_to_wait = 1000 * parsed.data["retry-after"];
-        setTimeout(retry, milliseconds_to_wait);
+        setTimeout(() => {
+            retry(0);
+        }, milliseconds_to_wait);
+    } else if (is_transient_error && attempt < MAX_UPDATE_READ_FLAGS_RETRIES) {
+        const delay_secs = get_retry_backoff_seconds(xhr, attempt);
+        setTimeout(() => {
+            retry(attempt + 1);
+        }, delay_secs * 1000);
+    } else if (is_transient_error) {
+        // The transient failure persisted past our retry budget, so the
+        // server is likely having a real problem.
+        // TODO: Ideally this would communicate the failure to the user.
+        blueslip.error("Unexpected error marking messages as unread after retries", {
+            status: xhr.status,
+            body: xhr.responseText,
+        });
     } else {
-        // TODO: Ideally, this case would communicate the
-        // failure to the user, with some manual retry
-        // offered, since the most likely cause is a 502.
+        // Any other error -- a 4xx bad request, or an unexpected/
+        // unparsable response -- is a client-side problem that retrying
+        // won't fix.
+        // TODO: Ideally this would communicate the failure to the user.
         blueslip.error("Unexpected error marking messages as unread", {
             status: xhr.status,
             body: xhr.responseText,
@@ -671,17 +669,22 @@ export function process_read_messages_event(message_ids: number[]): void {
         return;
     }
 
+    const conversation_keys = new Set<string>();
     for (const message_id of message_ids) {
+        // The unread data forgets a message's conversation once it is read.
+        const conversation_key = unread.get_unread_message_conversation_key(message_id);
+        if (conversation_key !== undefined) {
+            conversation_keys.add(conversation_key);
+        }
         unread.mark_as_read(message_id);
 
         const message = message_store.get(message_id);
-
-        // TODO: This ends up doing one in-place rerender operation on
-        // recent conversations per message, not a single global
-        // rerender or one per conversation.
         if (message) {
             process_newly_read_message(message, options);
         }
+    }
+    if (conversation_keys.size > 0) {
+        recent_view_ui.bulk_inplace_rerender(conversation_keys);
     }
 
     if (message_lists.current !== undefined && !message_lists.current.has_unread_messages()) {
@@ -790,10 +793,13 @@ export function notify_server_messages_read(
 
     message_flags.send_read(messages);
 
+    const conversation_keys = new Set<string>();
     for (const message of messages) {
         unread.mark_as_read(message.id);
         process_newly_read_message(message, options);
+        conversation_keys.add(recent_view_util.get_key_from_message(message));
     }
+    recent_view_ui.bulk_inplace_rerender(conversation_keys);
 
     unread_ui.update_unread_counts();
 }
@@ -836,7 +842,7 @@ function process_scrolled_to_bottom(): void {
 export function process_visible(): void {
     if (
         message_lists.current !== undefined &&
-        viewport_is_visible_and_focused() &&
+        message_viewport.viewport_is_visible_and_focused() &&
         message_viewport.bottom_rendered_message_visible() &&
         message_lists.current.view.is_fetched_end_rendered()
     ) {
@@ -886,6 +892,13 @@ export function mark_all_as_read(modal_id?: string): void {
     bulk_update_read_flags_for_narrow(all_unread_messages_narrow, "add", {}, modal_id);
 }
 
+export function mark_narrow_as_read(filter: Filter): void {
+    bulk_update_read_flags_for_narrow(
+        [{operator: "is", operand: "unread", negated: false}, ...filter.terms_for_server_query()],
+        "add",
+    );
+}
+
 export function mark_muted_topic_messages_as_read(modal_id?: string): void {
     bulk_update_read_flags_for_narrow(
         [
@@ -919,28 +932,10 @@ export function mark_pm_as_read(user_ids_string: string): void {
     message_flags.mark_as_read(unread_msg_ids);
 }
 
-export function viewport_is_visible_and_focused(): boolean {
-    if (
-        overlays.any_active() ||
-        modals.any_active() ||
-        !is_window_focused() ||
-        $("#message_feed_container").css("display") === "none"
-    ) {
-        return false;
-    }
-    return true;
-}
-
 export function initialize(): void {
-    $(window)
-        .on("focus", () => {
-            window_focused = true;
-
-            // Update many places on the DOM to reflect unread
-            // counts.
-            process_visible();
-        })
-        .on("blur", () => {
-            window_focused = false;
-        });
+    $(window).on("focus", () => {
+        // Update many places on the DOM to reflect unread
+        // counts.
+        process_visible();
+    });
 }

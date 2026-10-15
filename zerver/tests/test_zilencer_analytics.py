@@ -10,13 +10,14 @@ import responses
 import time_machine
 from django.conf import settings
 from django.db.models import F
+from django.test import override_settings
 from django.utils.timezone import now
 from requests.exceptions import ConnectionError
 from typing_extensions import override
 
 from analytics.lib.counts import CountStat, LoggingCountStat
 from analytics.models import InstallationCount, RealmCount, UserCount
-from corporate.lib.stripe import RemoteRealmBillingSession
+from corporate.lib.stripe import BillingUserCounts, RemoteRealmBillingSession
 from corporate.models.plans import CustomerPlan
 from version import ZULIP_VERSION
 from zerver.actions.create_realm import do_create_realm
@@ -24,6 +25,7 @@ from zerver.actions.realm_settings import (
     do_change_realm_org_type,
     do_deactivate_realm,
     do_set_realm_authentication_methods,
+    do_set_realm_property,
 )
 from zerver.lib import redis_utils
 from zerver.lib.remote_server import (
@@ -31,6 +33,7 @@ from zerver.lib.remote_server import (
     AnalyticsRequest,
     PushNotificationBouncerRetryLaterError,
     build_analytics_data,
+    get_advertise_realm_data,
     get_realms_info_for_push_bouncer,
     record_push_notifications_recently_working,
     redis_client,
@@ -217,8 +220,7 @@ class AnalyticsBouncerTest(BouncerTestCase):
         self.add_mock_response()
         # Send any existing data over, so that we can start the test with a "clean" slate
         remote_server = self.server
-        assert remote_server is not None
-        assert remote_server.last_version is None
+        self.assertIsNone(remote_server.last_version)
 
         send_server_data_to_push_bouncer()
         self.assertTrue(responses.assert_call_count(ANALYTICS_STATUS_URL, 1))
@@ -228,7 +230,7 @@ class AnalyticsBouncerTest(BouncerTestCase):
         audit_log_max_id = audit_log.id
 
         remote_server.refresh_from_db()
-        assert remote_server.last_version == ZULIP_VERSION
+        self.assertEqual(remote_server.last_version, ZULIP_VERSION)
 
         remote_audit_log_count = RemoteRealmAuditLog.objects.count()
 
@@ -393,6 +395,7 @@ class AnalyticsBouncerTest(BouncerTestCase):
             "SAML": True,
             "GitLab": False,
             "OpenID Connect": False,
+            "Discord": False,
         }
         do_set_realm_authentication_methods(zephyr_realm, new_auth_method_dict, acting_user=user)
 
@@ -974,7 +977,7 @@ class AnalyticsBouncerTest(BouncerTestCase):
             def transform_realmauditlog_extra_data(
                 method: str,
                 endpoint: str,
-                post_data: bytes | Mapping[str, str | int | None | bytes],
+                post_data: bytes | Mapping[str, str | int | bytes | None],
                 extra_headers: Mapping[str, str] = {},
             ) -> dict[str, Any]:
                 if endpoint == "server/analytics":
@@ -1054,8 +1057,8 @@ class AnalyticsBouncerTest(BouncerTestCase):
                 "corporate.lib.stripe.RemoteRealmBillingSession.get_customer", return_value=None
             ) as m,
             mock.patch(
-                "corporate.lib.stripe.RemoteServerBillingSession.current_count_for_billed_licenses",
-                return_value=10,
+                "corporate.lib.stripe.RemoteServerBillingSession.current_counts_for_billed_users",
+                return_value=BillingUserCounts(10, 0),
             ),
         ):
             send_server_data_to_push_bouncer(consider_usage_statistics=False)
@@ -1070,8 +1073,8 @@ class AnalyticsBouncerTest(BouncerTestCase):
                 "corporate.lib.stripe.RemoteRealmBillingSession.get_customer", return_value=None
             ) as m,
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.current_count_for_billed_licenses",
-                return_value=11,
+                "corporate.lib.stripe.RemoteRealmBillingSession.current_counts_for_billed_users",
+                return_value=BillingUserCounts(11, 0),
             ),
         ):
             send_server_data_to_push_bouncer(consider_usage_statistics=False)
@@ -1104,8 +1107,8 @@ class AnalyticsBouncerTest(BouncerTestCase):
             ),
             mock.patch("corporate.lib.stripe.get_current_plan_by_customer", return_value=None) as m,
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.current_count_for_billed_licenses",
-                return_value=11,
+                "corporate.lib.stripe.RemoteRealmBillingSession.current_counts_for_billed_users",
+                return_value=BillingUserCounts(11, 0),
             ),
         ):
             send_server_data_to_push_bouncer(consider_usage_statistics=False)
@@ -1126,7 +1129,7 @@ class AnalyticsBouncerTest(BouncerTestCase):
             ),
             mock.patch("corporate.lib.stripe.get_current_plan_by_customer", return_value=None),
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.current_count_for_billed_licenses"
+                "corporate.lib.stripe.RemoteRealmBillingSession.current_counts_for_billed_users"
             ) as m,
         ):
             send_server_data_to_push_bouncer(consider_usage_statistics=False)
@@ -1154,11 +1157,11 @@ class AnalyticsBouncerTest(BouncerTestCase):
                 return_value=dummy_customer_plan,
             ),
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.current_count_for_billed_licenses",
-                return_value=11,
+                "corporate.lib.stripe.RemoteRealmBillingSession.current_counts_for_billed_users",
+                return_value=BillingUserCounts(11, 0),
             ),
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.get_next_billing_cycle",
+                "corporate.lib.stripe.get_next_billing_cycle_for_plan",
                 return_value=dummy_date,
             ) as m,
             self.assertLogs("zulip.analytics", level="INFO") as info_log,
@@ -1187,11 +1190,11 @@ class AnalyticsBouncerTest(BouncerTestCase):
                 return_value=dummy_customer_plan,
             ),
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.current_count_for_billed_licenses",
+                "corporate.lib.stripe.RemoteRealmBillingSession.current_counts_for_billed_users",
                 side_effect=MissingDataError,
             ),
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.get_next_billing_cycle",
+                "corporate.lib.stripe.get_next_billing_cycle_for_plan",
                 return_value=dummy_date,
             ) as m,
             self.assertLogs("zulip.analytics", level="INFO") as info_log,
@@ -1220,8 +1223,8 @@ class AnalyticsBouncerTest(BouncerTestCase):
                 return_value=dummy_customer_plan,
             ),
             mock.patch(
-                "corporate.lib.stripe.RemoteRealmBillingSession.current_count_for_billed_licenses",
-                return_value=10,
+                "corporate.lib.stripe.RemoteRealmBillingSession.current_counts_for_billed_users",
+                return_value=BillingUserCounts(10, 0),
             ),
         ):
             send_server_data_to_push_bouncer(consider_usage_statistics=False)
@@ -1368,7 +1371,6 @@ class AnalyticsBouncerTest(BouncerTestCase):
 
         # Hard-delete a realm to test the non existent realm uuid case.
         zephyr_realm = get_realm("zephyr")
-        assert zephyr_realm is not None
         deleted_realm_uuid = zephyr_realm.uuid
         zephyr_realm.delete()
 
@@ -1392,8 +1394,10 @@ class AnalyticsBouncerTest(BouncerTestCase):
         self.assertEqual(
             analytics_logger.output,
             [
-                "WARNING:zulip.analytics:"
-                f"Received unexpected realm UUID from bouncer {deleted_realm_uuid}"
+                (
+                    "WARNING:zulip.analytics:"
+                    f"Received unexpected realm UUID from bouncer {deleted_realm_uuid}"
+                )
             ],
         )
 
@@ -1463,3 +1467,71 @@ class AnalyticsBouncerTest(BouncerTestCase):
             audit_log.event_type, AuditLogEventType.REMOTE_REALM_LOCALLY_DELETED_RESTORED
         )
         self.assertEqual(audit_log.remote_realm, remote_realm_for_deleted_realm)
+
+
+class AdvertiseRealmDataTest(BouncerTestCase):
+    def test_uploaded_only_when_server_and_realm_both_opt_in(self) -> None:
+        realm = get_realm("zulip")
+
+        # Neither the server nor the realm has opted in.
+        self.assertIsNone(get_advertise_realm_data(realm))
+
+        # The realm wants to be listed, but the server has not
+        # enabled the service.
+        do_set_realm_property(
+            realm, "want_advertise_in_communities_directory", True, acting_user=None
+        )
+        self.assertIsNone(get_advertise_realm_data(realm))
+
+        with self.settings(ZULIP_SERVICE_ADVERTISE_REALMS=True):
+            self.assertIsNotNone(get_advertise_realm_data(realm))
+
+            do_set_realm_property(
+                realm, "want_advertise_in_communities_directory", False, acting_user=None
+            )
+            self.assertIsNone(get_advertise_realm_data(realm))
+
+    @override_settings(ZULIP_SERVICE_ADVERTISE_REALMS=True)
+    def test_empty_description_is_not_replaced_by_placeholder(self) -> None:
+        realm = get_realm("zulip")
+        do_set_realm_property(
+            realm, "want_advertise_in_communities_directory", True, acting_user=None
+        )
+        do_set_realm_property(realm, "description", "", acting_user=None)
+
+        data = get_advertise_realm_data(realm)
+        assert data is not None
+        self.assertIsNone(data.description)
+
+    @override_settings(ZULIP_SERVICE_ADVERTISE_REALMS=True)
+    def test_advertise_realm_data_success(self) -> None:
+        realm = get_realm("zulip")
+        do_set_realm_property(
+            realm, "want_advertise_in_communities_directory", True, acting_user=None
+        )
+
+        realms_data = get_realms_info_for_push_bouncer()
+        self.assertTrue(
+            any(realm_data.advertise_realm_data is not None for realm_data in realms_data)
+        )
+
+        request = AnalyticsRequest.model_construct(
+            realm_counts=[],
+            installation_counts=[],
+            realmauditlog_rows=[],
+            realms=realms_data,
+            version=None,
+            merge_base=None,
+            api_feature_level=None,
+        )
+        result = self.uuid_post(
+            self.server_uuid,
+            "/api/v1/remotes/server/analytics",
+            request.model_dump(
+                round_trip=True, exclude={"version", "merge_base", "api_feature_level"}
+            ),
+            subdomain="",
+        )
+        self.assert_json_success(result)
+
+        # TODO: Extend it when implementing bouncer side of this feature.

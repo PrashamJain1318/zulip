@@ -1,7 +1,7 @@
 /* Module primarily for opening/closing the compose box. */
 
 import autosize from "autosize";
-import $ from "jquery";
+import {$} from "jquery";
 import _ from "lodash";
 
 import * as blueslip from "./blueslip.ts";
@@ -213,6 +213,7 @@ export let complete_starting_tasks = (opts: ComposeActionsOpts): void => {
 
     maybe_scroll_up_selected_message(opts);
     compose_fade.start_compose(opts.message_type);
+    message_viewport.bottom_of_feed.reset();
     reload.maybe_reset_pending_reload_timeout("compose_start");
     compose_recipient.update_compose_area_placeholder_text();
     compose_recipient.update_narrow_to_recipient_visibility();
@@ -245,11 +246,7 @@ export function rewire_complete_starting_tasks(value: typeof complete_starting_t
 }
 
 export function maybe_scroll_up_selected_message(opts: ComposeActionsStartOpts): void {
-    if (opts.skip_scrolling_selected_message) {
-        return;
-    }
-
-    if (message_lists.current === undefined) {
+    if (opts.skip_scrolling_selected_message || message_lists.current === undefined) {
         return;
     }
 
@@ -528,10 +525,11 @@ export let cancel = (): void => {
     compose_banner.clear_message_sent_banners();
     compose_banner.clear_non_interleaved_view_messages_fading_banner();
     compose_banner.clear_interleaved_view_messages_fading_banner();
+    compose_tooltips.dismiss_intro_go_to_conversation_tooltip();
     call_hooks(compose_cancel_hooks);
     compose_state.set_message_type(undefined);
     compose_pm_pill.clear();
-    $(document).trigger("compose_canceled.zulip");
+    message_viewport.bottom_of_feed.reset();
     reload.maybe_reset_pending_reload_timeout("compose_end");
 };
 
@@ -633,6 +631,10 @@ export function on_narrow(opts: NarrowActivateOpts): void {
 
     if (opts.trigger === "narrow_to_compose_target") {
         compose_fade.update_message_list();
+        // When narrowing to a compose target, focus the compose
+        // area, under the assumption that someone so narrowing
+        // is ready to compose their message.
+        $("#compose-textarea").trigger("focus");
         return;
     }
 

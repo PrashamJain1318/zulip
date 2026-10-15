@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
@@ -16,11 +16,17 @@ import * as message_store from "./message_store.ts";
 import type {Message, MessageCleanReaction, RawMessage} from "./message_store.ts";
 import {page_params} from "./page_params.ts";
 import * as people from "./people.ts";
+import {get_retry_backoff_seconds} from "./retry_backoff.ts";
 import * as spectators from "./spectators.ts";
 import {current_user} from "./state_data.ts";
 import {user_settings} from "./user_settings.ts";
 
 const waiting_for_server_request_ids = new Set<string>();
+
+// How many times to retry a reaction request that fails with a
+// transient server (5xx) or network error before giving up and
+// reporting the failure.
+const MAX_SEND_REACTION_RETRIES = 5;
 
 export type ReactionEvent = {
     message_id: number;
@@ -102,31 +108,98 @@ function update_ui_and_send_reaction_ajax(
         remove_reaction(reaction);
     }
 
+    send_reaction_request(operation, reaction, rendering_details, reaction_request_id, 0);
+}
+
+function send_reaction_request(
+    operation: "add" | "remove",
+    reaction: ReactionEvent,
+    rendering_details: EmojiRenderingDetails,
+    reaction_request_id: string,
+    attempt: number,
+): void {
+    waiting_for_server_request_ids.add(reaction_request_id);
     const args = {
-        url: "/json/messages/" + message.id + "/reactions",
+        url: "/json/messages/" + reaction.message_id + "/reactions",
         data: rendering_details,
         success() {
             waiting_for_server_request_ids.delete(reaction_request_id);
         },
         error(xhr: JQuery.jqXHR) {
-            waiting_for_server_request_ids.delete(reaction_request_id);
-            if (xhr.readyState !== 0) {
-                const parsed = z.object({code: z.string()}).safeParse(xhr.responseJSON);
-                if (
-                    parsed.success &&
-                    (parsed.data.code === "REACTION_ALREADY_EXISTS" ||
-                        parsed.data.code === "REACTION_DOES_NOT_EXIST")
-                ) {
-                    // Don't send error report for simple precondition failures caused by race
-                    // conditions; the user already got what they wanted
+            // Network drop (status 0) and gateway/server errors deserve some
+            // retries with exponential backoff.
+            const is_transient_error = xhr.status === 0 || xhr.status >= 500;
+            let parsed;
+            if (xhr.readyState === 0) {
+                // client cancelled the request
+                waiting_for_server_request_ids.delete(reaction_request_id);
+            } else if (
+                (parsed = z.object({code: z.string()}).safeParse(xhr.responseJSON)).success &&
+                (parsed.data.code === "REACTION_ALREADY_EXISTS" ||
+                    parsed.data.code === "REACTION_DOES_NOT_EXIST")
+            ) {
+                // Don't send error report for simple precondition failures caused by race
+                // conditions; the user already got what they wanted
+                waiting_for_server_request_ids.delete(reaction_request_id);
+            } else if (
+                (parsed = z
+                    .object({code: z.literal("RATE_LIMIT_HIT"), ["retry-after"]: z.number()})
+                    .safeParse(xhr.responseJSON)).success
+            ) {
+                // If we hit the rate limit, just retry after the server-specified
+                // delay. This is self-resolving, so we retry indefinitely and
+                // don't count it against the transient-error retry budget.
+                const milliseconds_to_wait = 1000 * parsed.data["retry-after"];
+                setTimeout(() => {
+                    send_reaction_request(
+                        operation,
+                        reaction,
+                        rendering_details,
+                        reaction_request_id,
+                        0,
+                    );
+                }, milliseconds_to_wait);
+            } else if (is_transient_error && attempt < MAX_SEND_REACTION_RETRIES) {
+                // Use the slower backoff, since a restarting server can take
+                // a while to come back.
+                const delay_secs = get_retry_backoff_seconds(xhr, attempt, false, true);
+                setTimeout(() => {
+                    send_reaction_request(
+                        operation,
+                        reaction,
+                        rendering_details,
+                        reaction_request_id,
+                        attempt + 1,
+                    );
+                }, delay_secs * 1000);
+            } else {
+                waiting_for_server_request_ids.delete(reaction_request_id);
+                // The server didn't apply the update, so revert the
+                // optimistically-updated local state.
+                if (operation === "add") {
+                    remove_reaction(reaction);
                 } else {
-                    blueslip.error(channel.xhr_error_message("Error sending reaction", xhr));
+                    add_reaction(reaction);
+                }
+                if (is_transient_error) {
+                    // The transient failure persisted past our retry budget,
+                    // so the server is likely having a real problem.
+                    blueslip.error("Error sending reaction after retries", {
+                        status: xhr.status,
+                        body: xhr.responseText,
+                    });
+                } else {
+                    // Any other error -- e.g. a 4xx bad request -- is a
+                    // client-side problem that retrying won't fix.
+                    blueslip.error("Error sending reaction", {
+                        status: xhr.status,
+                        body: xhr.responseText,
+                    });
                 }
             }
         },
     };
 
-    waiting_for_server_request_ids.add(reaction_request_id);
     if (operation === "add") {
         void channel.post(args);
     } else if (operation === "remove") {
@@ -388,7 +461,7 @@ export let insert_new_reaction = (
     // If the given reaction is the first reaction in a message, then we add
     // the whole message reactions section along with the new reaction.
     // Else, we insert the new reaction before the add reaction button.
-    if (message.clean_reactions.size - 1 === 0) {
+    if (message.clean_reactions.size === 1) {
         const $rows = message_lists.all_rendered_row_for_message_id(message.id);
         const reaction_section_context = {
             msg: {
@@ -427,11 +500,7 @@ export let remove_reaction = (event: ReactionEvent): void => {
 
     const clean_reaction_object = message.clean_reactions.get(local_id);
 
-    if (!clean_reaction_object) {
-        return;
-    }
-
-    if (!clean_reaction_object.user_ids.includes(user_id)) {
+    if (!clean_reaction_object?.user_ids.includes(user_id)) {
         return;
     }
 
@@ -516,7 +585,7 @@ export function get_emojis_used_by_user_for_message_id(message_id: number): stri
 
 export function get_message_reactions(message: Message): MessageCleanReaction[] {
     update_clean_reactions(message);
-    return [...message.clean_reactions.values()];
+    return message.clean_reactions.values().toArray();
 }
 
 export function generate_clean_reactions(
@@ -559,14 +628,17 @@ export function generate_clean_reactions(
 
     const clean_reactions = new Map<string, MessageCleanReaction>();
 
-    const reaction_counts_and_user_ids = [...distinct_reactions.keys()].map((local_id) => {
-        const user_ids = user_map.get(local_id);
-        assert(user_ids !== undefined);
-        return {
-            count: user_ids.length,
-            user_ids,
-        };
-    });
+    const reaction_counts_and_user_ids = distinct_reactions
+        .keys()
+        .map((local_id) => {
+            const user_ids = user_map.get(local_id);
+            assert(user_ids !== undefined);
+            return {
+                count: user_ids.length,
+                user_ids,
+            };
+        })
+        .toArray();
     const should_display_reactors = check_should_display_reactors(reaction_counts_and_user_ids);
 
     for (const local_id of distinct_reactions.keys()) {
@@ -661,14 +733,14 @@ export function update_user_fields(
     // who reacted on a message might have changed, including due to
     // upvote/downvotes on ANY reaction in the message, because those
     // can change the correct value of should_display_reactors to use.
-    Object.assign(clean_reaction_object, {
-        ...clean_reaction_object,
-        ...build_reaction_data(
+    Object.assign(
+        clean_reaction_object,
+        build_reaction_data(
             clean_reaction_object.user_ids,
             clean_reaction_object.emoji_name,
             should_display_reactors,
         ),
-    });
+    );
 }
 
 type ReactionUserIdAndCount = {
@@ -677,10 +749,13 @@ type ReactionUserIdAndCount = {
 };
 
 function get_reaction_counts_and_user_ids(message: Message): ReactionUserIdAndCount[] {
-    return [...message.clean_reactions.values()].map((reaction) => ({
-        count: reaction.count,
-        user_ids: reaction.user_ids,
-    }));
+    return message.clean_reactions
+        .values()
+        .map((reaction) => ({
+            count: reaction.count,
+            user_ids: reaction.user_ids,
+        }))
+        .toArray();
 }
 
 export function get_vote_text(user_ids: number[], should_display_reactors: boolean): string {
@@ -726,7 +801,7 @@ export let update_vote_text_on_message = (message: Message): void => {
     update_clean_reactions(message);
     const reaction_counts_and_user_ids = get_reaction_counts_and_user_ids(message);
     const should_display_reactors = check_should_display_reactors(reaction_counts_and_user_ids);
-    for (const [reaction, clean_reaction] of message.clean_reactions.entries()) {
+    for (const [reaction, clean_reaction] of message.clean_reactions) {
         const reaction_elem = find_reaction(message.id, clean_reaction.local_id);
         const vote_text = get_vote_text(clean_reaction.user_ids, should_display_reactors);
         const message_clean_reaction = message.clean_reactions.get(reaction);
@@ -740,4 +815,17 @@ export function rewire_update_vote_text_on_message(
     value: typeof update_vote_text_on_message,
 ): void {
     update_vote_text_on_message = value;
+}
+
+export function update_user_full_name(user_id: number): void {
+    // When a user's full name changes, we need to re-render the
+    // vote text on any reaction pill that includes that user, since
+    // vote text may contain display names.
+    for (const msg_list of message_lists.all_rendered_message_lists()) {
+        for (const message of msg_list.all_messages()) {
+            if (message.clean_reactions.values().some((r) => r.user_ids.includes(user_id))) {
+                update_vote_text_on_message(message);
+            }
+        }
+    }
 }

@@ -1,3 +1,4 @@
+import re
 import uuid
 from collections.abc import Iterable
 from contextlib import suppress
@@ -41,6 +42,7 @@ from zerver.actions.realm_settings import (
 from zerver.actions.users import do_delete_user_preserving_messages
 from zerver.decorator import require_server_admin, zulip_login_required
 from zerver.forms import check_subdomain_available
+from zerver.lib.captcha import CaptchaFormMixin
 from zerver.lib.rate_limiter import rate_limit_request_by_ip
 from zerver.lib.realm_icon import realm_icon_url
 from zerver.lib.send_email import FromAddress, send_email
@@ -71,6 +73,7 @@ from zilencer.models import (
     RemoteRealm,
     RemoteRealmBillingUser,
     RemoteServerBillingUser,
+    RemoteServerDeactivationReasonType,
     RemoteZulipServer,
 )
 
@@ -83,7 +86,7 @@ class SupportRequestForm(forms.Form):
     request_message = forms.CharField(widget=forms.Textarea)
 
 
-class DemoRequestForm(forms.Form):
+class DemoRequestForm(CaptchaFormMixin, forms.Form):
     MAX_INPUT_LENGTH = 50
     SORTED_ORG_TYPE_NAMES = sorted(
         ([org_type["name"] for org_type in Realm.ORG_TYPES.values() if not org_type["hidden"]]),
@@ -169,7 +172,7 @@ def demo_request(request: HttpRequest) -> HttpResponse:
 
     if request.POST:
         post_data = request.POST.copy()
-        form = DemoRequestForm(post_data)
+        form = DemoRequestForm(post_data, request=request)
 
         if form.is_valid():
             rate_limit_request_by_ip(request, domain="sends_email_by_ip")
@@ -199,7 +202,10 @@ def demo_request(request: HttpRequest) -> HttpResponse:
                 request, "corporate/support/support_request_thanks.html", context=context
             )
             return response
+    else:
+        form = DemoRequestForm(request=request)
 
+    context["form"] = form
     response = render(request, "corporate/support/demo_request.html", context=context)
     return response
 
@@ -595,13 +601,17 @@ def support(
                 context["error_message"] = error.msg
 
     if query:
-        key_words = get_invitee_emails_set(query)
-
+        possible_emails = get_invitee_emails_set(query)
         case_insensitive_users_q = Q()
-        for key_word in key_words:
-            case_insensitive_users_q |= Q(delivery_email__iexact=key_word)
+        for email_address in possible_emails:
+            case_insensitive_users_q |= Q(delivery_email__iexact=email_address)
         users = set(UserProfile.objects.filter(case_insensitive_users_q))
-        realms = set(Realm.objects.filter(string_id__in=key_words))
+
+        key_words = re.split(r"\s*[,;]\s*", query.strip())
+        possible_string_ids = [
+            key_word for key_word in key_words if re.match(r"^[a-z0-9-]+$", key_word)
+        ]
+        realms = set(Realm.objects.filter(string_id__in=possible_string_ids))
 
         for key_word in key_words:
             try:
@@ -779,6 +789,7 @@ def remote_servers_support(
     modify_plan: ModifyPlan | None = None,
     delete_fixed_price_next_plan: Json[bool] = False,
     remote_server_status: RemoteServerStatus | None = None,
+    remote_server_deactivation_reason: RemoteServerDeactivationReasonType | None = None,
     complimentary_access_plan: Annotated[
         str, AfterValidator(lambda x: check_date("complimentary_access_plan", x))
     ]
@@ -873,7 +884,6 @@ def remote_servers_support(
                 support_type=SupportType.delete_fixed_price_next_plan,
             )
         elif remote_server_status:
-            assert remote_server is not None
             remote_server_status_billing_session = RemoteServerBillingSession(
                 support_staff=acting_user, remote_server=remote_server
             )
@@ -884,8 +894,11 @@ def remote_servers_support(
                 )
             else:
                 assert remote_server_status == "deactivated"
+                assert remote_server_deactivation_reason is not None
                 try:
-                    remote_server_status_billing_session.do_deactivate_remote_server()
+                    remote_server_status_billing_session.do_deactivate_remote_server(
+                        remote_server_deactivation_reason
+                    )
                     context["success_message"] = (
                         f"Remote server ({remote_server.hostname}) deactivated."
                     )
@@ -987,6 +1000,7 @@ def remote_servers_support(
     )
     context["get_remote_realm_billing_user_emails"] = get_remote_realm_billing_user_emails_as_string
     context["SPONSORED_PLAN_TYPE"] = RemoteZulipServer.PLAN_TYPE_COMMUNITY
+    context["DEACTIVATION_REASONS"] = get_args(RemoteServerDeactivationReasonType)
     context["remote_support_view"] = True
 
     return render(

@@ -270,7 +270,7 @@ class ReactionMessageIDTest(ZulipTestCase):
 
     def test_inaccessible_message_id(self) -> None:
         """
-        Reacting to a inaccessible (for instance, private) message fails
+        Reacting to an inaccessible (for instance, private) message fails
         """
         pm_sender = self.example_user("hamlet")
         pm_recipient = self.example_user("othello")
@@ -499,7 +499,6 @@ class ReactionEventTest(ZulipTestCase):
         event_user_ids = set(events[0]["users"])
 
         self.assertEqual(expected_recipient_ids, event_user_ids)
-        self.assertEqual(event["user"]["email"], reaction_sender.email)
         self.assertEqual(event["type"], "reaction")
         self.assertEqual(event["op"], "add")
         self.assertEqual(event["emoji_name"], "smile")
@@ -1176,9 +1175,6 @@ class ReactionAPIEventTest(EmojiReactionBase):
         event_user_ids = set(events[0]["users"])
 
         self.assertEqual(expected_recipient_ids, event_user_ids)
-        self.assertEqual(event["user"]["user_id"], reaction_sender.id)
-        self.assertEqual(event["user"]["email"], reaction_sender.email)
-        self.assertEqual(event["user"]["full_name"], reaction_sender.full_name)
         self.assertEqual(event["type"], "reaction")
         self.assertEqual(event["op"], "add")
         self.assertEqual(event["message_id"], pm_id)
@@ -1221,9 +1217,6 @@ class ReactionAPIEventTest(EmojiReactionBase):
         event_user_ids = set(events[0]["users"])
 
         self.assertEqual(expected_recipient_ids, event_user_ids)
-        self.assertEqual(event["user"]["user_id"], reaction_sender.id)
-        self.assertEqual(event["user"]["email"], reaction_sender.email)
-        self.assertEqual(event["user"]["full_name"], reaction_sender.full_name)
         self.assertEqual(event["type"], "reaction")
         self.assertEqual(event["op"], "remove")
         self.assertEqual(event["message_id"], pm_id)
@@ -1245,7 +1238,7 @@ class ReactionAPIEventTest(EmojiReactionBase):
             message=message,
             emoji_name="whatever",
             emoji_code="whatever",
-            reaction_type="whatever",
+            reaction_type="unicode_emoji",
         )
 
         with (
@@ -1255,4 +1248,4 @@ class ReactionAPIEventTest(EmojiReactionBase):
             m.side_effect = AssertionError(
                 "Events should be sent only after the transaction commits."
             )
-            notify_reaction_update(hamlet, message, reaction, "stuff")
+            notify_reaction_update(hamlet, message, reaction, "add")

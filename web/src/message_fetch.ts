@@ -1,7 +1,6 @@
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
-import {all_messages_data} from "./all_messages_data.ts";
 import * as blueslip from "./blueslip.ts";
 import * as channel from "./channel.ts";
 import * as compose_closed_ui from "./compose_closed_ui.ts";
@@ -17,22 +16,27 @@ import type {MessageList} from "./message_list.ts";
 import type {MessageListData} from "./message_list_data.ts";
 import * as message_list_data_cache from "./message_list_data_cache.ts";
 import * as message_lists from "./message_lists.ts";
+import type {Message} from "./message_store.ts";
 import {raw_message_schema} from "./message_store.ts";
-import * as message_util from "./message_util.ts";
 import * as message_viewport from "./message_viewport.ts";
 import * as narrow_banner from "./narrow_banner.ts";
+import * as navbar_alerts from "./navbar_alerts.ts";
 import {page_params} from "./page_params.ts";
-import * as people from "./people.ts";
 import * as popup_banners from "./popup_banners.ts";
+import {recent_view_messages_data} from "./recent_view_messages_data.ts";
 import * as recent_view_ui from "./recent_view_ui.ts";
+import * as recent_view_util from "./recent_view_util.ts";
+import {get_retry_backoff_seconds} from "./retry_backoff.ts";
+import * as scroll_to_bottom_button from "./scroll_to_bottom_button.ts";
 import {narrow_operator_schema} from "./state_data.ts";
 import type {NarrowTerm} from "./state_data.ts";
 import * as stream_data from "./stream_data.ts";
 import * as stream_list from "./stream_list.ts";
-import * as util from "./util.ts";
+import * as unread from "./unread.ts";
+import * as unread_ops from "./unread_ops.ts";
+import * as unread_ui from "./unread_ui.ts";
 
-export const response_schema = z.object({
-    anchor: z.number(),
+export const message_ids_response_schema = z.object({
     found_newest: z.boolean(),
     found_oldest: z.boolean(),
     found_anchor: z.boolean(),
@@ -42,10 +46,16 @@ export const response_schema = z.object({
     msg: z.string(),
 });
 
-type MessageFetchResponse = z.infer<typeof response_schema>;
+export const message_fetch_response_schema = z.object({
+    ...message_ids_response_schema.shape,
+    anchor: z.number(),
+});
+
+type MessageFetchResponse = z.infer<typeof message_fetch_response_schema>;
 
 type MessageFetchOptions = {
     anchor: string | number;
+    anchor_date?: string | undefined;
     num_before: number;
     num_after: number;
     cont: (data: MessageFetchResponse, args: MessageFetchOptions) => void;
@@ -62,6 +72,7 @@ type MessageFetchAPIParams = {
     client_gravatar: boolean;
     narrow?: string;
     allow_empty_topic_name: boolean;
+    anchor_date?: string;
 };
 
 let first_messages_fetch = true;
@@ -108,9 +119,11 @@ export function load_messages_around_anchor(
     anchor: string,
     cont: () => void,
     msg_list_data: MessageListData,
+    anchor_date?: string,
 ): void {
     load_messages({
         anchor,
+        anchor_date,
         num_before: consts.narrowed_view_backward_batch_size,
         num_after: consts.narrowed_view_forward_batch_size,
         msg_list_data,
@@ -145,6 +158,25 @@ export function fetch_more_if_required_for_current_msg_list(
     }
 }
 
+export function do_unread_count_updates(messages: Message[], expect_no_new_unreads = false): void {
+    const untracked_unread_messages = unread.process_loaded_messages(
+        messages,
+        expect_no_new_unreads,
+    );
+
+    if (untracked_unread_messages.length > 0) {
+        // The following operations are expensive, and thus should
+        // only happen if we found any unread messages justifying it.
+        unread_ui.update_unread_counts();
+        const conversation_keys = new Set(
+            untracked_unread_messages.map((message) =>
+                recent_view_util.get_key_from_message(message),
+            ),
+        );
+        recent_view_ui.bulk_inplace_rerender(conversation_keys);
+    }
+}
+
 function process_result(data: MessageFetchResponse, opts: MessageFetchOptions): void {
     const raw_messages = data.messages;
 
@@ -156,10 +188,10 @@ function process_result(data: MessageFetchResponse, opts: MessageFetchOptions): 
 
     // In some rare situations, we expect to discover new unread
     // messages not tracked in unread.ts during this fetching process.
-    message_util.do_unread_count_updates(messages, true);
+    do_unread_count_updates(messages, true);
 
-    const is_contiguous_history = true;
     if (messages.length > 0) {
+        const is_contiguous_history = true;
         if (opts.msg_list) {
             if (opts.validate_filter_topic_post_fetch) {
                 opts.msg_list.data.filter.try_adjusting_for_moved_with_target(messages[0]);
@@ -173,8 +205,7 @@ function process_result(data: MessageFetchResponse, opts: MessageFetchOptions): 
     }
 
     direct_message_group_data.process_loaded_messages(messages);
-    stream_list.update_streams_sidebar();
-    stream_list.maybe_scroll_narrow_into_view(!first_messages_fetch);
+    stream_list.update_streams_sidebar_for_messages(messages);
 
     if (
         message_lists.current !== undefined &&
@@ -220,6 +251,14 @@ function get_messages_success(data: MessageFetchResponse, opts: MessageFetchOpti
         });
         if (opts.msg_list) {
             message_feed_top_notices.update_top_of_narrow_notices(opts.msg_list);
+            // When we've just backfilled to the oldest message in
+            // a /near/ conversation view, re-check whether reading
+            // can be resumed. This handles the old_unreads_missing
+            // case: the gate defers until has_found_oldest() is
+            // true, and this is the moment that becomes true.
+            if (current_fetch_found_oldest && opts.msg_list === message_lists.current) {
+                opts.msg_list.maybe_resume_reading_for_near_view();
+            }
         }
     }
 
@@ -251,23 +290,30 @@ function get_messages_success(data: MessageFetchResponse, opts: MessageFetchOpti
     }
 
     process_result(data, opts);
+
+    if (current_fetch_found_newest && opts.msg_list === message_lists.current) {
+        // Now that we've confirmed we have the newest messages in
+        // this view, re-check whether the visible messages should
+        // be marked as read. Without this, a fetch that completes
+        // after narrow activation (with no subsequent scroll, focus
+        // change, or new-message event) would leave messages unread
+        // even though the user is looking at the bottom of the view.
+        unread_ops.process_visible();
+    }
+
+    if (opts.msg_list?.is_current_message_list()) {
+        scroll_to_bottom_button.update();
+    }
 }
 
 // This function modifies the narrow data to use integer IDs instead of
-// strings if it is supported for that operator. We currently don't set
-// or convert user emails to IDs directly in the Filter code because
-// doing so breaks the app in various modules that expect a string of
-// user emails.
+// strings if it is supported for that operator.
 function handle_operators_supporting_id_based_api(narrow_parameter: string): string {
-    // We use the canonical operator when checking these sets, so legacy
-    // operators, such as "pm-with" and "stream", are not included here.
-    const operators_supporting_ids = new Set(["dm"]);
-    const operators_supporting_id = new Set(["id", "channel", "sender", "dm-including"]);
     const raw_narrow_term_array_schema = z.array(
         z.object({
             negated: z.optional(z.boolean()),
             operator: z.string(),
-            operand: z.string(),
+            operand: z.union([z.number(), z.string(), z.array(z.number())]),
         }),
     );
     const parsed_narrow_data = raw_narrow_term_array_schema.parse(JSON.parse(narrow_parameter));
@@ -292,40 +338,16 @@ function handle_operators_supporting_id_based_api(narrow_parameter: string): str
             raw_term.operator.toLowerCase(),
         );
         const canonical_operator = filter_util.canonicalize_operator(parsed_narrow_operator);
-
-        if (operators_supporting_ids.has(canonical_operator)) {
-            const user_ids_array = people.emails_strings_to_user_ids_array(raw_term.operand);
-            assert(user_ids_array !== undefined);
-            narrow_term.operand = user_ids_array;
-        }
-
-        if (operators_supporting_id.has(canonical_operator)) {
-            if (canonical_operator === "id") {
-                // The message ID may not exist locally,
-                // so send the term to the server as is.
-                narrow_terms.push(narrow_term);
-                continue;
-            }
-
-            if (canonical_operator === "channel") {
-                // An unknown channel will have an empty string set for
-                // the operand. And the page_params.narrow may have a
-                // channel name as the operand. But all other cases
-                // should have the channel ID set as the string value
-                // for the operand.
-                const stream = stream_data.get_sub_by_id_string(raw_term.operand);
-                if (stream !== undefined) {
-                    narrow_term.operand = stream.stream_id;
-                }
-                narrow_terms.push(narrow_term);
-                continue;
-            }
-
-            // The other operands supporting integer IDs all work with
-            // a single user object.
-            const person = people.get_by_email(raw_term.operand);
-            if (person !== undefined) {
-                narrow_term.operand = person.user_id;
+        // TODO: Migrate `channel` to use `number` operand so that we can avoid this conversion.
+        if (canonical_operator === "channel" && typeof raw_term.operand === "string") {
+            // An unknown channel will have an empty string set for
+            // the operand. And the page_params.narrow may have a
+            // channel name as the operand. But all other cases
+            // should have the channel ID set as the string value
+            // for the operand.
+            const stream = stream_data.get_sub_by_id_string(raw_term.operand);
+            if (stream !== undefined) {
+                narrow_term.operand = stream.stream_id;
             }
         }
         narrow_terms.push(narrow_term);
@@ -335,10 +357,16 @@ function handle_operators_supporting_id_based_api(narrow_parameter: string): str
 }
 
 export function get_narrow_for_message_fetch(filter: Filter): string {
-    let narrow_data: NarrowTerm[] = [];
+    // narrow_data is different from `NarrowTerm[]` because we
+    // expand `dm-including` operators into multiple terms here.
+    let narrow_data: {
+        operator: NarrowTerm["operator"];
+        operand: NarrowTerm["operand"];
+        negated?: boolean | undefined;
+    }[] = [];
     for (const term of filter.public_terms()) {
         if (term.operator === "dm-including") {
-            for (const operand of term.operand.split(",")) {
+            for (const operand of term.operand) {
                 narrow_data.push({
                     ...term,
                     operand,
@@ -394,6 +422,14 @@ export function get_parameters_for_message_fetch_api(
         blueslip.error("Message list data is undefined!");
     }
 
+    if (opts.anchor === "date") {
+        if (opts.anchor_date === undefined) {
+            blueslip.error("Missing anchor_date for date anchor fetch");
+        } else {
+            data.anchor_date = opts.anchor_date;
+        }
+    }
+
     const narrow = get_narrow_for_message_fetch(msg_list_data.filter);
     if (narrow !== "") {
         data.narrow = narrow;
@@ -418,7 +454,7 @@ export function load_messages(opts: MessageFetchOptions, attempt = 1): void {
 
     if (opts.num_after > 0) {
         // We hide the bottom loading indicator when we're fetching both top and bottom messages.
-        update_loading_indicator = update_loading_indicator && opts.num_before === 0;
+        update_loading_indicator &&= opts.num_before === 0;
         opts.msg_list_data.fetch_status.start_newer_batch({
             update_loading_indicator,
         });
@@ -433,7 +469,7 @@ export function load_messages(opts: MessageFetchOptions, attempt = 1): void {
         data,
         success(raw_data) {
             popup_banners.close_connection_error_popup_banner("message_fetch");
-            const data = response_schema.parse(raw_data);
+            const data = message_fetch_response_schema.parse(raw_data);
             get_messages_success(data, opts);
         },
         error(xhr) {
@@ -463,6 +499,9 @@ export function load_messages(opts: MessageFetchOptions, attempt = 1): void {
                 // for many common errors, and those have nicer HTML formatting,
                 // we certainly don't for every possible 400 error.
                 message_feed_loading.hide_indicators();
+                if (opts.msg_list?.is_current_message_list()) {
+                    scroll_to_bottom_button.hide_after_failed_fetch();
+                }
 
                 if (
                     message_lists.current !== undefined &&
@@ -470,7 +509,11 @@ export function load_messages(opts: MessageFetchOptions, attempt = 1): void {
                     !opts.msg_list.is_combined_feed_view &&
                     opts.msg_list.visibly_empty()
                 ) {
-                    narrow_banner.show_empty_narrow_message(opts.msg_list.data.filter);
+                    const invalid_narrow = true;
+                    narrow_banner.show_empty_narrow_message(
+                        opts.msg_list.data.filter,
+                        invalid_narrow,
+                    );
                 }
 
                 // TODO: This should probably do something explicit with
@@ -480,7 +523,7 @@ export function load_messages(opts: MessageFetchOptions, attempt = 1): void {
                 return;
             }
 
-            const delay_secs = util.get_retry_backoff_seconds(xhr, attempt, true);
+            const delay_secs = get_retry_backoff_seconds(xhr, attempt, true);
             popup_banners.open_connection_error_popup_banner({
                 caller: "message_fetch",
                 retry_delay_secs: delay_secs,
@@ -498,8 +541,9 @@ export function load_messages(opts: MessageFetchOptions, attempt = 1): void {
 
 export function load_messages_for_narrow(opts: {
     anchor: string | number;
+    anchor_date?: string | undefined;
     msg_list: MessageList;
-    cont: () => void;
+    cont: (data: MessageFetchResponse) => void;
     validate_filter_topic_post_fetch?: boolean | undefined;
 }): void {
     load_messages({
@@ -509,6 +553,7 @@ export function load_messages_for_narrow(opts: {
         msg_list: opts.msg_list,
         msg_list_data: opts.msg_list.data,
         cont: opts.cont,
+        anchor_date: opts.anchor_date,
         validate_filter_topic_post_fetch: opts.validate_filter_topic_post_fetch,
     });
 }
@@ -700,6 +745,12 @@ export function set_initial_pointer_and_offset({
     initial_narrow_offset = narrow_offset;
 }
 
+function post_initial_backfill_for_all_messages_done(): void {
+    initial_backfill_for_all_messages_done = true;
+    emoji_frequency.initialize_frequently_used_emojis();
+    navbar_alerts.check_and_show_muted_messages_banner();
+}
+
 export function initialize(finished_initial_fetch: () => void): void {
     const fetch_target_day_timestamp =
         Date.now() / 1000 - consts.target_days_of_history * 24 * 60 * 60;
@@ -714,28 +765,25 @@ export function initialize(finished_initial_fetch: () => void): void {
         }
 
         if (data.found_oldest) {
-            initial_backfill_for_all_messages_done = true;
-            emoji_frequency.initialize_frequently_used_emojis();
+            post_initial_backfill_for_all_messages_done();
             return;
         }
 
         // Stop once we've hit the minimum backfill quantity of
         // messages if we've received a message older than
         // `target_days_of_history`.
-        const latest_message = all_messages_data.first();
+        const latest_message = recent_view_messages_data.first();
         assert(latest_message !== undefined);
         if (
-            all_messages_data.num_items() >= consts.minimum_initial_backfill_size &&
+            recent_view_messages_data.num_items() >= consts.minimum_initial_backfill_size &&
             latest_message.timestamp < fetch_target_day_timestamp
         ) {
-            initial_backfill_for_all_messages_done = true;
-            emoji_frequency.initialize_frequently_used_emojis();
+            post_initial_backfill_for_all_messages_done();
             return;
         }
 
-        if (all_messages_data.num_items() >= consts.maximum_initial_backfill_size) {
-            initial_backfill_for_all_messages_done = true;
-            emoji_frequency.initialize_frequently_used_emojis();
+        if (recent_view_messages_data.num_items() >= consts.maximum_initial_backfill_size) {
+            post_initial_backfill_for_all_messages_done();
             return;
         }
 
@@ -752,18 +800,22 @@ export function initialize(finished_initial_fetch: () => void): void {
                 anchor: oldest_id,
                 num_before: consts.catch_up_batch_size,
                 num_after: 0,
-                msg_list_data: all_messages_data,
+                msg_list_data: recent_view_messages_data,
                 cont: load_more,
             });
         }, consts.catch_up_backfill_delay);
     }
 
-    // Since `all_messages_data` contains continuous message history
+    // Since `recent_view_messages_data` contains continuous message history
     // which always contains the latest message, it makes sense for
     // Recent view to display the same data and be in sync.
-    all_messages_data.set_add_messages_callback((messages, rows_order_changed) => {
+    recent_view_messages_data.set_add_messages_callback((messages, rows_order_changed) => {
         try {
-            recent_view_ui.process_messages(messages, rows_order_changed, all_messages_data);
+            recent_view_ui.process_messages(
+                messages,
+                rows_order_changed,
+                recent_view_messages_data,
+            );
         } catch (error) {
             blueslip.error("Error in recent_view_ui.process_messages", undefined, error);
         }
@@ -780,11 +832,10 @@ export function initialize(finished_initial_fetch: () => void): void {
         // Since we backfill a lot more messages here compared to rendered message list,
         // we can try populating them if we can do so locally.
         for (const msg_list_data of message_list_data_cache.all()) {
-            if (msg_list_data === all_messages_data) {
-                continue;
-            }
-
-            if (!msg_list_data.filter.can_apply_locally()) {
+            if (
+                msg_list_data === recent_view_messages_data ||
+                !msg_list_data.filter.can_apply_locally()
+            ) {
                 continue;
             }
 
@@ -798,12 +849,15 @@ export function initialize(finished_initial_fetch: () => void): void {
 
             // This callback is only called when backfilling messages,
             // so we need to check for the presence of any message from
-            // the message list in the all_messages_data to
+            // the message list in the recent_view_messages_data to
             // check for continuous message history for the message list.
             const first_message = msg_list_data.first();
             assert(first_message !== undefined);
-            if (all_messages_data.get(first_message.id) !== undefined) {
-                const messages_to_populate = all_messages_data.message_range(0, first_message.id);
+            if (recent_view_messages_data.get(first_message.id) !== undefined) {
+                const messages_to_populate = recent_view_messages_data.message_range(
+                    0,
+                    first_message.id,
+                );
                 if (msg_list_data.rendered_message_list_id) {
                     const msg_list = message_lists.rendered_message_lists.get(
                         msg_list_data.rendered_message_list_id,
@@ -826,7 +880,7 @@ export function initialize(finished_initial_fetch: () => void): void {
         anchor: "newest",
         num_before: consts.initial_backfill_fetch_size,
         num_after: 0,
-        msg_list_data: all_messages_data,
+        msg_list_data: recent_view_messages_data,
         cont: load_more,
     });
 }

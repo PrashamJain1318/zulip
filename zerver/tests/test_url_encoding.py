@@ -1,9 +1,14 @@
+import os
+
+import orjson
+
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.url_encoding import (
     encode_channel,
     encode_hash_component,
     encode_user_full_name_and_id,
     encode_user_ids,
+    message_link_url,
     stream_message_url,
 )
 from zerver.models.messages import Message
@@ -12,6 +17,16 @@ from zerver.models.streams import get_stream
 
 
 class URLEncodeTest(ZulipTestCase):
+    def test_encode_hash_component(self) -> None:
+        fixture_path = os.path.join(
+            os.path.dirname(__file__), "fixtures/url_encoding_test_cases.json"
+        )
+        with open(fixture_path, "rb") as f:
+            data = orjson.loads(f.read())
+        for test in data:
+            with self.subTest(name=test["name"]):
+                self.assertEqual(encode_hash_component(test["input"]), test["expected_output"])
+
     def test_encode_channel(self) -> None:
         # We have more tests for this function in `test_topic_link_utils.py`
         self.assertEqual(encode_channel(9, "Verona"), "9-Verona")
@@ -72,12 +87,39 @@ class URLEncodeTest(ZulipTestCase):
         expected_channel_message_url = f"{realm.url}/#narrow/{encode_channel(channel.id, channel.name, True)}/topic/{encode_hash_component(topic)}/near/{channel_message_id}"
         self.assertEqual(channel_message_url, expected_channel_message_url)
 
-        relative_channel_message_url = stream_message_url(
-            realm, message_dict, include_base_url=False
-        )
+        relative_channel_message_url = stream_message_url(None, message_dict)
         expected_relative_channel_message_url = f"#narrow/{encode_channel(channel.id, channel.name, True)}/topic/{encode_hash_component(topic)}/near/{channel_message_id}"
         self.assertEqual(relative_channel_message_url, expected_relative_channel_message_url)
 
-        with self.assertRaises(ValueError) as e:
-            stream_message_url(realm=None, message=message_dict, include_base_url=True)
-        self.assertEqual(str(e.exception), "realm is required when include_base_url=True")
+    def test_message_link_url_without_a_realm(self) -> None:
+        realm = get_realm("zulip")
+        channel_message = dict(
+            type="stream",
+            id=555,
+            stream_id=9,
+            display_recipient="Verona",
+            topic="test topic",
+        )
+        direct_message = dict(
+            type="personal",
+            id=556,
+            display_recipient=[dict(id=77), dict(id=80)],
+        )
+
+        self.assertEqual(
+            message_link_url(realm, channel_message),
+            f"{realm.url}/#narrow/channel/9-Verona/topic/test.20topic/near/555",
+        )
+        self.assertEqual(
+            message_link_url(None, channel_message),
+            "#narrow/channel/9-Verona/topic/test.20topic/near/555",
+        )
+
+        self.assertEqual(
+            message_link_url(realm, direct_message),
+            f"{realm.url}/#narrow/dm/77,80/near/556",
+        )
+        self.assertEqual(
+            message_link_url(None, direct_message),
+            "#narrow/dm/77,80/near/556",
+        )

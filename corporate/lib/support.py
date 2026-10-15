@@ -34,6 +34,7 @@ from zilencer.models import (
     RemoteRealm,
     RemoteRealmCount,
     RemoteServerBillingUser,
+    RemoteServerDeactivationReasonType,
     RemoteZulipServer,
     RemoteZulipServerAuditLog,
     get_remote_realm_guest_and_non_guest_count,
@@ -112,7 +113,7 @@ class DeactivationData:
     event_time: datetime
     acting_user: UserProfile | None
     billing_user: RemoteServerBillingUser | None
-    reason: RealmDeactivationReasonType | None
+    reason: RealmDeactivationReasonType | RemoteServerDeactivationReasonType | None
 
 
 @dataclass
@@ -313,7 +314,7 @@ def get_plan_data_for_support_view(
             plan_data.licenses = None
             plan_data.annual_recurring_revenue = 0
         else:
-            plan_data.licenses = last_ledger_entry.licenses
+            plan_data.licenses = last_ledger_entry.workplace_licenses
             plan_data.annual_recurring_revenue = (
                 billing_session.get_annual_recurring_revenue_for_support_data(
                     plan_data.current_plan, last_ledger_entry
@@ -328,12 +329,13 @@ def get_plan_data_for_support_view(
             plan_data.licenses_used = None
         elif user_count is None:
             try:
-                plan_data.licenses_used = billing_session.current_count_for_billed_licenses()
+                plan_data.licenses_used = (
+                    billing_session.current_counts_for_billed_users().workplace_users
+                )
             except MissingDataError:  # nocoverage
                 plan_data.warning += USER_DATA_STALE_WARNING
                 plan_data.licenses_used = None
         else:  # nocoverage
-            assert user_count is not None
             plan_data.licenses_used = user_count
 
         if plan_data.current_plan.status in (
@@ -486,6 +488,8 @@ def get_deactivation_data(audit_log: RealmAuditLog | RemoteZulipServerAuditLog) 
             billing_user = audit_log.acting_remote_user
         elif audit_log.acting_support_user:
             acting_user = audit_log.acting_support_user
+        if audit_log.extra_data:
+            reason = audit_log.extra_data.get("deactivation_reason", None)
 
     return DeactivationData(
         event_time=event_time,

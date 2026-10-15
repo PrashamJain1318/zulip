@@ -364,6 +364,15 @@ class TestQueryCounts(ZulipTestCase):
         hamlet = self.example_user("hamlet")
         cordelia = self.example_user("cordelia")
 
+        # when direct message group doesn't exist and should be created as part of the flow
+        with self.assert_database_query_count(22):
+            self.send_personal_message(
+                from_user=hamlet,
+                to_user=cordelia,
+                content="hello there!",
+            )
+
+        # when direct message group exists
         with self.assert_database_query_count(16):
             self.send_personal_message(
                 from_user=hamlet,

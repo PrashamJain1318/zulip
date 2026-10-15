@@ -1,4 +1,4 @@
-import $ from "jquery";
+import {$} from "jquery";
 
 import * as loading from "./loading.ts";
 import {COMPONENT_INTENT_VALUES} from "./types.ts";
@@ -78,4 +78,12 @@ export function modify_action_button_style(
     // Replace the old variant and intent values with the new ones, if provided.
     $button.removeClass(action_button_style_class);
     $button.addClass(`action-button-${opts.variant ?? old_variant}-${opts.intent ?? old_intent}`);
+}
+
+export function modify_button_icon($button: JQuery, new_icon: string): void {
+    $button
+        .find(".zulip-icon")
+        .attr("class", (_index, className) =>
+            className.replaceAll(/zulip-icon-[^\s]+/g, () => `zulip-icon-${new_icon}`),
+        );
 }
